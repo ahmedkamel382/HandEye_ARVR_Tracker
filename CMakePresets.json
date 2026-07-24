@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": false,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "Python3_EXECUTABLE": "${sourceDir}/.venv/Scripts/python.exe",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    }
+  ]
+}

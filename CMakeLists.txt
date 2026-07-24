@@ -5,6 +5,9 @@ project(GradProject CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Point CMake directly to the vcpkg built package files
+set(OpenCV_ROOT "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/share/opencv4")
+
 # 1. Locate OpenCV (Provided by vcpkg)
 find_package(OpenCV CONFIG REQUIRED)
 

@@ -3,14 +3,18 @@
 __pycache__/
 *.pyc
 
-# Datasets and AI Models (These are too large for Git)
+# IDE Configurations (PyCharm / JetBrains / Visual Studio)
+.idea/
+*.iml
+.vs/
+
+# Datasets and AI Models (Too large for Git)
 datasets/
 *.csv
-assets/*.task
-assets/*.pkl
+*.task
+*.pkl
 
-# Visual Studio & CMake Build Artifacts
-.vs/
+# CMake Build Artifacts & Binaries
 out/
 build/
 *.exe

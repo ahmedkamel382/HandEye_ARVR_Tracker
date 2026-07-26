@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e",
   "dependencies": [
-    "opencv4"
+    "opencv4",
+    "pybind11"
   ]
 }

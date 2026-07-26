@@ -6,31 +6,29 @@ import numpy as np
 import csv
 import time
 import os
+from collections import deque
 
 
 class DataCollector:
     def __init__(self, output_file=None):
-        # 1. Dynamically locate the directory of this script (ai_pipeline folder)
+        # --- 1. DIRECTORY SETUP ---
+        # Locate script dir and ensure 'datasets' folder exists
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # 2. Set the target for the CSV file into a new 'datasets' folder
         if output_file is None:
             self.output_file = os.path.join(self.script_dir, 'datasets', 'blink_dataset.csv')
         else:
             self.output_file = output_file
 
-        # Automatically create the 'datasets' folder if it doesn't exist
         os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
 
-        # 3. Path to the model in the assets folder (up two levels from ai_pipeline)
-        # Stepping out of gaze_intent, and then out of ai_pipeline
+        # --- 2. MODEL INITIALIZATION ---
+        # Resolve path to MediaPipe face model in assets folder
         model_path = os.path.abspath(os.path.join(self.script_dir, '..', '..', 'assets', 'face_landmarker.task'))
         if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"Model file not found at:\n{model_path}\n"
-                f"Please ensure 'face_landmarker.task' is inside the 'assets' folder at the root of the project."
-            )
+            raise FileNotFoundError(f"Model not found at:\n{model_path}")
 
+        # Configure Face Landmarker for 1 face
         base_options = python.BaseOptions(model_asset_path=model_path)
         options = vision.FaceLandmarkerOptions(
             base_options=base_options,
@@ -42,19 +40,26 @@ class DataCollector:
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
 
-        # Map both eyes based on the 478-point mesh
+        # --- 3. LANDMARK MAPPING ---
+        # 6 perimeter points per eye
         self.LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
         self.RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
-        # --- Map the exact center of the Irises ---
+        # Iris centers for gaze tracking
         self.LEFT_IRIS_INDEX = 468
         self.RIGHT_IRIS_INDEX = 473
 
+        # --- 4. STATE & TEMPORAL WINDOW ---
         self.current_label = 0
+
+        # 15 frames (~0.5s at 30fps) sliding window for sequence tracking
+        self.window_size = 15
+        self.left_ear_history = deque(maxlen=self.window_size)
+        self.right_ear_history = deque(maxlen=self.window_size)
 
     @staticmethod
     def _calculate_ear(face_landmarks, frame_w, frame_h, indices):
-        """Calculates EAR for a specific eye given its landmark indices."""
+        """Calculates Eye Aspect Ratio (EAR) using vertical and horizontal distances."""
         coords = []
         for idx in indices:
             lm = face_landmarks[idx]
@@ -69,7 +74,8 @@ class DataCollector:
         return float((v_dist_1 + v_dist_2) / (2.0 * h_dist))
 
     @staticmethod
-    def _calculate_bbox_area(face_landmarks, frame_w, frame_h):
+    def _calculate_bounding_box_area(face_landmarks, frame_w, frame_h):
+        """Calculates face bounding box area for distance normalization."""
         x_coords = [lm.x * frame_w for lm in face_landmarks]
         y_coords = [lm.y * frame_h for lm in face_landmarks]
 
@@ -80,14 +86,23 @@ class DataCollector:
     def run(self):
         with open(self.output_file, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['Timestamp', 'Avg_EAR', 'BBox_Area', 'Label'])
+
+            # Write CSV headers
+            writer.writerow([
+                'Timestamp',
+                'Left_EAR', 'Left_Min_15f', 'Left_Var_15f',
+                'Right_EAR', 'Right_Min_15f', 'Right_Var_15f',
+                'BoundingBox_Area', 'Label'
+            ])
 
             cap = cv2.VideoCapture(0)
 
+            # Updated Intuitive UI Instructions with Spacebar
             print("--- DATA COLLECTOR STARTED ---")
-            print("Press '0' to label data as OPEN (Default)")
-            print("Press '1' to label data as INTENTIONAL CLICK")
-            print("Press '2' to label data as SUSTAINED CLOSURE")
+            print("Press 'SPACEBAR' for NEUTRAL (Hover/Default)")
+            print("Press '1' for LEFT WINK (Left Click)")
+            print("Press '2' for RIGHT WINK (Right Click)")
+            print("Press '3' for SUSTAINED CLOSURE (Pause/Sleep)")
             print("Press 'Q' to save and exit.")
 
             while cap.isOpened():
@@ -95,66 +110,108 @@ class DataCollector:
                 if not success:
                     break
 
-                # --- MIRROR THE FRAME ---
+                # Mirror frame for natural UI
                 frame = cv2.flip(frame, 1)
-
                 frame_h, frame_w, _ = frame.shape
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+                # Convert BGR to RGB for MediaPipe
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
                 results = self.detector.detect(mp_image)
 
-                avg_ear = 0.0
-                bbox_area = 0.0
+                left_ear = right_ear = 0.0
+                l_min_ear = r_min_ear = 0.0
+                l_var_ear = r_var_ear = 0.0
 
                 if results.face_landmarks:
                     first_face_landmarks = results.face_landmarks[0]
 
-                    # 1. Math Extractions for BOTH eyes
+                    # 1. Independent EAR Math
                     left_ear = self._calculate_ear(first_face_landmarks, frame_w, frame_h, self.LEFT_EYE_INDICES)
                     right_ear = self._calculate_ear(first_face_landmarks, frame_w, frame_h, self.RIGHT_EYE_INDICES)
 
-                    # Average the two for a much more stable signal
-                    avg_ear = (left_ear + right_ear) / 2.0
+                    # 2. Update Histories
+                    self.left_ear_history.append(left_ear)
+                    self.right_ear_history.append(right_ear)
 
-                    bbox_area = self._calculate_bbox_area(first_face_landmarks, frame_w, frame_h)
+                    # 3. Calculate Rolling Features (Left Eye)
+                    if len(self.left_ear_history) == self.window_size:
+                        l_ear_array = np.array(self.left_ear_history)
+                        l_min_ear = float(np.min(l_ear_array))
+                        l_var_ear = float(np.var(l_ear_array))
+                    else:
+                        l_min_ear = float(left_ear)
+                        l_var_ear = 0.0
 
-                    # 2. Write to CSV (Iris coordinates are purposefully excluded here)
-                    writer.writerow([time.time(), avg_ear, bbox_area, self.current_label])
+                    # 4. Calculate Rolling Features (Right Eye)
+                    if len(self.right_ear_history) == self.window_size:
+                        r_ear_array = np.array(self.right_ear_history)
+                        r_min_ear = float(np.min(r_ear_array))
+                        r_var_ear = float(np.var(r_ear_array))
+                    else:
+                        r_min_ear = float(right_ear)
+                        r_var_ear = 0.0
 
-                    # 3. Visual Debugging (Draw BOTH eyelids in Green)
+                    bounding_box_area = self._calculate_bounding_box_area(first_face_landmarks, frame_w, frame_h)
+
+                    # 5. Save to CSV
+                    writer.writerow([
+                        time.time(),
+                        left_ear, l_min_ear, l_var_ear,
+                        right_ear, r_min_ear, r_var_ear,
+                        bounding_box_area, self.current_label
+                    ])
+
+                    # 6. Draw Debug Elements (Green Eyelids, Red Irises)
                     for idx in self.LEFT_EYE_INDICES + self.RIGHT_EYE_INDICES:
                         lm = first_face_landmarks[idx]
                         pos = (int(lm.x * frame_w), int(lm.y * frame_h))
                         cv2.circle(frame, pos, 2, (0, 255, 0), -1)
 
-                    # 4. Visual Debugging (Draw BOTH irises in Red to verify gaze tracking works)
                     for idx in [self.LEFT_IRIS_INDEX, self.RIGHT_IRIS_INDEX]:
                         lm = first_face_landmarks[idx]
                         pos = (int(lm.x * frame_w), int(lm.y * frame_h))
                         cv2.circle(frame, pos, 3, (0, 0, 255), -1)
 
-                # Overlay current state on the video feed
-                label_text = {0: "STATE: OPEN", 1: "STATE: CLICKING", 2: "STATE: SUSTAINED CLOSURE"}
-                colors = {0: (0, 255, 0), 1: (0, 0, 255), 2: (255, 0, 0)}
+                # --- UI OVERLAY ---
+                label_text = {
+                    0: "STATE: NEUTRAL (HOVER)",
+                    1: "STATE: LEFT WINK (LEFT CLICK)",
+                    2: "STATE: RIGHT WINK (RIGHT CLICK)",
+                    3: "STATE: SUSTAINED CLOSURE (PAUSE)"
+                }
+                colors = {
+                    0: (0, 255, 0),  # Green
+                    1: (0, 255, 255),  # Yellow
+                    2: (255, 255, 0),  # Cyan
+                    3: (0, 0, 255)  # Red
+                }
 
-                cv2.putText(frame, label_text[self.current_label], (30, 50),
+                # Display Labels & Stats
+                cv2.putText(frame, label_text[self.current_label], (30, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, colors[self.current_label], 2)
-                cv2.putText(frame, f"Avg EAR: {avg_ear:.3f}", (30, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                cv2.putText(frame, f"L EAR: {left_ear:.3f} | R EAR: {right_ear:.3f}", (30, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(frame, f"L Min: {l_min_ear:.3f} | R Min: {r_min_ear:.3f}", (30, 110),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.putText(frame, f"L Var: {l_var_ear:.5f} | R Var: {r_var_ear:.5f}", (30, 140),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
                 cv2.imshow('Data Collector (Press Q to Quit)', frame)
 
-                # Keyboard listener for labeling
+                # --- KEYBOARD LISTENER ---
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == ord('Q'):
+                if key in [ord('q'), ord('Q')]:
                     break
-                elif key == ord('0'):
+                elif key == ord(' '):  # SPACEBAR is now the trigger for Neutral
                     self.current_label = 0
                 elif key == ord('1'):
                     self.current_label = 1
                 elif key == ord('2'):
                     self.current_label = 2
+                elif key == ord('3'):
+                    self.current_label = 3
 
         cap.release()
         cv2.destroyAllWindows()

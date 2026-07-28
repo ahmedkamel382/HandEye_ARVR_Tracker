@@ -15,12 +15,18 @@ find_package(OpenCV CONFIG REQUIRED)
 # 2. Locate the local Python Environment 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
-# 3. Locate Pybind11
-# Note: Ensure pybind11 is installed via vcpkg or pip in your environment
+# 3. Ask Python exactly where Pybind11 is installed
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import pybind11; print(pybind11.get_cmake_dir())"
+    OUTPUT_VARIABLE pybind11_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# 4. Locate Pybind11 using the directory we just found
 find_package(pybind11 REQUIRED)
 
-# 4. Define the Core Engine Executable
+# 5. Define the Core Engine Executable
 add_executable(core_engine core_engine/src/main.cpp)
 
-# 5. Link OpenCV and the Pybind11 Embed module to the Core Engine
+# 6. Link OpenCV and the Pybind11 Embed module to the Core Engine
 target_link_libraries(core_engine PRIVATE ${OpenCV_LIBS} pybind11::embed)

@@ -83,23 +83,34 @@ class DataCollector:
         height = max(y_coords) - min(y_coords)
         return float(width * height)
 
+    def _get_rolling_features(self, history, current_ear):
+        """Helper method to calculate rolling min and variance to prevent duplicated code."""
+        if len(history) == self.window_size:
+            ear_array = np.array(history)
+            return float(np.min(ear_array)), float(np.var(ear_array))
+        return float(current_ear), 0.0
+
     def run(self):
-        with open(self.output_file, mode='w', newline='') as file:
+        # Check if file exists so we don't duplicate headers
+        file_exists = os.path.isfile(self.output_file)
+
+        with open(self.output_file, mode='a', newline='') as file:
             writer = csv.writer(file)
 
-            # Write CSV headers
-            writer.writerow([
-                'Timestamp',
-                'Left_EAR', 'Left_Min_15f', 'Left_Var_15f',
-                'Right_EAR', 'Right_Min_15f', 'Right_Var_15f',
-                'BoundingBox_Area', 'Label'
-            ])
+            # Only write headers if this is a new file
+            if not file_exists:
+                writer.writerow([
+                    'Timestamp',
+                    'Left_EAR', 'Left_Min_15f', 'Left_Var_15f',
+                    'Right_EAR', 'Right_Min_15f', 'Right_Var_15f',
+                    'BoundingBox_Area', 'Label'
+                ])
 
             cap = cv2.VideoCapture(0)
 
-            # Updated Intuitive UI Instructions with Spacebar
+            # Intuitive UI Instructions with Space
             print("--- DATA COLLECTOR STARTED ---")
-            print("Press 'SPACEBAR' for NEUTRAL (Hover/Default)")
+            print("Press 'SPACE' for NEUTRAL (Hover/Default)")
             print("Press '1' for LEFT WINK (Left Click)")
             print("Press '2' for RIGHT WINK (Right Click)")
             print("Press '3' for SUSTAINED CLOSURE (Pause/Sleep)")
@@ -134,27 +145,13 @@ class DataCollector:
                     self.left_ear_history.append(left_ear)
                     self.right_ear_history.append(right_ear)
 
-                    # 3. Calculate Rolling Features (Left Eye)
-                    if len(self.left_ear_history) == self.window_size:
-                        l_ear_array = np.array(self.left_ear_history)
-                        l_min_ear = float(np.min(l_ear_array))
-                        l_var_ear = float(np.var(l_ear_array))
-                    else:
-                        l_min_ear = float(left_ear)
-                        l_var_ear = 0.0
-
-                    # 4. Calculate Rolling Features (Right Eye)
-                    if len(self.right_ear_history) == self.window_size:
-                        r_ear_array = np.array(self.right_ear_history)
-                        r_min_ear = float(np.min(r_ear_array))
-                        r_var_ear = float(np.var(r_ear_array))
-                    else:
-                        r_min_ear = float(right_ear)
-                        r_var_ear = 0.0
+                    # 3. Calculate Rolling Features for Both Eyes
+                    l_min_ear, l_var_ear = self._get_rolling_features(self.left_ear_history, left_ear)
+                    r_min_ear, r_var_ear = self._get_rolling_features(self.right_ear_history, right_ear)
 
                     bounding_box_area = self._calculate_bounding_box_area(first_face_landmarks, frame_w, frame_h)
 
-                    # 5. Save to CSV
+                    # 4. Save to CSV
                     writer.writerow([
                         time.time(),
                         left_ear, l_min_ear, l_var_ear,
@@ -162,7 +159,7 @@ class DataCollector:
                         bounding_box_area, self.current_label
                     ])
 
-                    # 6. Draw Debug Elements (Green Eyelids, Red Irises)
+                    # 5. Draw Debug Elements (Green Eyelids, Red Irises)
                     for idx in self.LEFT_EYE_INDICES + self.RIGHT_EYE_INDICES:
                         lm = first_face_landmarks[idx]
                         pos = (int(lm.x * frame_w), int(lm.y * frame_h))
@@ -181,10 +178,10 @@ class DataCollector:
                     3: "STATE: SUSTAINED CLOSURE (PAUSE)"
                 }
                 colors = {
-                    0: (0, 255, 0),  # Green
+                    0: (0, 255, 0),    # Green
                     1: (0, 255, 255),  # Yellow
                     2: (255, 255, 0),  # Cyan
-                    3: (0, 0, 255)  # Red
+                    3: (0, 0, 255)     # Red
                 }
 
                 # Display Labels & Stats
@@ -204,7 +201,7 @@ class DataCollector:
                 key = cv2.waitKey(1) & 0xFF
                 if key in [ord('q'), ord('Q')]:
                     break
-                elif key == ord(' '):  # SPACEBAR is now the trigger for Neutral
+                elif key == ord(' '):  # SPACE is now the trigger for Neutral
                     self.current_label = 0
                 elif key == ord('1'):
                     self.current_label = 1

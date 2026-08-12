@@ -1,4 +1,5 @@
 {
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "gaze-hand-tracking-engine",
   "version": "1.0.0",
   "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e",

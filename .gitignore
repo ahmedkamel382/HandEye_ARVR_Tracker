@@ -11,8 +11,6 @@ __pycache__/
 # Datasets and AI Models (Too large for Git)
 datasets/
 *.csv
-*.task
-*.pkl
 
 # CMake Build Artifacts & Binaries
 out/

@@ -20,7 +20,7 @@ class GazeIntent:
 
         # Locate the trained Random Forest model
         project_root = os.environ.get('AI_PIPELINE_ROOT', os.path.abspath(os.path.join(self.script_dir, '..')))
-        model_path = os.path.join(project_root, 'gesture_model.pkl')
+        model_path = os.path.join(self.script_dir, 'gesture_model.pkl')
 
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"[CRITICAL ERROR] Production Model missing at:\n{model_path}")
@@ -48,14 +48,26 @@ class GazeIntent:
         self.LEFT_IRIS = 468
         self.RIGHT_IRIS = 473
 
-        # Eye corners for gaze calculation (Outer, Inner)
+        # Eye corners for horizontal gaze calculation (Outer, Inner)
         self.LEFT_CORNERS = (33, 133)
         self.RIGHT_CORNERS = (362, 263)
+
+        # Eyelid centers for vertical gaze calculation (Top, Bottom)
+        self.LEFT_VERTICAL_BOUNDS = (159, 145)
+        self.RIGHT_VERTICAL_BOUNDS = (386, 374)
 
         # --- 5. TEMPORAL STATE ---
         self.window_size = 15
         self.left_ear_history = deque(maxlen=self.window_size)
         self.right_ear_history = deque(maxlen=self.window_size)
+
+    def close(self):
+        """Safely release MediaPipe resources to prevent memory leaks in production."""
+        if hasattr(self, 'detector'):
+            self.detector.close()
+
+    def __del__(self):
+        self.close()
 
     @staticmethod
     def _calculate_ear(face_landmarks, frame_w: int, frame_h: int, indices: list) -> float:
@@ -82,18 +94,16 @@ class GazeIntent:
         return float(current_ear), 0.0
 
     @staticmethod
-    def _get_eye_gaze_ratio(landmarks, frame_w: int, corners: Tuple[int, int], iris_idx: int) -> float:
-        """Helper method to calculate the horizontal gaze ratio for a single eye, eliminating duplicated code."""
+    def _get_horizontal_eye_gaze_ratio(landmarks, frame_w: int, corners: Tuple[int, int], iris_idx: int) -> float:
+        """Calculates the horizontal gaze ratio for a single eye."""
         p_outer = landmarks[corners[0]]
         p_inner = landmarks[corners[1]]
         p_iris = landmarks[iris_idx]
 
-        # Map to pixel coordinates
         outer_x = p_outer.x * frame_w
         inner_x = p_inner.x * frame_w
         iris_x = p_iris.x * frame_w
 
-        # Calculate ratio based on min and max X values of the eye corners
         min_x = min(outer_x, inner_x)
         max_x = max(outer_x, inner_x)
         eye_width = max_x - min_x
@@ -103,19 +113,40 @@ class GazeIntent:
 
         return float((iris_x - min_x) / eye_width)
 
-    def _calculate_gaze(self, landmarks, frame_w: int) -> Tuple[float, float]:
+    @staticmethod
+    def _get_vertical_eye_gaze_ratio(landmarks, frame_h: int, bounds: Tuple[int, int], iris_idx: int) -> float:
+        """Calculates the vertical gaze ratio for a single eye relative to the eyelids."""
+        p_top = landmarks[bounds[0]]
+        p_bottom = landmarks[bounds[1]]
+        p_iris = landmarks[iris_idx]
+
+        top_y = p_top.y * frame_h
+        bottom_y = p_bottom.y * frame_h
+        iris_y = p_iris.y * frame_h
+
+        min_y = min(top_y, bottom_y)
+        max_y = max(top_y, bottom_y)
+        eye_height = max_y - min_y
+
+        if eye_height == 0:
+            return 0.5
+
+        return float((iris_y - min_y) / eye_height)
+
+    def _calculate_gaze(self, landmarks, frame_w: int, frame_h: int) -> Tuple[float, float]:
         """
-        Calculates normalized X and Y cursor coordinates based on iris position.
+        Calculates normalized X and Y cursor coordinates based on iris position relative to eye boundaries.
         Returns values between 0.0 and 1.0.
         """
-        # Horizontal ratio (X): Average of both eyes to prevent jitter
-        l_ratio_x = self._get_eye_gaze_ratio(landmarks, frame_w, self.LEFT_CORNERS, self.LEFT_IRIS)
-        r_ratio_x = self._get_eye_gaze_ratio(landmarks, frame_w, self.RIGHT_CORNERS, self.RIGHT_IRIS)
+        # Horizontal ratio (X)
+        l_ratio_x = self._get_horizontal_eye_gaze_ratio(landmarks, frame_w, self.LEFT_CORNERS, self.LEFT_IRIS)
+        r_ratio_x = self._get_horizontal_eye_gaze_ratio(landmarks, frame_w, self.RIGHT_CORNERS, self.RIGHT_IRIS)
         gaze_x = (l_ratio_x + r_ratio_x) / 2.0
 
-        # Vertical ratio (Y): Simple vertical tracking using the iris Y position
-        # .y is already a normalized float [0.0, 1.0], no frame height needed
-        gaze_y = (landmarks[self.LEFT_IRIS].y + landmarks[self.RIGHT_IRIS].y) / 2.0
+        # Vertical ratio (Y)
+        l_ratio_y = self._get_vertical_eye_gaze_ratio(landmarks, frame_h, self.LEFT_VERTICAL_BOUNDS, self.LEFT_IRIS)
+        r_ratio_y = self._get_vertical_eye_gaze_ratio(landmarks, frame_h, self.RIGHT_VERTICAL_BOUNDS, self.RIGHT_IRIS)
+        gaze_y = (l_ratio_y + r_ratio_y) / 2.0
 
         # Clamp between 0.0 and 1.0 for absolute bounds safety
         return max(0.0, min(1.0, gaze_x)), max(0.0, min(1.0, gaze_y))
@@ -157,7 +188,7 @@ class GazeIntent:
             features = np.array([[left_ear, l_min, l_var, right_ear, r_min, r_var, bounding_box_area]])
             state = int(self.model.predict(features)[0])
 
-            # Gaze Math (frame_h removed)
-            gaze_x, gaze_y = self._calculate_gaze(landmarks, frame_w)
+            # Gaze Math
+            gaze_x, gaze_y = self._calculate_gaze(landmarks, frame_w, frame_h)
 
         return float(gaze_x), float(gaze_y), int(state)

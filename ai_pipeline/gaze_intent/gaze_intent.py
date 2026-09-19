@@ -1,4 +1,3 @@
-import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -7,6 +6,7 @@ import os
 import joblib
 from collections import deque
 import warnings
+import math
 from typing import Tuple
 
 # Suppress scikit-learn version warnings during real-time execution
@@ -18,7 +18,6 @@ class GazeIntent:
         # --- 1. PATH RESOLUTION ---
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # Locate the trained Random Forest model
         project_root = os.environ.get('AI_PIPELINE_ROOT', os.path.abspath(os.path.join(self.script_dir, '..')))
         model_path = os.path.join(self.script_dir, 'gesture_model.pkl')
 
@@ -31,9 +30,10 @@ class GazeIntent:
         # --- 3. MediaPipe INITIALIZATION ---
         mp_model_path = os.path.abspath(os.path.join(project_root, '..', 'assets', 'face_landmarker.task'))
         base_options = python.BaseOptions(model_asset_path=mp_model_path)
+
         options = vision.FaceLandmarkerOptions(
             base_options=base_options,
-            running_mode=vision.RunningMode.IMAGE,
+            running_mode=vision.RunningMode.VIDEO,
             num_faces=1,
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
@@ -48,35 +48,53 @@ class GazeIntent:
         self.LEFT_IRIS = 468
         self.RIGHT_IRIS = 473
 
-        # Eye corners for horizontal gaze calculation (Outer, Inner)
         self.LEFT_CORNERS = (33, 133)
         self.RIGHT_CORNERS = (362, 263)
 
-        # Eyelid centers for vertical gaze calculation (Top, Bottom)
         self.LEFT_VERTICAL_BOUNDS = (159, 145)
         self.RIGHT_VERTICAL_BOUNDS = (386, 374)
 
-        # --- 5. TEMPORAL STATE ---
-        self.window_size = 15
+        # --- 5. TEMPORAL STATE & CALIBRATION ---
+        self.window_size = 10
         self.left_ear_history = deque(maxlen=self.window_size)
         self.right_ear_history = deque(maxlen=self.window_size)
 
-    def close(self):
+        self.frame_timestamp_ms = 0
+
+        # Dynamic Baseline Normalization Variables
+        self.is_calibrated = False
+        self.calibration_frame_count = 30
+        self.current_calibration_frames = 0
+        self.left_ear_sum = 0.0
+        self.right_ear_sum = 0.0
+        self.baseline_left_ear = 1.0
+        self.baseline_right_ear = 1.0
+
+    def shutdown(self):
         """Safely release MediaPipe resources to prevent memory leaks in production."""
-        if hasattr(self, 'detector'):
+        if hasattr(self, 'detector') and self.detector is not None:
             self.detector.close()
+            self.detector = None
 
     def __del__(self):
-        self.close()
+        self.shutdown()
 
     @staticmethod
-    def _calculate_ear(face_landmarks, frame_w: int, frame_h: int, indices: list) -> float:
-        """Calculates Eye Aspect Ratio (EAR)."""
-        coords = [np.array([face_landmarks[idx].x * frame_w, face_landmarks[idx].y * frame_h]) for idx in indices]
-        p1, p2, p3, p4, p5, p6 = coords
-        v_dist_1 = float(np.linalg.norm(p2 - p6))
-        v_dist_2 = float(np.linalg.norm(p3 - p5))
-        h_dist = float(np.linalg.norm(p1 - p4))
+    def _get_3d_dist(p1, p2, frame_w: int, frame_h: int) -> float:
+        """Centralized helper to calculate true 3D Euclidean distance between two landmarks."""
+        return math.hypot((p1.x - p2.x) * frame_w,
+                          (p1.y - p2.y) * frame_h,
+                          p1.z - p2.z)
+
+    @classmethod
+    def _calculate_ear(cls, face_landmarks, frame_w: int, frame_h: int, indices: list) -> float:
+        """Calculates Eye Aspect Ratio (EAR) using the DRY 3D distance helper."""
+        p1, p2, p3, p4, p5, p6 = (face_landmarks[i] for i in indices)
+
+        v_dist_1 = cls._get_3d_dist(p2, p6, frame_w, frame_h)
+        v_dist_2 = cls._get_3d_dist(p3, p5, frame_w, frame_h)
+        h_dist = cls._get_3d_dist(p1, p4, frame_w, frame_h)
+
         return (v_dist_1 + v_dist_2) / (2.0 * h_dist) if h_dist > 0 else 0.0
 
     @staticmethod
@@ -93,102 +111,90 @@ class GazeIntent:
             return float(np.min(ear_array)), float(np.var(ear_array))
         return float(current_ear), 0.0
 
-    @staticmethod
-    def _get_horizontal_eye_gaze_ratio(landmarks, frame_w: int, corners: Tuple[int, int], iris_idx: int) -> float:
-        """Calculates the horizontal gaze ratio for a single eye."""
-        p_outer = landmarks[corners[0]]
-        p_inner = landmarks[corners[1]]
+    @classmethod
+    def _get_eye_gaze_ratio(cls, landmarks, frame_w: int, frame_h: int, bounds: Tuple[int, int],
+                            iris_idx: int) -> float:
+        """Generic method to calculate gaze ratio across a specified eye axis."""
+        p_bound1 = landmarks[bounds[0]]
+        p_bound2 = landmarks[bounds[1]]
         p_iris = landmarks[iris_idx]
 
-        outer_x = p_outer.x * frame_w
-        inner_x = p_inner.x * frame_w
-        iris_x = p_iris.x * frame_w
-
-        min_x = min(outer_x, inner_x)
-        max_x = max(outer_x, inner_x)
-        eye_width = max_x - min_x
-
-        if eye_width == 0:
+        axis_length = cls._get_3d_dist(p_bound1, p_bound2, frame_w, frame_h)
+        if axis_length == 0:
             return 0.5
 
-        return float((iris_x - min_x) / eye_width)
-
-    @staticmethod
-    def _get_vertical_eye_gaze_ratio(landmarks, frame_h: int, bounds: Tuple[int, int], iris_idx: int) -> float:
-        """Calculates the vertical gaze ratio for a single eye relative to the eyelids."""
-        p_top = landmarks[bounds[0]]
-        p_bottom = landmarks[bounds[1]]
-        p_iris = landmarks[iris_idx]
-
-        top_y = p_top.y * frame_h
-        bottom_y = p_bottom.y * frame_h
-        iris_y = p_iris.y * frame_h
-
-        min_y = min(top_y, bottom_y)
-        max_y = max(top_y, bottom_y)
-        eye_height = max_y - min_y
-
-        if eye_height == 0:
-            return 0.5
-
-        return float((iris_y - min_y) / eye_height)
+        iris_dist = cls._get_3d_dist(p_iris, p_bound2, frame_w, frame_h)
+        return float(iris_dist / axis_length)
 
     def _calculate_gaze(self, landmarks, frame_w: int, frame_h: int) -> Tuple[float, float]:
-        """
-        Calculates normalized X and Y cursor coordinates based on iris position relative to eye boundaries.
-        Returns values between 0.0 and 1.0.
-        """
-        # Horizontal ratio (X)
-        l_ratio_x = self._get_horizontal_eye_gaze_ratio(landmarks, frame_w, self.LEFT_CORNERS, self.LEFT_IRIS)
-        r_ratio_x = self._get_horizontal_eye_gaze_ratio(landmarks, frame_w, self.RIGHT_CORNERS, self.RIGHT_IRIS)
+        """Calculates normalized X and Y cursor coordinates based on iris position."""
+        l_ratio_x = self._get_eye_gaze_ratio(landmarks, frame_w, frame_h, self.LEFT_CORNERS, self.LEFT_IRIS)
+        r_ratio_x = self._get_eye_gaze_ratio(landmarks, frame_w, frame_h, self.RIGHT_CORNERS, self.RIGHT_IRIS)
         gaze_x = (l_ratio_x + r_ratio_x) / 2.0
 
-        # Vertical ratio (Y)
-        l_ratio_y = self._get_vertical_eye_gaze_ratio(landmarks, frame_h, self.LEFT_VERTICAL_BOUNDS, self.LEFT_IRIS)
-        r_ratio_y = self._get_vertical_eye_gaze_ratio(landmarks, frame_h, self.RIGHT_VERTICAL_BOUNDS, self.RIGHT_IRIS)
+        l_ratio_y = self._get_eye_gaze_ratio(landmarks, frame_w, frame_h, self.LEFT_VERTICAL_BOUNDS, self.LEFT_IRIS)
+        r_ratio_y = self._get_eye_gaze_ratio(landmarks, frame_w, frame_h, self.RIGHT_VERTICAL_BOUNDS, self.RIGHT_IRIS)
         gaze_y = (l_ratio_y + r_ratio_y) / 2.0
 
-        # Clamp between 0.0 and 1.0 for absolute bounds safety
         return max(0.0, min(1.0, gaze_x)), max(0.0, min(1.0, gaze_y))
 
-    # noinspection DuplicatedCode
-    def process_frame(self, frame_array: np.ndarray) -> Tuple[float, float, int]:
+    @staticmethod
+    def _normalize_ear(raw_ear: float, baseline: float) -> float:
+        """Normalizes the current EAR against the user's calibrated resting baseline."""
+        return raw_ear / baseline if baseline > 0 else 0.0
+
+    def process_frame(self, rgb_frame_array: np.ndarray, timestamp_ms: int) -> Tuple[float, float, int]:
         """
         THE C++ BRIDGE METHOD.
-        Takes a raw BGR numpy array from OpenCV.
         Returns a Tuple: (Cursor X, Cursor Y, Eye State)
+        State -1 indicates the system is currently calibrating.
         """
         gaze_x, gaze_y = -1.0, -1.0
         state = 0  # 0 = Neutral
 
-        frame = cv2.flip(frame_array, 1)
-        frame_h, frame_w, _ = frame.shape
+        frame_h, frame_w, _ = rgb_frame_array.shape
+        self.frame_timestamp_ms = timestamp_ms
 
-        # Convert BGR to RGB for MediaPipe
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        results = self.detector.detect(mp_image)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame_array)
+        results = self.detector.detect_for_video(mp_image, self.frame_timestamp_ms)
 
         if results.face_landmarks:
             landmarks = results.face_landmarks[0]
 
-            # Extract EAR for both eyes
-            left_ear = self._calculate_ear(landmarks, frame_w, frame_h, self.LEFT_EYE)
-            right_ear = self._calculate_ear(landmarks, frame_w, frame_h, self.RIGHT_EYE)
+            # 1. Extract raw EAR
+            raw_left_ear = self._calculate_ear(landmarks, frame_w, frame_h, self.LEFT_EYE)
+            raw_right_ear = self._calculate_ear(landmarks, frame_w, frame_h, self.RIGHT_EYE)
 
+            # 2. Gaze Math (Runs independently of calibration)
+            gaze_x, gaze_y = self._calculate_gaze(landmarks, frame_w, frame_h)
+
+            # 3. Handle Dynamic Calibration
+            if not self.is_calibrated:
+                self.left_ear_sum += raw_left_ear
+                self.right_ear_sum += raw_right_ear
+                self.current_calibration_frames += 1
+
+                if self.current_calibration_frames >= self.calibration_frame_count:
+                    self.baseline_left_ear = self.left_ear_sum / self.calibration_frame_count
+                    self.baseline_right_ear = self.right_ear_sum / self.calibration_frame_count
+                    self.is_calibrated = True
+
+                # Return -1 to tell C++ to hold the cursor and show a "Calibrating" UI
+                return float(gaze_x), float(gaze_y), -1
+
+            # 4. Normalize the EAR based on the user's baseline
+            left_ear = self._normalize_ear(raw_left_ear, self.baseline_left_ear)
+            right_ear = self._normalize_ear(raw_right_ear, self.baseline_right_ear)
+
+            # 5. Proceed with AI Inference using Normalized data
             self.left_ear_history.append(left_ear)
             self.right_ear_history.append(right_ear)
 
-            # Calculate Rolling Features
             l_min, l_var = self._get_rolling_features(self.left_ear_history, left_ear)
             r_min, r_var = self._get_rolling_features(self.right_ear_history, right_ear)
             bounding_box_area = self._calculate_bounding_box_area(landmarks, frame_w, frame_h)
 
-            # AI Inference
             features = np.array([[left_ear, l_min, l_var, right_ear, r_min, r_var, bounding_box_area]])
             state = int(self.model.predict(features)[0])
-
-            # Gaze Math
-            gaze_x, gaze_y = self._calculate_gaze(landmarks, frame_w, frame_h)
 
         return float(gaze_x), float(gaze_y), int(state)

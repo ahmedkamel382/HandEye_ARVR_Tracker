@@ -30,3 +30,6 @@ add_executable(core_engine core_engine/src/main.cpp)
 
 # 6. Link OpenCV and the Pybind11 Embed module to the Core Engine
 target_link_libraries(core_engine PRIVATE ${OpenCV_LIBS} pybind11::embed)
+
+include(CTest)
+add_subdirectory(dsp_filter)

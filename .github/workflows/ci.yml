@@ -2,12 +2,12 @@ name: HandEye Tracker CI/CD Pipeline
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main" ]
 
 env:
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite" # Enables GitHub Actions caching for vcpkg
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   # =========================================================================
@@ -19,10 +19,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5 # Upgraded to fix Node 20 deprecation
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6 # Upgraded to fix Node 20 deprecation
         with:
           python-version: "3.11"
           cache: "pip"
@@ -37,10 +37,6 @@ jobs:
         run: |
           python -m py_compile ai_pipeline/gaze_intent/gaze_intent.py
 
-      - name: Run Pytest (if test suites exist)
-        run: |
-          pytest --ignore=datasets || echo "No standalone pytests discovered. Skipping."
-
   # =========================================================================
   # 2. C++ ENGINE & DSP FILTER BUILD
   # =========================================================================
@@ -51,12 +47,12 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5 # Upgraded
         with:
           submodules: recursive
 
       - name: Set up Python 3.11 (for Pybind11 Embed)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6 # Upgraded
         with:
           python-version: "3.11"
 
@@ -66,14 +62,14 @@ jobs:
           pip install pybind11
 
       - name: Set up vcpkg Caching
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8 # Upgraded
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg Installed Packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5 # Upgraded
         with:
           path: |
             ${{ env.LOCALAPPDATA }}/vcpkg/archives

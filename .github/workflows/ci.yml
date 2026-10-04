@@ -80,7 +80,7 @@ jobs:
         run: |
           $pythonPath = (Get-Command python).Source
           cmake -B build `
-            -G "Visual Studio 17 2022" -A x64 `
+            -G "Ninja" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET="x64-windows" `
             -DPython3_EXECUTABLE="$pythonPath" `

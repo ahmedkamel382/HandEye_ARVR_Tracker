@@ -2,9 +2,9 @@ name: HandEye Tracker CI/CD Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
 
 env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"

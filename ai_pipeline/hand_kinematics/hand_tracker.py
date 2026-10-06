@@ -4,179 +4,175 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
 import os
+import time
+from collections import deque, Counter
 from typing import Tuple
+
+from hand_features import (extract_features, result_to_points, load_gesture_model,
+                           FEATURE_NAMES)
 
 
 class HandTracker:
     """
-    THE C++ BRIDGE CLASS.
+    THE C++ BRIDGE CLASS.  process_frame(BGR frame) -> (Cursor X, Cursor Y, Gesture State)
 
-    Standalone Python hand-tracking module. Zero OS-level logic -- its only
-    job is to turn a raw webcam frame into a standardized (Cursor X, Cursor Y,
-    Gesture State) payload for the Pybind11 core engine to consume.
+    Gesture classification = Random Forest over 3D joint angles / normalized
+    3D distances (see hand_features.py), trained with model_trainer.py.
+    This replaces the old 2D pixel-distance thresholds, whose Pinch/Fist
+    distributions overlapped completely (no threshold could separate them).
 
-    Unlike GazeIntent (which needs a trained Random Forest because blink
-    nuance depends on each user's facial anatomy), hand poses are mechanically
-    rigid -- Pinch and Fist are reliably detected with pure vector geometry
-    on the 21 MediaPipe hand landmarks. No training pipeline, no .pkl model,
-    virtually zero extra CPU cost next to the eye-tracking model running in
-    parallel on the same machine.
+    Stability layer 1 (classification): a majority vote over the last
+    SMOOTHING_FRAMES predictions plus a minimum-confidence gate, so one
+    noisy frame can't fire a click.
+
+    Stability layer 2 (detection dropouts): MediaPipe's hand detector can
+    intermittently fail to find a hand for a few consecutive frames on hard
+    poses -- a tightly closed Fist held close to the face is the worst case,
+    since it has few distinguishing edges and low skin/background contrast.
+    Without this layer, a single missed frame used to clear the vote buffer
+    and snap straight to (-1.0, -1.0, 0), bypassing the smoothing above
+    entirely -- that produced the "flickers between all three states" bug,
+    which was actually a *detection* dropout, not a *classification* error
+    (confirmed live: real detections during the same dropouts classified
+    Fist correctly at 0.83-0.92 confidence). Now a short run of missed
+    frames (up to GRACE_FRAMES) just holds the last known output instead of
+    resetting; only a longer, genuine hand-loss clears state to Neutral.
+
+    Stability layer 3 (tracking mode): running in VIDEO mode (not IMAGE)
+    lets MediaPipe reuse the previous frame's hand location as a tracking
+    prior instead of re-running full palm detection from scratch on every
+    single frame. Per Google's own docs, this is specifically what keeps
+    the skeleton alive through hard, momentary poses -- live testing still
+    showed occasional dropouts longer than GRACE_FRAMES under IMAGE mode
+    (a held Fist briefly reporting Neutral/-1,-1 despite being clearly
+    visible), which VIDEO mode's tracking continuity is meant to reduce at
+    the source, with the grace period above as a remaining safety net for
+    whatever dropouts still get through.
+
+    If hand_gesture_rf.pkl does not exist yet, a rough 3D geometric fallback
+    is used (bootstrap only, UNTESTED thresholds) and a warning is printed.
+    Train the model to get reliable behavior.
     """
 
+    SMOOTHING_FRAMES = 5
+    MIN_CONFIDENCE = 0.55      # below this, the frame votes Neutral
+
+    # Detection-dropout tolerance: consecutive frames with no hand found
+    # before we actually clear the vote buffer and report (-1, -1, 0).
+    # 6 frames (~0.2s at 30fps) comfortably covers the short dropouts seen
+    # on a tight Fist near the face without masking a genuine hand-away.
+    GRACE_FRAMES = 6
+
+    # Fallback-only (no trained model):
+    FALLBACK_PINCH_RATIO = 0.30
+    FALLBACK_CURL_RATIO = 1.30
+
     def __init__(self):
-        # --- 1. PATH RESOLUTION ---
-        # Mirrors GazeIntent's layout exactly:
-        # script_dir      -> ai_pipeline/hands/
-        # project_root    -> ai_pipeline/            (one level up)
-        # assets folder   -> <repo_root>/assets/     (one more level up)
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.environ.get('AI_PIPELINE_ROOT', os.path.abspath(os.path.join(self.script_dir, '..')))
+        assets_dir = os.path.abspath(os.path.join(project_root, '..', 'assets'))
 
-        model_path = os.path.abspath(os.path.join(project_root, '..', 'assets', 'hand_landmarker.task'))
+        model_path = os.path.join(assets_dir, 'hand_landmarker.task')
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"[CRITICAL ERROR] Hand model missing at:\n{model_path}")
 
-        # --- 2. MediaPipe INITIALIZATION ---
-        base_options = python.BaseOptions(model_asset_path=model_path)
         options = vision.HandLandmarkerOptions(
-            base_options=base_options,
-            running_mode=vision.RunningMode.IMAGE,
+            base_options=python.BaseOptions(model_asset_path=model_path),
+            # VIDEO (not IMAGE): each process_frame() call is one frame of a
+            # continuous webcam stream, so MediaPipe can track the hand
+            # forward from the previous frame instead of re-detecting the
+            # palm from scratch every time -- see Stability layer 3 above.
+            running_mode=vision.RunningMode.VIDEO,
             num_hands=1,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5
+            # Lowered from 0.5 -> 0.3. A tight Fist near the face has few
+            # clear edges and low skin/background contrast, which was
+            # pushing MediaPipe's own detection confidence below the old
+            # threshold on otherwise-valid frames (live tests showed
+            # correct Fist classification at 0.83-0.92 model confidence
+            # whenever detection succeeded -- the gap was detection
+            # recall, not classification quality).
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
 
-        # --- 3. LANDMARK INDICES ---
-        # Standard MediaPipe 21-point hand topology.
-        self.WRIST = 0
+        # VIDEO mode requires a strictly increasing timestamp (ms) per call.
+        self._start_time = time.time()
+        self._last_timestamp_ms = -1
 
-        self.THUMB_TIP = 4
-        self.INDEX_TIP = 8
-        self.MIDDLE_TIP = 12
-        self.RING_TIP = 16
-        self.PINKY_TIP = 20
+        self.rf = load_gesture_model(os.path.join(assets_dir, 'hand_gesture_rf.pkl'))
+        if self.rf is None:
+            print("[WARNING] hand_gesture_rf.pkl not found -> using rough geometric fallback. "
+                  "Run hand_data_collector.py then model_trainer.py.")
 
-        self.INDEX_MCP = 5
-        self.MIDDLE_MCP = 9
-        self.RING_MCP = 13
-        self.PINKY_MCP = 17
+        self._votes = deque(maxlen=self.SMOOTHING_FRAMES)
+        self.last_confidence = 0.0   # debug only, not part of the C++ bridge payload
 
-        # (tip, mcp) pairs for the four fingers used in Fist detection.
-        # Thumb is intentionally excluded -- its curl geometry is different
-        # from the other four fingers and would need its own rule.
-        self.CURL_FINGER_PAIRS = [
-            (self.INDEX_TIP, self.INDEX_MCP),
-            (self.MIDDLE_TIP, self.MIDDLE_MCP),
-            (self.RING_TIP, self.RING_MCP),
-            (self.PINKY_TIP, self.PINKY_MCP),
-        ]
+        # Grace-period state: last known good output + consecutive-miss counter.
+        self._missed_frames = 0
+        self._last_output = (-1.0, -1.0, 0)
 
-        # --- 4. TUNING THRESHOLDS ---
-        # Pinch distance is normalized against palm size (wrist -> middle MCP)
-        # so the threshold stays valid whether the hand is close to or far
-        # from the camera.
-        # NOTE: raised from 0.35 -> 0.5 after live testing with
-        # hand_data_collector.py showed real pinches landing around 0.46,
-        # above the old threshold (which caused them to be misread as Fist,
-        # since the other 3 fingers naturally curl a bit during a pinch too).
-        self.PINCH_THRESHOLD_RATIO = 0.5
+    def _classify(self, feats: np.ndarray) -> Tuple[int, float]:
+        if self.rf is not None:
+            proba = self.rf.predict_proba(feats.reshape(1, -1))[0]
+            k = int(np.argmax(proba))
+            cls, conf = int(self.rf.classes_[k]), float(proba[k])
+            return (cls if conf >= self.MIN_CONFIDENCE else 0), conf
 
-        # A finger counts as "curled" (closed) when its tip sits closer to
-        # the wrist than its own MCP knuckle does. Fist = at least 3 of the
-        # 4 tracked fingers curled.
-        self.FIST_MIN_CURLED_FINGERS = 3
+        # Fallback: 3D normalized distances (indices follow FEATURE_NAMES).
+        pinch = feats[FEATURE_NAMES.index("thumb_to_index_tip")]
+        tips = [feats[FEATURE_NAMES.index(f"wrist_to_{f}_tip")] for f in ("index", "middle", "ring", "pinky")]
+        if pinch < self.FALLBACK_PINCH_RATIO:
+            return 1, 1.0
+        if sum(t < self.FALLBACK_CURL_RATIO for t in tips) >= 3:
+            return 2, 1.0
+        return 0, 1.0
 
-    @staticmethod
-    def _landmark_xy(landmarks, idx: int, frame_w: int, frame_h: int) -> np.ndarray:
-        """Converts a normalized MediaPipe landmark to pixel coordinates."""
-        lm = landmarks[idx]
-        return np.array([lm.x * frame_w, lm.y * frame_h])
-
-    def _get_palm_size(self, landmarks, frame_w: int, frame_h: int) -> float:
-        """Distance from wrist to middle-finger MCP, used as a scale reference."""
-        wrist = self._landmark_xy(landmarks, self.WRIST, frame_w, frame_h)
-        middle_mcp = self._landmark_xy(landmarks, self.MIDDLE_MCP, frame_w, frame_h)
-        return float(np.linalg.norm(wrist - middle_mcp))
-
-    def _is_pinching(self, landmarks, frame_w: int, frame_h: int, palm_size: float) -> bool:
-        """
-        Detects a Pinch by measuring the Euclidean distance between the
-        index fingertip (Landmark 8) and thumb tip (Landmark 4), normalized
-        by palm size so the threshold works at any distance from the camera.
-        """
-        if palm_size == 0:
-            return False
-
-        thumb_tip = self._landmark_xy(landmarks, self.THUMB_TIP, frame_w, frame_h)
-        index_tip = self._landmark_xy(landmarks, self.INDEX_TIP, frame_w, frame_h)
-        pinch_dist = float(np.linalg.norm(thumb_tip - index_tip))
-
-        return (pinch_dist / palm_size) < self.PINCH_THRESHOLD_RATIO
-
-    def _is_fist(self, landmarks, frame_w: int, frame_h: int) -> bool:
-        """
-        Detects a closed Fist by checking, for each of the 4 main fingers,
-        whether its tip sits closer to the wrist than its own MCP knuckle
-        does (i.e. the finger is curled inward rather than extended outward).
-        """
-        wrist = self._landmark_xy(landmarks, self.WRIST, frame_w, frame_h)
-        curled_count = 0
-
-        for tip_idx, mcp_idx in self.CURL_FINGER_PAIRS:
-            tip = self._landmark_xy(landmarks, tip_idx, frame_w, frame_h)
-            mcp = self._landmark_xy(landmarks, mcp_idx, frame_w, frame_h)
-
-            tip_to_wrist = np.linalg.norm(tip - wrist)
-            mcp_to_wrist = np.linalg.norm(mcp - wrist)
-
-            if tip_to_wrist < mcp_to_wrist:
-                curled_count += 1
-
-        return curled_count >= self.FIST_MIN_CURLED_FINGERS
-
-    # noinspection DuplicatedCode
     def process_frame(self, frame_array: np.ndarray) -> Tuple[float, float, int]:
         """
-        THE C++ BRIDGE METHOD.
-        Takes a raw BGR numpy array from OpenCV.
-        Returns a Tuple: (Cursor X, Cursor Y, Gesture State)
-
-        Gesture State values:
-            0 = Neutral / Hover
-            1 = Pinch   (e.g. Left Click / Drag)
-            2 = Fist    (e.g. Pause / Alternate action)
+        State values: 0 = Neutral/Hover, 1 = Pinch (click/drag), 2 = Fist.
+        No hand for more than GRACE_FRAMES consecutive frames -> (-1.0, -1.0, 0).
+        A short dropout (<= GRACE_FRAMES) holds the last known output instead
+        of resetting, since most such dropouts are detection misses on a
+        hand that is still actually there (see class docstring).
         """
-        cursor_x, cursor_y = -1.0, -1.0
-        state = 0  # 0 = Neutral
-
         frame = cv2.flip(frame_array, 1)
-        frame_h, frame_w, _ = frame.shape
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        # Convert BGR to RGB for MediaPipe
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        results = self.detector.detect(mp_image)
+        # Monotonic timestamp required by VIDEO mode. Wall-clock time is
+        # normally plenty, but two calls can land in the same millisecond
+        # on a fast machine -- force strictly increasing just in case.
+        timestamp_ms = int((time.time() - self._start_time) * 1000)
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
 
-        if results.hand_landmarks:
-            landmarks = results.hand_landmarks[0]
+        result = self.detector.detect_for_video(mp_image, timestamp_ms)
 
-            # Cursor position: normalized index fingertip (Landmark 8),
-            # already in [0.0, 1.0] range directly from MediaPipe -- no
-            # frame_w/frame_h division needed, same pattern as GazeIntent's
-            # iris .y usage.
-            cursor_x = max(0.0, min(1.0, landmarks[self.INDEX_TIP].x))
-            cursor_y = max(0.0, min(1.0, landmarks[self.INDEX_TIP].y))
+        points = result_to_points(result)
+        if points is None or not result.hand_landmarks:
+            self._missed_frames += 1
+            if self._missed_frames > self.GRACE_FRAMES:
+                # Genuine hand-loss: clear everything and report Neutral.
+                self._votes.clear()
+                self.last_confidence = 0.0
+                self._last_output = (-1.0, -1.0, 0)
+            # Either way, return the held output rather than snapping to
+            # Neutral on every single missed frame.
+            return self._last_output
 
-            # Gesture classification via pure geometric heuristics.
-            palm_size = self._get_palm_size(landmarks, frame_w, frame_h)
+        # Hand found again -- reset the miss counter.
+        self._missed_frames = 0
 
-            if self._is_pinching(landmarks, frame_w, frame_h, palm_size):
-                state = 1
-            elif self._is_fist(landmarks, frame_w, frame_h):
-                state = 2
-            else:
-                state = 0
+        index_tip = result.hand_landmarks[0][8]
+        cursor_x = max(0.0, min(1.0, index_tip.x))
+        cursor_y = max(0.0, min(1.0, index_tip.y))
 
-        return float(cursor_x), float(cursor_y), int(state)
+        state, self.last_confidence = self._classify(extract_features(points))
+        self._votes.append(state)
+        smoothed = Counter(self._votes).most_common(1)[0][0]
+
+        self._last_output = (float(cursor_x), float(cursor_y), int(smoothed))
+        return self._last_output

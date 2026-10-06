@@ -60,9 +60,11 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(display_frame, f"STATE: {state} ({state_name})", (30, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-        cv2.putText(display_frame, f"Cursor X: {cursor_x:.3f}", (30, 115),
+        cv2.putText(display_frame, f"Confidence: {tracker.last_confidence:.2f}", (30, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+        cv2.putText(display_frame, f"Cursor X: {cursor_x:.3f}", (30, 125),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-        cv2.putText(display_frame, f"Cursor Y: {cursor_y:.3f}", (30, 145),
+        cv2.putText(display_frame, f"Cursor Y: {cursor_y:.3f}", (30, 150),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
         cv2.imshow("test_hand_tracker (press q to quit)", display_frame)

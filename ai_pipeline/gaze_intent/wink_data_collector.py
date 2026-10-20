@@ -62,29 +62,17 @@ class DataCollector:
         self.baseline_right_ear = 1.0
 
     @staticmethod
-    def _get_3d_dist(p1, p2, frame_w: int, frame_h: int) -> float:
-        """Centralized helper to calculate true 3D Euclidean distance between two landmarks."""
-        return math.hypot((p1.x - p2.x) * frame_w,
-                          (p1.y - p2.y) * frame_h,
-                          p1.z - p2.z)
+    def _get_3d_dist(p1, p2, frame_w, frame_h) -> float:
+        # Scale normalized coordinates to physical pixels (MediaPipe z scales with width)
+        return math.sqrt(((p1.x - p2.x) * frame_w)**2 + ((p1.y - p2.y) * frame_h)**2 + ((p1.z - p2.z) * frame_w)**2)
 
     @classmethod
-    def _calculate_ear(cls, face_landmarks, frame_w: int, frame_h: int, indices: list) -> float:
-        """Calculates Eye Aspect Ratio (EAR) using the DRY 3D distance helper."""
+    def _calculate_ear(cls, face_landmarks, indices: list, frame_w: int, frame_h: int) -> float:
         p1, p2, p3, p4, p5, p6 = (face_landmarks[i] for i in indices)
-
         v_dist_1 = cls._get_3d_dist(p2, p6, frame_w, frame_h)
         v_dist_2 = cls._get_3d_dist(p3, p5, frame_w, frame_h)
         h_dist = cls._get_3d_dist(p1, p4, frame_w, frame_h)
-
         return (v_dist_1 + v_dist_2) / (2.0 * h_dist) if h_dist > 0 else 0.0
-
-    @staticmethod
-    def _calculate_bounding_box_area(face_landmarks, frame_w: int, frame_h: int) -> float:
-        """Calculates face bounding box area for normalization."""
-        x_coords = [lm.x * frame_w for lm in face_landmarks]
-        y_coords = [lm.y * frame_h for lm in face_landmarks]
-        return float((max(x_coords) - min(x_coords)) * (max(y_coords) - min(y_coords)))
 
     def _get_rolling_features(self, history: deque, current_ear: float) -> tuple[float, float]:
         """Calculates rolling min and variance safely."""
@@ -104,7 +92,7 @@ class DataCollector:
                     'Timestamp',
                     'Left_EAR', 'Left_Min_10f', 'Left_Var_10f',
                     'Right_EAR', 'Right_Min_10f', 'Right_Var_10f',
-                    'BoundingBox_Area', 'Label'
+                    'Label'
                 ])
 
             cap = cv2.VideoCapture(0)
@@ -132,8 +120,8 @@ class DataCollector:
                 if results.face_landmarks:
                     first_face_landmarks = results.face_landmarks[0]
 
-                    raw_left_ear = self._calculate_ear(first_face_landmarks, frame_w, frame_h, self.LEFT_EYE_INDICES)
-                    raw_right_ear = self._calculate_ear(first_face_landmarks, frame_w, frame_h, self.RIGHT_EYE_INDICES)
+                    raw_left_ear = self._calculate_ear(first_face_landmarks, self.LEFT_EYE_INDICES, frame_w, frame_h)
+                    raw_right_ear = self._calculate_ear(first_face_landmarks, self.RIGHT_EYE_INDICES, frame_w, frame_h)
 
                     if not self.is_calibrated:
                         self.left_ear_sum += raw_left_ear
@@ -165,13 +153,11 @@ class DataCollector:
                         l_min_ear, l_var_ear = self._get_rolling_features(self.left_ear_history, left_ear)
                         r_min_ear, r_var_ear = self._get_rolling_features(self.right_ear_history, right_ear)
 
-                        bounding_box_area = self._calculate_bounding_box_area(first_face_landmarks, frame_w, frame_h)
-
                         writer.writerow([
                             time.time(),
                             left_ear, l_min_ear, l_var_ear,
                             right_ear, r_min_ear, r_var_ear,
-                            bounding_box_area, self.current_label
+                            self.current_label
                         ])
 
                         label_text = {

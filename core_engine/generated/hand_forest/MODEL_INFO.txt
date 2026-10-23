@@ -1,0 +1,8 @@
+exported     : 2026-10-23T04:22:35
+pkl          : hand_gesture_rf.pkl  sha256 c29ff85ddd400440bb75d4dbce243d49fec9c0287dc95d537322a5573f33494e
+model        : RandomForestClassifier, 100 trees, classes [0, 1, 2]
+symbol prefix: hand_
+scikit-learn : 1.9.1
+treelite     : 4.7.2
+tl2cgen      : 1.0.0
+parity cases : 6000 (half on split thresholds)

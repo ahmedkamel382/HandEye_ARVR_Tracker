@@ -1,0 +1,19 @@
+{
+    "target": "predictor",
+    "sources": [{
+            "name": "main",
+            "length": 33
+        }, {
+            "name": "tu0",
+            "length": 6631
+        }, {
+            "name": "tu1",
+            "length": 6448
+        }, {
+            "name": "tu2",
+            "length": 6443
+        }, {
+            "name": "tu3",
+            "length": 6249
+        }]
+}

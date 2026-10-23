@@ -1,0 +1,3 @@
+moodycamel::ConcurrentQueue v1.0.4 (commit 6dd38b8a1dbaa7863aa907045f32308a56a6ff5d)
+Source: https://github.com/cameron314/concurrentqueue
+License: dual Simplified BSD / Boost-style, see LICENSE.md. Vendored unmodified so the build needs no network or git.

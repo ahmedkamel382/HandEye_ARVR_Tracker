@@ -2,9 +2,9 @@ name: HandEye Tracker CI/CD Pipeline
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "first-full-working-demo" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "first-full-working-demo" ]
 
 jobs:
   # =========================================================================

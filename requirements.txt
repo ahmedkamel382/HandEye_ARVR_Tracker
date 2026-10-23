@@ -8,3 +8,12 @@ seaborn
 joblib
 jupyter
 pytest
+torch
+torchvision
+tqdm
+safetensors
+treelite
+treelite-runtime
+tl2cgen
+onnx
+onnxruntime

@@ -92,7 +92,7 @@ endfunction()
 core_add_forest(gaze "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/gaze_forest" CORE_HAVE_TREELITE_FOREST)
 core_add_forest(hand "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/hand_forest" CORE_HAVE_HAND_FOREST)
 
-# 6c. Configure-time pre-flight (warnings only: the build still succeeds; "core_engine --check" is the full test).
+# 6c. Configure-time pre-flight checks for Python packages, MediaPipe models, and your Gaze/Wink assets.
 foreach(_pkg numpy mediapipe sklearn cv2)
     execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import ${_pkg}"
                     RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
@@ -101,14 +101,22 @@ foreach(_pkg numpy mediapipe sklearn cv2)
                         "Install the AI requirements into that venv (pip install numpy mediapipe scikit-learn opencv-python).")
     endif()
 endforeach()
+
 foreach(_m face_landmarker.task hand_landmarker.task)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/assets/${_m}")
         message(WARNING "Model file assets/${_m} is missing - the engine will fail at startup until it is added.")
     endif()
 endforeach()
+
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/assets/hand_gesture_rf.pkl")
     message(WARNING "assets/hand_gesture_rf.pkl is missing - hand gestures would use a rough geometric fallback "
                     "(train the hand model with Engineer 2's model_trainer.py).")
+endif()
+
+# Explicit checks for your gaze and wink components / exported forest directories
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/gaze_forest")
+    message(WARNING "Gaze/wink native forest folder is missing under core_engine/generated/gaze_forest. "
+                    "Run 'python core_engine/tools/export_forests.py' to generate native C inference files for your gaze/wink models.")
 endif()
 
 if(MSVC)
@@ -127,7 +135,7 @@ if(WIN32)
 endif()
 
 include(CTest)
-add_subdirectory(dsp_filter)            # Engineer 4: defines the static library target "dsp_filter"
+add_subdirectory(dsp_filter)                # Engineer 4: defines the static library target "dsp_filter"
 add_subdirectory(core_engine/os_integration)   # Engineer 5: OS integration + tray app (targets os_integration, os_integration_tray, ...)
 
 # 7b. Eng 5's OS integration is the LAST stage of the pipeline (after the DSP filter): screen mapping, gestures, clicks,
@@ -148,4 +156,4 @@ if(TARGET dsp_filter)
     message(STATUS "Smoothing filter: dsp_filter (Engineer 4)")
 endif()
 
-add_subdirectory(core_engine/tests tests_build)   # unit tests always; parity + end-to-end tests when the compiled forest exists
+add_subdirectory(core_engine/tests tests_build)    # unit tests always; parity + end-to-end tests when the compiled forest exists

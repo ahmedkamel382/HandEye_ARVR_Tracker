@@ -44,6 +44,7 @@ class _Detector:
     def detect_for_video(self, image, ts):
         return types.SimpleNamespace(
             face_landmarks=[self.next_face] if self.next_face else [],
+            facial_transformation_matrixes=[np.eye(4, dtype=np.float32)] if self.next_face else [],
             hand_landmarks=[self.next_hand] if self.next_hand else [],
             hand_world_landmarks=[self.next_world] if self.next_world else [])
 
@@ -188,8 +189,8 @@ def main():
             blank = np.zeros((h, w, 3), dtype=np.uint8)
             for ts, lm in enumerate(seq):
                 detector.next_face = as_objs(lm) if lm is not None else []
-                x, y, s = gi.process_frame(blank, ts * 16 + 1)
-                expected.append((x, y, s)); kinds.append("gaze")
+                final_yaw, final_pitch, head_yaw, head_pitch, state, landmarks = gi.process_frame(blank, ts * 16 + 1)
+                expected.append((final_yaw, final_pitch, state)); kinds.append("gaze")
                 n = 0 if lm is None else len(lm)
                 lines.append(f"F {w} {h} {n} " + (fmt(lm) if lm is not None else ""))
             gi.shutdown()

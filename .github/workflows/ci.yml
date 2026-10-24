@@ -94,6 +94,13 @@ jobs:
       - name: Build Core Engine & DSP Filter
         run: cmake --build build --config Release --parallel
 
+      - name: Fix tl2cgen Windows DLL Path Issue
+        shell: pwsh
+        run: |
+          $pythonDir = Split-Path (Get-Command python).Source
+          $libBinPath = Join-Path $pythonDir "Library\bin"
+          New-Item -ItemType Directory -Force -Path $libBinPath
+
       - name: Execute CTest (Unit, Parity & E2E Tests)
         working-directory: build
         run: ctest -C Release --output-on-failure

@@ -11,7 +11,7 @@ $ErrorActionPreference = "Stop"
 $env:PYTHONDONTWRITEBYTECODE = "1"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$RepoRoot = Split-Path -Parent $ProjectRoot
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $ProjectRoot)
 $BuildDir = Join-Path $ProjectRoot "build"
 $DistDir = Join-Path $ProjectRoot "dist"
 
@@ -138,29 +138,51 @@ if (-not $SkipTests) {
     }
 }
 
+
 Write-Host "Staging distribution..."
+
 $DistBin = Join-Path $DistDir "bin"
 $DistLib = Join-Path $DistDir "lib"
 $DistInclude = Join-Path $DistDir "include"
 $DistPython = Join-Path $DistDir "python"
 $DistModel = Join-Path $DistDir "model"
 $DistExample = Join-Path $DistDir "examples"
+
 foreach ($Directory in @($DistBin, $DistLib, $DistInclude, $DistPython, $DistModel, $DistExample)) {
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null
 }
 
+# Copy compiled artifacts
 Copy-Item -LiteralPath $DllPath -Destination $DistBin -Force
 Copy-Item -LiteralPath $LibPath -Destination $DistLib -Force
-Copy-Item -LiteralPath (Join-Path $ProjectRoot "include\hand_index_tracker.h") -Destination $DistInclude -Force
-Copy-Item -LiteralPath (Join-Path $RepoRoot "ai_pipeline\hand_kinematics\index_tracker.py") -Destination $DistPython -Force
-Copy-Item -LiteralPath (Join-Path $RepoRoot "ai_pipeline\hand_kinematics\hand_features.py") -Destination $DistPython -Force
-Copy-Item -LiteralPath (Join-Path $RepoRoot "assets\hand_landmarker.task") -Destination $DistModel -Force
-Copy-Item -LiteralPath (Join-Path $ProjectRoot "examples\index_tracker_example.cpp") -Destination $DistExample -Force
 Copy-Item -LiteralPath $SmokePath -Destination $DistBin -Force
 Copy-Item -LiteralPath $ExamplePath -Destination $DistBin -Force
 Copy-Item -LiteralPath $IntegrationPath -Destination $DistBin -Force
-Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.md") -Destination $DistDir -Force
-Remove-Item -LiteralPath (Join-Path $DistPython "__pycache__") -Recurse -Force -ErrorAction SilentlyContinue
+
+# Copy public header and example source
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "include\hand_index_tracker.h") `
+    -Destination $DistInclude -Force
+
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "examples\index_tracker_example.cpp") `
+    -Destination $DistExample -Force
+
+# Reuse the existing Python runtime files and model in dist
+$PythonSource = Join-Path $DistPython "index_tracker.py"
+$FeaturesSource = Join-Path $DistPython "hand_features.py"
+$ModelSource = Join-Path $DistModel "hand_landmarker.task"
+
+foreach ($RequiredSource in @($PythonSource, $FeaturesSource, $ModelSource)) {
+    if (-not (Test-Path -LiteralPath $RequiredSource)) {
+        throw "Required distribution file missing: $RequiredSource"
+    }
+}
+
+# Copy the project README into dist
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.md") `
+    -Destination $DistDir -Force
+
+Remove-Item -LiteralPath (Join-Path $DistPython "__pycache__") `
+    -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "Build complete."

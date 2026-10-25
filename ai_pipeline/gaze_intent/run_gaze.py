@@ -60,6 +60,11 @@ def main():
     last_cursor_x, last_cursor_y = None, None
     CROP_SIZE = 500
 
+    # EMA Variables moved from tracker to runner
+    smooth_yaw = 0.0
+    smooth_pitch = 0.0
+    ema_alpha = 0.20
+
     while cap.isOpened():
         success, frame = cap.read()
         if not success: break
@@ -69,9 +74,21 @@ def main():
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         timestamp_ms = int((time.time() - start_time) * 1000)
 
-        # 1. RUN TRACKER ON RAW FRAME (Perfects 3D Head Pose)
-        rel_yaw, rel_pitch, head_yaw, head_pitch, state, landmarks = tracker.process_frame(rgb_frame, timestamp_ms)
+        # 1. RUN TRACKER ON RAW FRAME (Outputs raw Absolute Gaze)
+        raw_yaw, raw_pitch, head_yaw, head_pitch, state, landmarks = tracker.process_frame(rgb_frame, timestamp_ms)
         state_text, state_color = STATE_LABELS.get(state, (f"STATE: {state}", (0, 255, 0)))
+
+        # Apply EMA smoothing locally for the visualizer
+        if raw_yaw != 0.0 or raw_pitch != 0.0:
+            if smooth_yaw == 0.0 and smooth_pitch == 0.0:
+                smooth_yaw = raw_yaw
+                smooth_pitch = raw_pitch
+            else:
+                smooth_yaw = (ema_alpha * raw_yaw) + ((1 - ema_alpha) * smooth_yaw)
+                smooth_pitch = (ema_alpha * raw_pitch) + ((1 - ema_alpha) * smooth_pitch)
+        else:
+            smooth_yaw = 0.0
+            smooth_pitch = 0.0
 
         # 2. CALCULATE UI CROP
         if landmarks:
@@ -154,12 +171,12 @@ def main():
                           (0, 255, 255), 2)
 
             if elapsed > 1.2:
-                current_dot_samples.append((rel_yaw, rel_pitch))
+                current_dot_samples.append((smooth_yaw, smooth_pitch))
                 baseline_areas.append(get_face_area(landmarks, raw_w, raw_h))  # Calculate multiplier on RAW frame
 
             if elapsed >= calib_duration:
-                med_yaw = float(np.median([s[0] for s in current_dot_samples])) if current_dot_samples else rel_yaw
-                med_pitch = float(np.median([s[1] for s in current_dot_samples])) if current_dot_samples else rel_pitch
+                med_yaw = float(np.median([s[0] for s in current_dot_samples])) if current_dot_samples else smooth_yaw
+                med_pitch = float(np.median([s[1] for s in current_dot_samples])) if current_dot_samples else smooth_pitch
                 collected_features.append(build_poly_features(med_yaw, med_pitch))
                 target_screen_pts.append([tx, ty])
                 current_dot_samples = []
@@ -173,7 +190,7 @@ def main():
                     reg_x, reg_y = Ridge(alpha=0.5).fit(A, targets[:, 0]), Ridge(alpha=0.5).fit(A, targets[:, 1])
                     calib_active = False
         else:
-            feat = build_poly_features(rel_yaw, rel_pitch).reshape(1, -1)
+            feat = build_poly_features(smooth_yaw, smooth_pitch).reshape(1, -1)
             raw_cx, raw_cy = float(reg_x.predict(feat)[0]), float(reg_y.predict(feat)[0])
 
             current_area = get_face_area(landmarks, raw_w, raw_h)
@@ -210,7 +227,7 @@ def main():
             cv2.circle(cropped_frame, (cursor_x, cursor_y), 2, (0, 0, 0), -1, cv2.LINE_AA)
 
             draw_hud_text(cropped_frame,
-                          f"EYE: (Y:{rel_yaw:.1f} P:{rel_pitch:.1f}) | HEAD: (Y:{head_yaw:.1f} P:{head_pitch:.1f})",
+                          f"EYE: (Y:{smooth_yaw:.1f} P:{smooth_pitch:.1f}) | HEAD: (Y:{head_yaw:.1f} P:{head_pitch:.1f})",
                           (20, 35), 0.65, (255, 255, 255), 2)
             draw_hud_text(cropped_frame, f"STATE: {state_text}", (20, 70), 0.85, state_color, 2)
 

@@ -82,11 +82,6 @@ class GazeIntent:
         self.baseline_left_ear = 1.0
         self.baseline_right_ear = 1.0
 
-        # EMA Smoothing for ML Degrees
-        self.smooth_pitch = 0.0
-        self.smooth_yaw = 0.0
-        self.ema_alpha = 0.20
-
     def shutdown(self):
         if hasattr(self, 'detector') and self.detector is not None:
             self.detector.close()
@@ -157,7 +152,7 @@ class GazeIntent:
 
     def process_frame(self, rgb_frame_array: np.ndarray, timestamp_ms: int) -> Tuple[float, float, float, float, int, Optional[Any]]:
         """
-        Returns (final_yaw, final_pitch, head_yaw, head_pitch, state, landmarks)
+        Returns (raw_abs_yaw, raw_abs_pitch, head_yaw, head_pitch, state, landmarks)
         """
         state = 0
         frame_h, frame_w, _ = rgb_frame_array.shape
@@ -219,14 +214,7 @@ class GazeIntent:
             abs_pitch = rel_pitch + head_pitch
             abs_yaw = rel_yaw + head_yaw
 
-            # 3. EMA Smoothing on the Absolute World Gaze
-            self.smooth_pitch = (self.ema_alpha * abs_pitch) + ((1 - self.ema_alpha) * self.smooth_pitch)
-            self.smooth_yaw = (self.ema_alpha * abs_yaw) + ((1 - self.ema_alpha) * self.smooth_yaw)
-
-            final_pitch = self.smooth_pitch
-            final_yaw = self.smooth_yaw
-
-            # Return the Absolute World Gaze to the calibrator
-            return final_yaw, final_pitch, head_yaw, head_pitch, state, landmarks
+            # Return the raw Absolute World Gaze to the caller
+            return abs_yaw, abs_pitch, head_yaw, head_pitch, state, landmarks
 
         return 0.0, 0.0, 0.0, 0.0, 0, None

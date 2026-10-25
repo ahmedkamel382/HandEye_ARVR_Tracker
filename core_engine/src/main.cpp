@@ -183,6 +183,10 @@ std::string hintFor(const std::string& err, const std::string& site) {
         return "install it into the venv the engine was configured with:  python -m pip install " + pkg +
                "   (the engine looks in: " + site + ")";
     }
+    if (err.find("Access is denied") != std::string::npos || err.find("Access denied") != std::string::npos)
+        return "Windows refused to read a Python file (typical for a Microsoft Store Python, or an antivirus). Install Python 3.11 "
+               "from python.org for your user, delete .venv and out\\, run setup.bat, then configure and build again "
+               "(see SETUP_AND_RUN_GUIDE.md, 'Access is denied')";
     if (err.find("DLL load failed") != std::string::npos)
         return "install the Microsoft Visual C++ Redistributable 2015-2022 (x64), then retry";
     if (err.find("model missing") != std::string::npos || err.find(".task") != std::string::npos)
@@ -758,6 +762,13 @@ int main(int argc, char** argv) {
         if (!std::ifstream(std::string(core::paths::kPyHomeDir) + "/Lib/os.py")) {
             std::fprintf(stderr, "[FATAL] The Python installation this program was built with is not there any more:\n"
                                  "  %s\nDelete the build folder and configure again with the project's .venv.\n",
+                         core::paths::kPyHomeDir);
+            return 2;
+        }
+        if (std::string(core::paths::kPyHomeDir).find("WindowsApps") != std::string::npos) {
+            std::fprintf(stderr, "[FATAL] This build uses a Microsoft Store Python:\n  %s\n"
+                                 "Windows does not let other programs load files from it (\"Access is denied\").\n"
+                                 "Install Python 3.11 from python.org, delete .venv and out\\, run setup.bat and build again.\n",
                          core::paths::kPyHomeDir);
             return 2;
         }

@@ -9,7 +9,7 @@ tests/fake_ai/bridge/landmark_extractors.py), runs the real core_engine on it in
   -> forest -> 1-Euro filter -> OS integration (Eng 5, dry run: nothing reaches the real mouse)
   + frame accounting (no frame unaccounted for), no Python errors, no leaked frame slots.
 
-  python run_e2e.py --exe core_engine --ai-root <repo>/core_engine/tests/fake_ai
+  python run_e2e.py --exe core_engine --ai-root <repo>/core_engine/tests/fake_ai --gaze-models <repo>/ai_pipeline/gaze_intent/models
 Needs: python with opencv (cv2) and numpy.
 """
 import argparse
@@ -48,6 +48,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
     ap.add_argument("--ai-root", required=True)
+    ap.add_argument("--gaze-models", required=True, help="<repo>/ai_pipeline/gaze_intent/models (the real .dll models)")
     a = ap.parse_args()
 
     tmp = tempfile.TemporaryDirectory()
@@ -69,7 +70,7 @@ def main():
     hand_pkl = os.path.join(tmp.name, "standin_hand_rf.pkl")
     hand_features_ref.train_standin_model(hand_pkl)
 
-    cmd = [a.exe, "--video", video, "--ai-root", a.ai_root, "--hand-model", hand_pkl,
+    cmd = [a.exe, "--video", video, "--ai-root", a.ai_root, "--gaze-models", a.gaze_models, "--hand-model", hand_pkl,
            "--start-active", "--os", "log"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     out = p.stdout
@@ -97,7 +98,7 @@ def main():
     check("hand is mirrored (x ~ 0.84, y ~ 0.50)", bool(re.search(r"hand\(0\.8[2-6],0\.(4[89]|5[0-2]) s=", out)))
     check("pinch state reported by the native hand math", bool(re.search(r"hand\([\d.]+,[\d.]+ s=1\)", out)))
     # ---- --check (start-up self test): must pass on a good setup and fail with a hint on bad ones ----
-    base = [a.exe, "--check", "--ai-root", a.ai_root, "--hand-model", hand_pkl]
+    base = [a.exe, "--check", "--ai-root", a.ai_root, "--gaze-models", a.gaze_models, "--hand-model", hand_pkl]
     c = subprocess.run(base + ["--video", video], capture_output=True, text=True, timeout=120)
     check("--check passes on a good setup (exit 0)", c.returncode == 0 and "ALL CHECKS PASSED" in c.stdout,
           f"exit {c.returncode}")

@@ -46,7 +46,7 @@ class FaceLandmarkExtractor:
             return _EMPTY
         k_left = 0.25 if _block_on(rgb, 1) else 1.0
         k_right = 0.25 if _block_on(rgb, 2) else 1.0
-        return syn.make_face(k_left=k_left, k_right=k_right, iris=(0.5, 0.5))
+        return syn.pack_face(syn.make_face(k_left=k_left, k_right=k_right, iris=(0.5, 0.5)))
 
     def shutdown(self):
         pass

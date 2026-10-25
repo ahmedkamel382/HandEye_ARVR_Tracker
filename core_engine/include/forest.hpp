@@ -1,17 +1,18 @@
-// The blink/wink classifier (Random Forest). Three interchangeable backends:
-//   TreeliteForest   : the forest compiled to native C by Treelite/TL2cgen (microseconds, no Python).
-//                      Only built when core_engine/generated/gaze_forest/{main.c,header.h} exist.
-//   PySklearnForest  : loads gesture_model.pkl through the embedded Python (about 5 ms/call). Fallback.
-//   LambdaForest     : for unit tests.
+// The gaze models. Since Eng 3's rewrite there are THREE Treelite/TL2cgen models, all shipped as compiled .dll files in
+// ai_pipeline/gaze_intent/models/ and run natively (no Python, see tl_model.hpp):
+//   gesture_model.dll  wink/blink classifier   6 features -> class 0..3        (IForest)
+//   gaze_pitch.dll     eye-in-socket pitch     5 features -> degrees           (IRegressor)
+//   gaze_yaw.dll       eye-in-socket yaw       5 features -> degrees           (IRegressor)
+// LambdaForest / LambdaRegressor are for unit tests.
 #pragma once
 #include <cstdint>
 #include <functional>
-#include <stdexcept>
 #include <utility>
 
 namespace core {
 
-constexpr int kGazeFeatures = 7;   // [left_ear, l_min, l_var, right_ear, r_min, r_var, bbox_area]
+constexpr int kGazeFeatures = 6;   // wink model: [left_ear, l_min, l_var, right_ear, r_min, r_var]
+constexpr int kPoseFeatures = 5;   // pitch/yaw models: [iris_x, iris_y, head_pitch, head_yaw, head_roll]
 
 class IForest {
 public:
@@ -20,6 +21,14 @@ public:
     virtual int predict(const float* features) = 0;
     virtual const char* name() const = 0;
     virtual uint64_t errors() const { return 0; }
+};
+
+class IRegressor {
+public:
+    virtual ~IRegressor() = default;
+    // `features` points to kPoseFeatures floats. Returns degrees.
+    virtual double predict(const float* features) = 0;
+    virtual const char* name() const = 0;
 };
 
 class LambdaForest : public IForest {
@@ -31,23 +40,13 @@ private:
     std::function<int(const float*)> fn_;
 };
 
-#ifdef CORE_HAVE_TREELITE_FOREST
-extern "C" {
-int gaze_forest_num_features(void);
-int gaze_forest_num_classes(void);
-int gaze_forest_predict(const float* features);   // implemented in src/forest_shim.c
-}
-
-class TreeliteForest : public IForest {
+class LambdaRegressor : public IRegressor {
 public:
-    TreeliteForest() {
-        if (gaze_forest_num_features() != kGazeFeatures)
-            throw std::runtime_error("compiled forest expects a different number of features than 7");
-    }
-    int predict(const float* f) override { return gaze_forest_predict(f); }
-    const char* name() const override { return "treelite (compiled)"; }
-    int numClasses() const { return gaze_forest_num_classes(); }
+    explicit LambdaRegressor(std::function<double(const float*)> fn) : fn_(std::move(fn)) {}
+    double predict(const float* f) override { return fn_(f); }
+    const char* name() const override { return "lambda"; }
+private:
+    std::function<double(const float*)> fn_;
 };
-#endif
 
 } // namespace core

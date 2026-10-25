@@ -12,7 +12,10 @@ Contract (called from core_engine/include/py_bridge.hpp, always on ONE thread):
                 It is a view of memory owned by the C++ core: use it during the call, never keep it.
         ts_ms : int, strictly increasing milliseconds
         pts   : float32 ndarray (N, 3) of the first face / hand, or an array of shape (0, 3) when nothing is
-                detected.   FaceLandmarkExtractor: N = 478 normalised (x, y, z) face points.
+                detected.   FaceLandmarkExtractor: N = 484 = the 478 normalised (x, y, z) face points followed by
+                6 rows that carry MediaPipe's 4x4 facial transformation matrix (16 floats, row-major, then 2 zeros):
+                gaze_math.hpp turns it into the head pose (pitch / yaw / roll), like gaze_intent.py does.
+                No matrix from MediaPipe counts as no face.
                 HandLandmarkExtractor: N = 42 = the 21 normalised IMAGE landmarks (rows 0..20, used for the
                 cursor) followed by the 21 WORLD landmarks (rows 21..41, metres, used for the 24 gesture features).
     extractor.shutdown()                         # releases the MediaPipe resources (called once at exit)
@@ -33,6 +36,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 _EMPTY = np.zeros((0, 3), dtype=np.float32)
+_POSE_ROWS = 6          # 4x4 matrix = 16 floats = 5.33 rows of 3 -> 6 rows, zero padded
 
 
 def _asset_path(name: str) -> str:
@@ -54,7 +58,7 @@ def _to_array(landmarks) -> np.ndarray:
 
 
 class FaceLandmarkExtractor:
-    """478 face-mesh points (468 mesh + 10 iris). Same MediaPipe settings as gaze_intent.py."""
+    """478 face-mesh points (468 mesh + 10 iris) + the head-pose matrix. Same MediaPipe settings as gaze_intent.py."""
 
     def __init__(self):
         options = vision.FaceLandmarkerOptions(
@@ -64,15 +68,19 @@ class FaceLandmarkExtractor:
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
+            output_facial_transformation_matrixes=True,      # head pose, needed by the gaze models
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
 
     def process_frame(self, rgb: np.ndarray, timestamp_ms: int) -> np.ndarray:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.detector.detect_for_video(mp_image, int(timestamp_ms))
-        if not result.face_landmarks:
+        if not result.face_landmarks or not result.facial_transformation_matrixes:
             return _EMPTY
-        return _to_array(result.face_landmarks[0])
+        pts = _to_array(result.face_landmarks[0])
+        pose = np.zeros((_POSE_ROWS, 3), dtype=np.float32)
+        pose.reshape(-1)[:16] = np.asarray(result.facial_transformation_matrixes[0], dtype=np.float32).reshape(-1)
+        return np.concatenate([pts, pose])
 
     def shutdown(self):
         if getattr(self, "detector", None) is not None:

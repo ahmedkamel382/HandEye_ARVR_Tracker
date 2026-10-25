@@ -10,7 +10,7 @@
 //     AI thread (the only one that touches Python + GIL):   |                      +-- OS output (log, or real mouse)
 //       MediaPipe face landmarks  (Python, returns raw points)
 //       MediaPipe hand landmarks  (Python, returns raw points)
-//       gaze math + forest        (native C++, forest = Treelite-compiled C)
+//       gaze math + 3 models      (native C++: wink classifier + pitch/yaw regressors = Treelite-compiled .dll files)
 //       hand features + gesture forest + vote + dropout grace  (native C++, forest = Treelite-compiled C)
 //
 //  Rules
@@ -48,6 +48,7 @@
 #include "build_paths.hpp"
 #include "dsp_adapter.hpp"
 #include "forest.hpp"
+#include "tl_model.hpp"
 #include "frame_pool.hpp"
 #include "gaze_math.hpp"
 #include "hand_math.hpp"
@@ -121,8 +122,7 @@ struct Config {
     bool        preview = false;            // debug window drawn by the AI thread
     std::string ai_root = core::paths::kAiPipelineDir;
     std::string site    = core::paths::kPySiteDir;
-    std::string forest  = "auto";           // auto | treelite | sklearn
-    std::string selftest;                   // CSV from tools/export_forests.py (gaze forest)
+    std::string gaze_models;                // folder with gesture_model.dll, gaze_pitch.dll, gaze_yaw.dll (default <ai-root>/gaze_intent/models)
     std::string selftest_hand;              // same, hand forest
     std::string hand_forest = "auto";       // auto | treelite | sklearn
     std::string hand_model;                 // explicit hand .pkl (scikit-learn backend); default assets/hand_gesture_rf.pkl
@@ -187,63 +187,30 @@ std::string hintFor(const std::string& err, const std::string& site) {
         return "install the Microsoft Visual C++ Redistributable 2015-2022 (x64), then retry";
     if (err.find("model missing") != std::string::npos || err.find(".task") != std::string::npos)
         return "the MediaPipe model file is missing: put face_landmarker.task / hand_landmarker.task into the repo's assets/ folder";
-    if (err.find("gesture_model.pkl") != std::string::npos)
-        return "gesture_model.pkl was not found under <ai-root>/gaze_intent/ (needed only by the scikit-learn fallback)";
+    if (err.find("gaze model") != std::string::npos)
+        return "the three gaze models (gesture_model.dll, gaze_pitch.dll, gaze_yaw.dll) must be in <ai-root>/gaze_intent/models, "
+               "or pass --gaze-models DIR";
     if (err.find("hand_gesture_rf.pkl") != std::string::npos || err.find("hand model") != std::string::npos)
         return "hand_gesture_rf.pkl is expected in the repo's assets/ folder (or pass --hand-model FILE); "
                "without it the engine would only have the rough geometric fallback";
     return std::string();
 }
 
-// --------------------------------------------------------------- forest ----
-// Must be called with the GIL held (the scikit-learn fallback uses Python).
-std::unique_ptr<core::IForest> makeForest(const Config& cfg) {
-#ifdef CORE_HAVE_TREELITE_FOREST
-    if (cfg.forest != "sklearn") return std::unique_ptr<core::IForest>(new core::TreeliteForest());
-#else
-    if (cfg.forest == "treelite")
-        throw std::runtime_error("this build has no compiled forest: run tools/export_forests.py, "
-                                 "then delete the build folder and re-configure");
-#endif
-    std::unique_ptr<core::PySklearnForest> f(new core::PySklearnForest());
-    f->load(cfg.ai_root + "/gaze_intent/gesture_model.pkl");
-    return std::unique_ptr<core::IForest>(f.release());
+// ---------------------------------------------------------- gaze models ----
+// Eng 3's three Treelite models, loaded from their .dll files (no Python involved).
+struct GazeModels {
+    std::unique_ptr<core::TlForest> wink;
+    std::unique_ptr<core::TlRegressor> pitch, yaw;
+};
+
+GazeModels makeGazeModels(const Config& cfg) {
+    const std::string dir = cfg.gaze_models.empty() ? cfg.ai_root + "/gaze_intent/models" : cfg.gaze_models;
+    GazeModels m;
+    m.wink.reset(new core::TlForest(dir + "/gesture_model.dll"));
+    m.pitch.reset(new core::TlRegressor(dir + "/gaze_pitch.dll"));
+    m.yaw.reset(new core::TlRegressor(dir + "/gaze_yaw.dll"));
+    return m;
 }
-
-// Compares the active forest with the labels scikit-learn produced (parity_cases.csv).
-int runForestSelfTest(const Config& cfg) {
-    std::ifstream in(cfg.selftest);
-    if (!in) { std::fprintf(stderr, "Cannot open %s\n", cfg.selftest.c_str()); return 1; }
-    std::unique_ptr<core::IForest> forest;
-    try { forest = makeForest(cfg); }
-    catch (const std::exception& e) { std::fprintf(stderr, "[FATAL] %s\n", e.what()); return 2; }
-
-    size_t n = 0, ok = 0;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::stringstream ss(line);
-        std::string tok;
-        float f[core::kGazeFeatures];
-        int i = 0, label = -1;
-        while (std::getline(ss, tok, ',')) {
-            if (i < core::kGazeFeatures) f[i] = std::strtof(tok.c_str(), nullptr);
-            else if (i == core::kGazeFeatures) label = std::atoi(tok.c_str());
-            ++i;
-        }
-        if (i != core::kGazeFeatures + 1) continue;
-        ++n;
-        const int got = forest->predict(f);
-        if (got == label) ++ok;
-        else if (n - ok <= 5) std::printf("  mismatch on row %zu: scikit-learn=%d forest=%d\n", n, label, got);
-    }
-    std::printf("forest self-test [%s]: %zu/%zu predictions match scikit-learn %s\n",
-                forest->name(), ok, n, (n > 0 && ok == n) ? "(PASS)" : "(FAIL)");
-    if (auto* sk = dynamic_cast<core::PySklearnForest*>(forest.get())) sk->shutdown();
-    forest.reset();
-    return (n > 0 && ok == n) ? 0 : 3;
-}
-
 
 // ----------------------------------------------------------- hand model ----
 // Must be called with the GIL held (the scikit-learn backend uses Python).
@@ -384,14 +351,14 @@ void aiBody(Pipeline& P) {
     const Config& cfg = P.cfg;
     py::gil_scoped_acquire gil;                      // this thread owns Python for its whole life
     core::PyLandmarker face, hand;
-    std::unique_ptr<core::IForest> forest;           // declared after `gil`: destroyed before the GIL is released
+    GazeModels gaze_models;
     std::unique_ptr<core::IHandModel> hand_model;
 
     try {
         core::prependSysPath(cfg.site);
         core::prependSysPath(cfg.ai_root + "/bridge");
         if (cfg.use_gaze) {
-            forest = makeForest(cfg);
+            gaze_models = makeGazeModels(cfg);
             face.load("landmark_extractors", "FaceLandmarkExtractor");
         }
         if (cfg.use_hand) {
@@ -411,12 +378,12 @@ void aiBody(Pipeline& P) {
         return;
     }
     std::printf("[ai] ready | gaze: %s | hand: %s%s\n",
-                cfg.use_gaze ? (std::string("face landmarks + native math, forest = ") + forest->name()).c_str() : "off",
+                cfg.use_gaze ? (std::string("face landmarks + native math, models = ") + gaze_models.wink->name() + " + pitch/yaw").c_str() : "off",
                 cfg.use_hand ? (std::string("hand landmarks + native features, model = ") + hand_model->name()).c_str() : "off",
                 cfg.hand_roi > 0 ? " | hand ROI crop ON" : "");
     P.ai_ready.store(true);
 
-    core::GazeNative gaze(forest.get());
+    core::GazeNative gaze(gaze_models.wink.get(), gaze_models.pitch.get(), gaze_models.yaw.get());
     core::HandNative handn(hand_model.get(), cfg.hand);
     const cv::Size fs = P.pool.size();
     const int roi = std::min({cfg.hand_roi, fs.width, fs.height});
@@ -425,7 +392,7 @@ void aiBody(Pipeline& P) {
     bool hand_valid = false;                         // ROI state lives here: the AI thread is its only user
     float last_hx = 0.f, last_hy = 0.f;
     std::vector<float> face_pts, hand_pts;           // reused buffers: no per-frame allocation after warm-up
-    face_pts.reserve(478 * 3);
+    face_pts.reserve(size_t(core::GazeNative::kPacked) * 3);
     hand_pts.reserve(size_t(core::kHandPacked) * 3);
 
     int64_t last_ts = -1;
@@ -491,7 +458,7 @@ void aiBody(Pipeline& P) {
         P.pool.release(pkt.slot);                              // slot is reusable immediately
 
         // Python failures: counted, first few printed, loop keeps going.
-        const uint64_t errs = face.errors + hand.errors + (forest ? forest->errors() : 0) + (hand_model ? hand_model->errors() : 0);
+        const uint64_t errs = face.errors + hand.errors + (hand_model ? hand_model->errors() : 0);
         P.stats.py_errors.store(errs, std::memory_order_relaxed);
         if (errs > err_printed && err_printed < 5) {
             std::fprintf(stderr, "[ai] python error #%llu: %s\n", (unsigned long long)errs,
@@ -514,9 +481,8 @@ void aiBody(Pipeline& P) {
     if (cfg.preview) cv::destroyAllWindows();
     face.shutdown();                                           // releases MediaPipe resources
     hand.shutdown();
-    if (auto* sk = dynamic_cast<core::PySklearnForest*>(forest.get())) sk->shutdown();
     if (auto* sh = dynamic_cast<core::PySklearnHandModel*>(hand_model.get())) sh->shutdown();
-    forest.reset();
+    gaze_models = GazeModels();
     hand_model.reset();
 }
 
@@ -531,7 +497,7 @@ void usage() {
 "core_engine - camera -> hand/gaze trackers -> filter -> OS output\n\n"
 "source:   --camera N | --video FILE | --width W --height H --fps F\n"
 "loop:     --pool N (frames in flight, default 8) | --process-all | --seconds N | --preview\n"
-"modules:  --no-gaze | --no-hand | --hand-roi N (experimental crop) | --forest auto|treelite|sklearn (gaze)\n"
+"modules:  --no-gaze | --no-hand | --hand-roi N (experimental crop) | --gaze-models DIR (default <ai-root>/gaze_intent/models)\n"
 "          --hand-forest auto|treelite|sklearn | --hand-model FILE.pkl (default assets/hand_gesture_rf.pkl)\n"
 "hand:     --hand-anchor tip|knuckle|mid   (pointer source, margins and calibration: tray app / os_integration.ini)\n"
 "filter:   --filter auto|dsp|builtin (auto = Eng 4's dsp_filter when compiled in) | --no-filter\n"
@@ -539,7 +505,7 @@ void usage() {
 "output:   --os log|win32 (default log = dry run) | --control (same as --os win32) | --start-active\n"
 "paths:    --ai-root DIR | --site DIR\n"
 "checks:   --check (diagnose Python, packages, models, forest and camera; sends nothing to the OS)\n"
-"          --selftest-forest gaze_forest/parity_cases.csv | --selftest-hand-forest hand_forest/parity_cases.csv\n"
+"          --selftest-hand-forest hand_forest/parity_cases.csv\n"
 "exit codes: 0 ok | 1 bad options / source or filter config | 2 AI stage or Python failed to start | 3 camera lost | 130 interrupted\n"
 "hotkeys (Windows): Ctrl+Alt+P = pause/resume (OS integration), F9 = quit.  Ctrl+C also quits.  Tray icon: Calibrate, Exit.\n");
 }
@@ -621,8 +587,7 @@ Config parseArgs(int argc, char** argv, bool& ok) {
         else if (a == "--preview")        c.preview = true;
         else if (a == "--ai-root")        c.ai_root = next();
         else if (a == "--site")           c.site = next();
-        else if (a == "--forest")         c.forest = next();
-        else if (a == "--selftest-forest") c.selftest = next();
+        else if (a == "--gaze-models")    c.gaze_models = next();
         else if (a == "--selftest-hand-forest") c.selftest_hand = next();
         else if (a == "--hand-forest")    c.hand_forest = next();
         else if (a == "--hand-model")     c.hand_model = next();
@@ -642,9 +607,6 @@ Config parseArgs(int argc, char** argv, bool& ok) {
             else { std::fprintf(stderr, "--hand-anchor must be tip, knuckle or mid\n"); ok = false; }
         } else if (a == "--help" || a == "-h") { usage(); ok = false; }
         else { std::fprintf(stderr, "Unknown option: %s (try --help)\n", a.c_str()); ok = false; }
-    }
-    if (c.forest != "auto" && c.forest != "treelite" && c.forest != "sklearn") {
-        std::fprintf(stderr, "--forest must be auto, treelite or sklearn\n"); ok = false;
     }
     if (c.hand_forest != "auto" && c.hand_forest != "treelite" && c.hand_forest != "sklearn") {
         std::fprintf(stderr, "--hand-forest must be auto, treelite or sklearn\n"); ok = false;
@@ -697,15 +659,19 @@ int runCheck(const Config& cfg) {
     pkg("numpy");
 
     core::PyLandmarker face, hand;
-    std::unique_ptr<core::IForest> forest;
+    GazeModels gmodels;
     if (cfg.use_gaze) {
         try {
-            forest = makeForest(cfg);
-            const float probe[core::kGazeFeatures] = {1.f, 1.f, 0.f, 1.f, 1.f, 0.f, 80000.f};
-            ok("gaze forest", std::string(forest->name()) + ", test prediction " + std::to_string(forest->predict(probe)));
+            gmodels = makeGazeModels(cfg);
+            const float wp[core::kGazeFeatures] = {1.f, 1.f, 0.f, 1.f, 1.f, 0.f};        // both eyes open
+            const float gp[core::kPoseFeatures] = {0.5f, 0.0f, 0.f, 0.f, 0.f};           // looking straight ahead
+            char b[200];
+            std::snprintf(b, sizeof b, "wink class %d, pitch %.2f, yaw %.2f deg (test inputs)", gmodels.wink->predict(wp),
+                          gmodels.pitch->predict(gp), gmodels.yaw->predict(gp));
+            ok("gaze models", b);
         } catch (const std::exception& e) {
             const std::string msg = shortErr(e.what());
-            bad("gaze forest", firstLine(msg), hintFor(msg, cfg.site));
+            bad("gaze models", firstLine(msg), hintFor(msg, cfg.site));
         }
         try { face.load("landmark_extractors", "FaceLandmarkExtractor"); ok("face landmarker", "loaded"); }
         catch (const std::exception& e) { const std::string msg = shortErr(e.what()); bad("face landmarker", firstLine(msg), hintFor(msg, cfg.site)); }
@@ -758,9 +724,7 @@ int runCheck(const Config& cfg) {
 
     face.shutdown();
     hand.shutdown();
-    if (auto* sk = dynamic_cast<core::PySklearnForest*>(forest.get())) sk->shutdown();
     if (auto* sh = dynamic_cast<core::PySklearnHandModel*>(hmodel.get())) sh->shutdown();
-    forest.reset();
     hmodel.reset();
 
     std::printf("\n%s%s\n", failed ? (std::to_string(failed) + " check(s) FAILED").c_str() : "ALL CHECKS PASSED",
@@ -787,7 +751,7 @@ int main(int argc, char** argv) {
     if (cfg.os == "win32") { std::fprintf(stderr, "--control / --os win32 is only available on Windows\n"); return 1; }
 #endif
 
-    // ---- embedded Python (started before the camera so --selftest-forest needs no camera) ----
+    // ---- embedded Python (started before the camera so --selftest-hand-forest needs no camera) ----
 #ifdef _WIN32
     if (core::paths::kPyHomeDir[0]) {
         // An embedded Python cannot report this itself: a wrong home aborts the process with "Fatal Python error".
@@ -803,7 +767,6 @@ int main(int argc, char** argv) {
     // (no signal handlers: keep our Ctrl+C handler; no program dir on sys.path)
     py::scoped_interpreter interpreter{false, 0, nullptr, false};
     try { core::prependSysPath(cfg.site); } catch (const std::exception&) {}
-    if (!cfg.selftest.empty()) return runForestSelfTest(cfg);
     if (!cfg.selftest_hand.empty()) return runHandSelfTest(cfg);
     if (cfg.check) return runCheck(cfg);
 

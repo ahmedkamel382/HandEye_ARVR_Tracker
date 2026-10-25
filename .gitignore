@@ -18,3 +18,9 @@ build/
 *.exe
 *.dll
 *.lib
+
+# Exceptions: files the project needs at run time (must stay AFTER the patterns above)
+# Eng 3's compiled gaze models: the engine loads these three .dll files at startup
+!ai_pipeline/gaze_intent/models/*.dll
+# Hand forest test cases used by core_engine --selftest-hand-forest
+!core_engine/generated/hand_forest/parity_cases.csv

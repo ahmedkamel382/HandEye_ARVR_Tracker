@@ -4,7 +4,7 @@
 //      -> iris ratios (projected on the eye-corner line) + head pose (Euler angles from the matrix)
 //      -> pitch / yaw models (gaze_pitch.dll, gaze_yaw.dll) = eye-in-socket angles
 //      -> + head angles = absolute world gaze (raw, bypassing C++ EMA to let DSP handle filtering)
-// Like the Python: during calibration (state -1) the gaze is 0, 0; with no face the answer is (0, 0, state 0).
+// Like the Python: during calibration (state -1) the gaze is 0, 0; with no face the answer is (x = -1, y = -1, state 0).
 // All arithmetic is double, like Python's float64; the features are rounded to float32 before the models (what the
 // Python does with np.float32). The head-pose products are float32 too, because the matrix is a float32 array.
 #pragma once
@@ -23,10 +23,9 @@ namespace core {
         static constexpr int kPacked = kFacePoints + kPoseRows;  // padded with zeros to 6 rows of 3 (see landmark_extractors.py)
         static constexpr double kSpanDeg = 60.0;                 // x, y = 0.5 + angle / kSpanDeg  (+-30 deg covers the unit square)
 
-        GazeNative(IForest* wink, IRegressor* pitch, IRegressor* yaw, int calibration_frames = 30, int window = 10,
-            double ema_alpha = 0.20)
+        GazeNative(IForest* wink, IRegressor* pitch, IRegressor* yaw, int calibration_frames = 30, int window = 10)
             : wink_(wink), pitch_(pitch), yaw_(yaw), calib_target_(calibration_frames),
-            window_(static_cast<size_t>(window)), alpha_(ema_alpha) {}
+            window_(static_cast<size_t>(window)) {}
 
         bool calibrated() const { return calibrated_; }
         void recalibrate() {
@@ -39,7 +38,14 @@ namespace core {
         ModuleOut process(const float* lm, int n, int W, int H) {
             ModuleOut out;
             out.ok = true;
-            if (!lm || n < kPacked) return out;
+            if (!lm || n < kPacked) {
+                out.x = -1.0f;
+                out.y = -1.0f;
+                out.state = 0;
+                out.yaw_deg = 0.0;
+                out.pitch_deg = 0.0;
+                return out;
+            }
             const float* pose = lm + 3 * kFacePoints;
 
             const double raw_l = ear(lm, kLeftEye, W, H);
@@ -163,7 +169,6 @@ namespace core {
         IRegressor* pitch_, * yaw_;
         int calib_target_;
         size_t window_;
-        double alpha_;
         bool calibrated_ = false;
         int calib_frames_ = 0;
         double sum_l_ = 0.0, sum_r_ = 0.0, base_l_ = 1.0, base_r_ = 1.0;

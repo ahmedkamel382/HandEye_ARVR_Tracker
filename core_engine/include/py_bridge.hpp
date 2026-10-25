@@ -1,6 +1,6 @@
 // Pybind11 side of the bridge. Python is used ONLY for what has no C++ equivalent here:
 //   * MediaPipe landmark extraction (PyLandmarker)
-//   * optionally, scikit-learn as a fallback forest (PySklearnForest, PySklearnHandModel)
+//   * optionally, scikit-learn as a fallback hand model (PySklearnHandModel)
 // Everything runs on the AI thread, which holds the GIL. Python errors never escape:
 // they are counted and turned into "nothing detected".
 #pragma once
@@ -82,37 +82,6 @@ public:
 private:
     py::object inst_, fn_;
     bool loaded_ = false;
-};
-
-// Fallback forest: scikit-learn through the embedded interpreter (gesture_model.pkl).
-class PySklearnForest : public IForest {
-public:
-    void load(const std::string& pkl_path) {
-        py::module_::import("warnings").attr("filterwarnings")(
-            "ignore", py::arg("category") = py::module_::import("builtins").attr("UserWarning"));
-        model_ = py::module_::import("joblib").attr("load")(pkl_path);
-        predict_ = model_.attr("predict");
-    }
-    int predict(const float* f) override {
-        try {
-            py::array_t<double> a({static_cast<py::ssize_t>(1), static_cast<py::ssize_t>(kGazeFeatures)});
-            double* p = a.mutable_data();
-            for (int i = 0; i < kGazeFeatures; ++i) p[i] = f[i];
-            py::object r = predict_(a);
-            return py::int_(r.cast<py::sequence>()[0]).cast<int>();
-        } catch (const std::exception& e) {
-            ++errors_;
-            last_error_ = e.what();
-            return 0;
-        }
-    }
-    const char* name() const override { return "scikit-learn (Python, slow fallback)"; }
-    uint64_t errors() const override { return errors_; }
-    void shutdown() { predict_ = py::object(); model_ = py::object(); }
-    std::string last_error_;
-private:
-    py::object model_, predict_;
-    uint64_t errors_ = 0;
 };
 
 // Hand gesture model through scikit-learn (hand_gesture_rf.pkl = {"model": RandomForest, "feature_names": [...]}).

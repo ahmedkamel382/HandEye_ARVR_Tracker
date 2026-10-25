@@ -165,11 +165,13 @@ static void t_hand_anchor_clamp_and_fallback() {
 }
 
 // ======================================================================= gaze maths
-// 478 landmarks with both eyes drawn so that the Eye Aspect Ratio equals the requested value.
+// 478 landmarks (+ the head-pose matrix rows) with both eyes drawn so that the Eye Aspect Ratio equals the requested value.
 struct FacePts {
-    std::vector<float> p = std::vector<float>(478 * 3, 0.f);
+    std::vector<float> p = std::vector<float>(GazeNative::kPacked * 3, 0.f);
     static constexpr int W = 640, H = 480;
+    int count() const { return GazeNative::kPacked; }
     void set(int i, double x, double y) { p[3 * i] = float(x); p[3 * i + 1] = float(y); p[3 * i + 2] = 0.f; }
+    void setPose(const float (&m)[16]) { for (int i = 0; i < 16; ++i) p[3 * GazeNative::kFacePoints + i] = m[i]; }
     void eye(const int (&i)[6], double x0, double y0, double ear) {
         const double w = 64.0;                             // eye width in pixels
         const double v = ear * w;                          // each vertical gap in pixels
@@ -185,56 +187,109 @@ struct FacePts {
         set(159, 232.0 / W, (200 - l_ear * 64 / 2) / H);   set(145, 232.0 / W, (200 + l_ear * 64 / 2) / H);   // vertical bounds
         set(386, 412.0 / W, (200 - r_ear * 64 / 2) / H);   set(374, 412.0 / W, (200 + r_ear * 64 / 2) / H);
         set(468, 232.0 / W, 200.0 / H);    set(473, 412.0 / W, 200.0 / H);                                    // irises centred
+        const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        setPose(identity);
     }
 };
+// Models for the tests: the wink classifier records its features, the pitch/yaw regressors return constants.
+struct GazeRig {
+    std::vector<float> wink_in = std::vector<float>(kGazeFeatures, -1.f), pose_in = std::vector<float>(kPoseFeatures, -1.f);
+    int wink_calls = 0;
+    double pitch_out = 0.0, yaw_out = 0.0;
+    LambdaForest wink{[this](const float* f) { for (int i = 0; i < kGazeFeatures; ++i) wink_in[i] = f[i]; ++wink_calls; return 0; }};
+    LambdaRegressor pitch{[this](const float* f) { for (int i = 0; i < kPoseFeatures; ++i) pose_in[i] = f[i]; return pitch_out; }};
+    LambdaRegressor yaw{[this](const float*) { return yaw_out; }};
+    GazeNative g{&wink, &pitch, &yaw};
+    ModuleOut run(const FacePts& f) { return g.process(f.p.data(), f.count(), FacePts::W, FacePts::H); }
+    void calibrate(const FacePts& f) { for (int i = 0; i < 30; ++i) run(f); }
+};
 static void t_gaze_calibration_and_features() {
-    std::vector<float> last(kGazeFeatures, -1.f);
-    int calls = 0;
-    LambdaForest forest([&](const float* f) { for (int i = 0; i < kGazeFeatures; ++i) last[i] = f[i]; ++calls; return 0; });
-    GazeNative g(&forest);
+    GazeRig r;
     FacePts open(0.30, 0.30);
     for (int i = 0; i < 29; ++i) {
-        ModuleOut o = g.process(open.p.data(), 478, FacePts::W, FacePts::H);
+        ModuleOut o = r.run(open);
         CHECK(o.detected() && o.state == -1);
+        CHECK(o.yaw_deg == 0.0 && o.pitch_deg == 0.0);                     // calibrating: gaze is 0, 0 (like the Python)
     }
-    CHECK(calls == 0 && !g.calibrated());
-    ModuleOut o = g.process(open.p.data(), 478, FacePts::W, FacePts::H);   // 30th calibration frame still reports -1
-    CHECK(o.state == -1 && g.calibrated());
-    CHECK_NEAR(o.x, 0.5, 1e-6);                                            // irises centred -> ratio 0.5
-    for (int i = 0; i < 12; ++i) o = g.process(open.p.data(), 478, FacePts::W, FacePts::H);
-    CHECK(o.state == 0 && calls == 12);
-    CHECK_NEAR(last[0], 1.0, 1e-4);                                        // normalised EAR (open) = 1
-    CHECK_NEAR(last[1], 1.0, 1e-4);                                        // rolling min
-    CHECK_NEAR(last[2], 0.0, 1e-8);                                        // rolling variance
-    CHECK_NEAR(last[3], 1.0, 1e-4);
-    CHECK(last[6] > 1000.f);                                               // bounding-box area in pixels
+    CHECK(r.wink_calls == 0 && !r.g.calibrated());
+    ModuleOut o = r.run(open);                                             // 30th calibration frame still reports -1
+    CHECK(o.state == -1 && r.g.calibrated());
+    CHECK_NEAR(o.x, 0.5, 1e-6);
+    for (int i = 0; i < 12; ++i) o = r.run(open);
+    CHECK(o.state == 0 && r.wink_calls == 12);
+    CHECK_NEAR(r.wink_in[0], 1.0, 1e-4);                                   // normalised EAR (open) = 1
+    CHECK_NEAR(r.wink_in[1], 1.0, 1e-4);                                   // rolling min
+    CHECK_NEAR(r.wink_in[2], 0.0, 1e-8);                                   // rolling variance
+    CHECK_NEAR(r.wink_in[3], 1.0, 1e-4);
+    CHECK_NEAR(r.pose_in[0], 0.5, 1e-5);                                   // irises centred: x ratio 0.5 ...
+    CHECK_NEAR(r.pose_in[1], 0.0, 1e-5);                                   // ... on the corner line: y ratio 0
+    CHECK_NEAR(r.pose_in[2], 0.0, 1e-5);                                   // identity matrix: no head rotation
     FacePts wink(0.075, 0.30);                                             // left eye closes to 25 % of its resting EAR
-    g.process(wink.p.data(), 478, FacePts::W, FacePts::H);
-    CHECK_NEAR(last[0], 0.25, 1e-3);
-    CHECK_NEAR(last[3], 1.0, 1e-3);
-    CHECK_NEAR(last[1], 0.25, 1e-3);                                       // min over the window drops immediately
+    r.run(wink);
+    CHECK_NEAR(r.wink_in[0], 0.25, 1e-3);
+    CHECK_NEAR(r.wink_in[3], 1.0, 1e-3);
+    CHECK_NEAR(r.wink_in[1], 0.25, 1e-3);                                  // min over the window drops immediately
 }
 static void t_gaze_no_face_and_recalibrate() {
-    LambdaForest forest([](const float*) { return 0; });
-    GazeNative g(&forest);
-    ModuleOut none = g.process(nullptr, 0, 640, 480);
-    CHECK(none.ok && !none.detected() && none.state == 0);
+    GazeRig r;
+    ModuleOut none = r.g.process(nullptr, 0, 640, 480);
+    CHECK(none.ok && !none.detected() && none.state == 0 && none.yaw_deg == 0.0);
     std::vector<float> few(100 * 3, 0.f);
-    CHECK(!g.process(few.data(), 100, 640, 480).detected());               // too few landmarks (no iris points)
+    CHECK(!r.g.process(few.data(), 100, 640, 480).detected());             // too few landmarks
     FacePts open(0.3, 0.3);
-    for (int i = 0; i < 30; ++i) g.process(open.p.data(), 478, 640, 480);
-    CHECK(g.calibrated());
-    g.recalibrate();
-    CHECK(!g.calibrated());
-    CHECK(g.process(open.p.data(), 478, 640, 480).state == -1);
+    CHECK(!r.g.process(open.p.data(), GazeNative::kFacePoints, 640, 480).detected());   // landmarks but no head-pose matrix = no face
+    r.calibrate(open);
+    CHECK(r.g.calibrated());
+    r.g.recalibrate();
+    CHECK(!r.g.calibrated());
+    CHECK(r.run(open).state == -1);
 }
 static void t_gaze_ratio_follows_iris() {
-    LambdaForest forest([](const float*) { return 0; });
-    GazeNative g(&forest);
+    GazeRig r;
     FacePts f(0.3, 0.3);
-    f.set(468, 216.0 / FacePts::W, 200.0 / FacePts::H);                    // left iris: halfway between corner(232 side) ...
-    ModuleOut o = g.process(f.p.data(), 478, FacePts::W, FacePts::H);
-    CHECK(o.x > 0.0f && o.x < 1.0f && std::fabs(o.x - 0.5f) > 0.01f);      // moved away from centre
+    r.calibrate(f);
+    f.set(468, 216.0 / FacePts::W, 190.0 / FacePts::H);                    // left iris: a quarter along the eye, 10 px above the corner line
+    r.run(f);
+    CHECK_NEAR(r.pose_in[0], 0.375, 1e-5);                                 // mean of 0.25 (left) and 0.5 (right)
+    CHECK_NEAR(r.pose_in[1], -0.5 * (10.0 / 480.0) / (64.0 / 640.0), 1e-5);   // above the line is negative; measured in NORMALISED units like the Python: mean of that and 0
+}
+static void t_head_pose_angles() {
+    constexpr double D = 3.14159265358979323846 / 180.0;
+    double p, y, ro;
+    const float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    GazeNative::headPose(id, p, y, ro);
+    CHECK_NEAR(p, 0.0, 1e-9); CHECK_NEAR(y, 0.0, 1e-9); CHECK_NEAR(ro, 0.0, 1e-9);
+    const float c30 = float(std::cos(30 * D)), s30 = float(std::sin(30 * D));        // 30 deg about Y (yaw)
+    const float ry[16] = {c30, 0, s30, 0, 0, 1, 0, 0, -s30, 0, c30, 0, 0, 0, 0, 1};
+    GazeNative::headPose(ry, p, y, ro);
+    CHECK_NEAR(p, 0.0, 1e-4); CHECK_NEAR(y, 30.0, 1e-4); CHECK_NEAR(ro, 0.0, 1e-4);
+    const float c20 = float(std::cos(20 * D)), s20 = float(std::sin(20 * D));        // 20 deg about X (pitch)
+    const float rx[16] = {1, 0, 0, 0, 0, c20, -s20, 0, 0, s20, c20, 0, 0, 0, 0, 1};
+    GazeNative::headPose(rx, p, y, ro);
+    CHECK_NEAR(p, 20.0, 1e-4); CHECK_NEAR(y, 0.0, 1e-4); CHECK_NEAR(ro, 0.0, 1e-4);
+    const float c10 = float(std::cos(10 * D)), s10 = float(std::sin(10 * D));        // 10 deg about Z (roll)
+    const float rz[16] = {c10, -s10, 0, 0, s10, c10, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    GazeNative::headPose(rz, p, y, ro);
+    CHECK_NEAR(p, 0.0, 1e-4); CHECK_NEAR(y, 0.0, 1e-4); CHECK_NEAR(ro, 10.0, 1e-4);
+    const float lock[16] = {0, 0, 1, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 0, 1};      // yaw = 90 deg: gimbal lock branch
+    GazeNative::headPose(lock, p, y, ro);
+    CHECK_NEAR(y, 90.0, 1e-9); CHECK_NEAR(ro, 0.0, 1e-9);
+}
+static void t_gaze_adds_head_pose_and_smooths() {
+    GazeRig r;
+    FacePts f(0.3, 0.3);
+    const float c30 = float(std::cos(30 * 3.14159265358979323846 / 180)), s30 = float(std::sin(30 * 3.14159265358979323846 / 180));
+    const float ry[16] = {c30, 0, s30, 0, 0, 1, 0, 0, -s30, 0, c30, 0, 0, 0, 0, 1};
+    f.setPose(ry);
+    r.pitch_out = 5.0; r.yaw_out = -10.0;                                  // eye-in-socket angles from the models
+    r.calibrate(f);
+    ModuleOut o = r.run(f);                                                // first gaze frame: EMA starts from 0 with alpha 0.2
+    CHECK_NEAR(o.head_yaw_deg, 30.0, 1e-4);
+    CHECK_NEAR(o.yaw_deg, 0.2 * (-10.0 + 30.0), 1e-4);                     // 0.2 * (rel + head)
+    CHECK_NEAR(o.pitch_deg, 0.2 * 5.0, 1e-4);
+    CHECK_NEAR(o.x, 0.5 + o.yaw_deg / GazeNative::kSpanDeg, 1e-6);         // the 0..1 pointer for the OS stage
+    for (int i = 0; i < 80; ++i) o = r.run(f);
+    CHECK_NEAR(o.yaw_deg, 20.0, 0.01);                                     // converges to rel + head
 }
 
 int main() {
@@ -249,6 +304,8 @@ int main() {
         {"gaze: calibration + feature vector", t_gaze_calibration_and_features},
         {"gaze: no face + recalibrate", t_gaze_no_face_and_recalibrate},
         {"gaze: ratio follows the iris", t_gaze_ratio_follows_iris},
+        {"gaze: head pose angles", t_head_pose_angles},
+        {"gaze: head pose added, EMA smoothing", t_gaze_adds_head_pose_and_smooths},
     };
     int failed_tests = 0;
     for (const T& t : tests) {

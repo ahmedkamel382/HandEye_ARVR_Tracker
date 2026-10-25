@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 """Parity test: the C++ ports versus the team's REAL Python files, frame by frame.
 
-  gaze: ai_pipeline/gaze_intent/gaze_intent.py   (GazeIntent.process_frame + the real gesture_model.pkl)
+  gaze: ai_pipeline/gaze_intent/gaze_intent.py   (GazeIntent.process_frame + the real wink / pitch / yaw .dll models,
+        random head-pose matrices; compares final_yaw, final_pitch and the state)
   hand: ai_pipeline/hand_kinematics/hand_tracker.py (HandTracker.process_frame: world-landmark features,
         the real hand_gesture_rf.pkl in assets/, 5-frame vote, 0.55 gate, 6-frame dropout grace)
 
 MediaPipe is replaced by a stub that simply hands the Python code the same synthetic landmarks the C++
 side receives, so no camera, no .task files and no MediaPipe install are needed. Everything else in those
-files (EAR, calibration, features, scikit-learn, both .pkl models, thresholds) is the real code.
+files (EAR, calibration, features, head pose, the Treelite models, scikit-learn, thresholds) is the real code.
+Needs Windows (the gaze models are .dll files) and the tl2cgen package.
 
   python run_parity.py --exe core_parity_check --ai-root <repo>/ai_pipeline [--frames 3000] [--seed 1]
 
@@ -40,11 +42,12 @@ class _Detector:
         self.next_face = []          # list of landmark objects, or []
         self.next_hand = []          # image landmarks of the hand
         self.next_world = []         # world landmarks of the hand
+        self.next_pose = np.eye(4, dtype=np.float32)   # facial transformation matrix of the face
 
     def detect_for_video(self, image, ts):
         return types.SimpleNamespace(
             face_landmarks=[self.next_face] if self.next_face else [],
-            facial_transformation_matrixes=[np.eye(4, dtype=np.float32)] if self.next_face else [],
+            facial_transformation_matrixes=[self.next_pose] if self.next_face else [],
             hand_landmarks=[self.next_hand] if self.next_hand else [],
             hand_world_landmarks=[self.next_world] if self.next_world else [])
 
@@ -119,6 +122,22 @@ def gen_face_sequences(rng, frames):
     return seqs
 
 
+def random_pose(rng):
+    """4x4 float32 head-pose matrix (what MediaPipe returns): a random rotation, now and then gimbal-locked
+    (yaw = +-90 deg) to exercise the singular branch of the Euler-angle code."""
+    pitch, yaw, roll = np.radians(rng.uniform([-35.0, -45.0, -20.0], [35.0, 45.0, 20.0]))
+    if rng.random() < 0.02:
+        yaw = np.radians(90.0 if rng.random() < 0.5 else -90.0)
+    cp, sp, cy, sy, cr, sr = np.cos(pitch), np.sin(pitch), np.cos(yaw), np.sin(yaw), np.cos(roll), np.sin(roll)
+    rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+    ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
+    m = np.eye(4, dtype=np.float32)
+    m[:3, :3] = rz @ ry @ rx
+    m[:3, 3] = rng.uniform(-5.0, 5.0, 3)
+    return m
+
+
 def gen_hand_frames(rng, n):
     """Frames are None (no hand) or a (42,3) packed array: image landmarks + world landmarks."""
     frames = []
@@ -160,8 +179,10 @@ def main():
     gaze_py = os.path.join(a.ai_root, "gaze_intent", "gaze_intent.py")
     hand_py = os.path.join(a.ai_root, "hand_kinematics", "hand_tracker.py")
     hand_pkl = os.path.abspath(os.path.join(a.ai_root, "..", "assets", "hand_gesture_rf.pkl"))
-    for p in (gaze_py, hand_py, os.path.join(os.path.dirname(hand_py), "hand_features.py"),
-              os.path.join(a.ai_root, "gaze_intent", "gesture_model.pkl"), hand_pkl):
+    models_dir = os.path.join(a.ai_root, "gaze_intent", "models")
+    for p in (gaze_py, hand_py, os.path.join(os.path.dirname(hand_py), "hand_features.py"), hand_pkl,
+              os.path.join(models_dir, "gesture_model.dll"), os.path.join(models_dir, "gaze_pitch.dll"),
+              os.path.join(models_dir, "gaze_yaw.dll")):
         if not os.path.exists(p):
             print(f"PARITY: missing {p}", file=sys.stderr)
             return 2
@@ -188,11 +209,14 @@ def main():
             lines.append("S")
             blank = np.zeros((h, w, 3), dtype=np.uint8)
             for ts, lm in enumerate(seq):
+                pose = random_pose(rng)
                 detector.next_face = as_objs(lm) if lm is not None else []
+                detector.next_pose = pose
                 final_yaw, final_pitch, head_yaw, head_pitch, state, landmarks = gi.process_frame(blank, ts * 16 + 1)
                 expected.append((final_yaw, final_pitch, state)); kinds.append("gaze")
-                n = 0 if lm is None else len(lm)
-                lines.append(f"F {w} {h} {n} " + (fmt(lm) if lm is not None else ""))
+                packed = syn.pack_face(lm, pose) if lm is not None else None      # what the engine receives
+                n = 0 if packed is None else len(packed)
+                lines.append(f"F {w} {h} {n} " + (fmt(packed) if packed is not None else ""))
             gi.shutdown()
 
     # ---- hand ----
@@ -210,7 +234,7 @@ def main():
     rec = os.path.join(tmp.name, "recording.txt")
     with open(rec, "w") as f:
         f.write("\n".join(lines) + "\n")
-    proc = subprocess.run([a.exe, rec], capture_output=True, text=True)
+    proc = subprocess.run([a.exe, rec, models_dir], capture_output=True, text=True)
     if proc.returncode != 0:
         print("PARITY: core_parity_check failed:\n" + proc.stderr, file=sys.stderr)
         return 2
@@ -241,8 +265,7 @@ def main():
         print("PARITY: warning - the real hand model gave a single state on the synthetic hands "
               "(parity of the classes is covered by --selftest-hand-forest)", file=sys.stderr)
     if len(states["gaze"]) < 2:
-        print("PARITY: warning - the forest produced a single gaze state on the synthetic data "
-              "(parity of the other classes is covered by --selftest-forest)", file=sys.stderr)
+        print("PARITY: warning - the wink model gave a single gaze state on the synthetic data", file=sys.stderr)
     print("PARITY", "FAIL" if fail else "PASS")
     return 1 if fail else 0
 

@@ -56,15 +56,13 @@ target_compile_definitions(core_engine PRIVATE NOMINMAX)
 # 6. Link OpenCV, the Pybind11 Embed module and the lock-free queue
 target_link_libraries(core_engine PRIVATE ${OpenCV_LIBS} pybind11::embed core_concurrentqueue)
 
-# 6b. The two Random Forests (gaze blink/wink classifier, hand gesture classifier) compiled to native C by
-#     Treelite/TL2cgen (strongly recommended). Produced by:
-#         python core_engine/tools/export_forests.py        (re-run whenever a .pkl is retrained)
-#     Without them the engine falls back to scikit-learn through Python: several ms per call instead of microseconds.
-#     Every global symbol of the generated code is prefixed (gaze_ / hand_) by the export script, so both forests
-#     link into one executable; forest_shim.c is compiled once per forest with -DFOREST_PREFIX=...
+# 6b. The hand gesture Random Forest compiled to native C by Treelite/TL2cgen (strongly recommended). Produced by:
+#         python core_engine/tools/export_forests.py        (re-run whenever the hand .pkl is retrained)
+#     Without it the engine falls back to scikit-learn through Python: several ms per call instead of microseconds.
+#     The three GAZE models (wink, pitch, yaw) are not built here: they are Eng 3's compiled .dll files in
+#     ai_pipeline/gaze_intent/models/, loaded at run time by core_engine/include/tl_model.hpp.
 # (enable_language must run at top level, not inside the function below)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/gaze_forest/main.c" OR
-   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/hand_forest/main.c")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/hand_forest/main.c")
     enable_language(C)
 endif()
 function(core_add_forest NAME DIR DEFINE)
@@ -85,11 +83,10 @@ function(core_add_forest NAME DIR DEFINE)
         message(STATUS "${NAME} forest: Treelite-compiled native C (${DIR})")
     else()
         message(WARNING "${NAME} forest: NOT compiled. The engine will use scikit-learn through Python "
-                        "(gaze: slow; hand: slow, or a rough geometric fallback if hand_gesture_rf.pkl is missing). "
+                        "(slow, or a rough geometric fallback if hand_gesture_rf.pkl is missing). "
                         "Run  python core_engine/tools/export_forests.py  and re-configure.")
     endif()
 endfunction()
-core_add_forest(gaze "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/gaze_forest" CORE_HAVE_TREELITE_FOREST)
 core_add_forest(hand "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/hand_forest" CORE_HAVE_HAND_FOREST)
 
 # 6c. Configure-time pre-flight checks for Python packages, MediaPipe models, and your Gaze/Wink assets.
@@ -102,6 +99,11 @@ foreach(_pkg numpy mediapipe sklearn cv2)
     endif()
 endforeach()
 
+foreach(_m gesture_model.dll gaze_pitch.dll gaze_yaw.dll)
+    if(NOT EXISTS "${AI_PIPELINE_DIR}/gaze_intent/models/${_m}")
+        message(WARNING "Gaze model ai_pipeline/gaze_intent/models/${_m} is missing - the engine will fail at startup until it is added.")
+    endif()
+endforeach()
 foreach(_m face_landmarker.task hand_landmarker.task)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/assets/${_m}")
         message(WARNING "Model file assets/${_m} is missing - the engine will fail at startup until it is added.")
@@ -111,12 +113,6 @@ endforeach()
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/assets/hand_gesture_rf.pkl")
     message(WARNING "assets/hand_gesture_rf.pkl is missing - hand gestures would use a rough geometric fallback "
                     "(train the hand model with Engineer 2's model_trainer.py).")
-endif()
-
-# Explicit checks for your gaze and wink components / exported forest directories
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/gaze_forest")
-    message(WARNING "Gaze/wink native forest folder is missing under core_engine/generated/gaze_forest. "
-                    "Run 'python core_engine/tools/export_forests.py' to generate native C inference files for your gaze/wink models.")
 endif()
 
 if(MSVC)

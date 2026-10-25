@@ -14,11 +14,15 @@ using Clock = std::chrono::steady_clock;
 //                              hand:  0 neutral, 1 pinch, 2 fist
 //   ok    : false if the Python call raised or the module is disabled
 //           (x, y, state then hold the safe fallback -1, -1, 0)
+//   gaze only: yaw_deg / pitch_deg = the absolute world gaze in degrees (eye-in-socket + head pose, smoothed:
+//           exactly what gaze_intent.py returns), head_*_deg = the head pose alone. x, y are those angles
+//           mapped linearly onto 0..1 (see GazeNative::kSpanDeg) so the OS stage can treat gaze like a pointer.
 struct ModuleOut {
     float x = -1.0f;
     float y = -1.0f;
     int   state = 0;
     bool  ok = false;
+    double yaw_deg = 0.0, pitch_deg = 0.0, head_yaw_deg = 0.0, head_pitch_deg = 0.0;
     bool detected() const { return ok && x >= 0.0f && y >= 0.0f; }
 };
 

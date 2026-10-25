@@ -38,6 +38,17 @@ def _eye(pts, ids, vert, iris_idx, cx, cy, k, iris):
     pts[iris_idx] = (cx - _HALF_W + 2 * _HALF_W * iris[0], cy - 1.1 * ap + 2.2 * ap * iris[1])
 
 
+POSE_ROWS = 6
+
+
+def pack_face(face, pose=None):
+    """(478,3) face + a 4x4 head-pose matrix (identity by default) -> the (484,3) array the engine receives."""
+    m = np.eye(4, dtype=np.float32) if pose is None else np.asarray(pose, dtype=np.float32)
+    extra = np.zeros((POSE_ROWS, 3), dtype=np.float32)
+    extra.reshape(-1)[:16] = m.reshape(-1)
+    return np.concatenate([face, extra])
+
+
 def make_face(k_left=1.0, k_right=1.0, iris=(0.5, 0.5), center=(0.5, 0.5), size=0.25, rng=None, noise=0.0):
     """k_* : eye openness factor (1.0 = open, ~0.25 = closed). iris: position inside the eye, 0..1."""
     pts = center + _BASE_XY * size

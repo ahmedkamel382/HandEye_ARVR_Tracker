@@ -1,0 +1,380 @@
+=====================================================================================================
+ HANDEYE AR/VR TRACKER - CORE ENGINE + BRIDGE GUIDE
+ What every module receives, what it must return, and how the engine moves data between them
+=====================================================================================================
+
+Written by the core-engine / bridge owner (Engineer 1). If you work on ANY of the four modules, read
+PART 1 first: it tells you exactly what your module gets as input and what it has to produce.
+PART 2 explains how the engine and the bridge work inside. PART 3 is "what do I touch if I change X".
+
+
+-----------------------------------------------------------------------------------------------------
+ THE WHOLE PIPELINE ON ONE PAGE
+-----------------------------------------------------------------------------------------------------
+
+   webcam
+     |  BGR frame (what OpenCV gives)
+     v
+ [ CAPTURE THREAD ]  mirror (left-right flip) + BGR->RGB, ONCE, into a pre-allocated frame slot
+     |  lock-free queue of tiny packets (slot number + frame id + timestamp). Pixels are never copied.
+     v
+ [ AI THREAD ]  (the only thread that touches Python)
+     |   Python:  MediaPipe landmark extractors  (ai_pipeline/bridge/landmark_extractors.py)
+     |               face  -> 484 x 3 floats   (478 face points + head-pose matrix)
+     |               hand  ->  42 x 3 floats   (21 image points + 21 world points)
+     |   C++:     GAZE module  (core_engine/include/gaze_math.hpp + 3 compiled .dll models)    Eng 3
+     |            HAND module  (core_engine/include/hand_math.hpp + hand forest)                Eng 2
+     |  one TrackingResult per frame:  { gaze: x,y,state,... }  { hand: x,y,state }
+     v
+ [ MAIN THREAD ]
+     |   DSP module   2 x One-Euro filter (hand, gaze), only on x,y, never on states        Eng 4
+     |   OS BRIDGE    core_engine/include/os_bridge.hpp: packs the filtered points + raw states
+     v
+ [ OS INTEGRATION ]  Eng 5: screen mapping, gestures -> clicks, SendInput, tray icon, calibration GUI
+     v
+   Windows mouse
+
+The four modules are:  (1) hand tracking  (2) gaze / blink tracking  (3) DSP filtering  (4) OS integration/GUI.
+The engine ("core engine" + "bridge") is the glue: camera in, modules wired together, mouse out.
+
+Conventions used EVERYWHERE (read this once):
+  * Coordinates are NORMALISED to the MIRRORED camera frame: x = 0 is the left edge, x = 1 the right edge,
+    y = 0 the top edge, y = 1 the bottom edge. A user moving their hand to their right makes x grow.
+  * "Not detected" is x = -1, y = -1 (state 0). Any negative x or y means "no target this frame".
+  * Time is in seconds for the DSP/OS stages (double) and in milliseconds (int64) inside TrackingResult.
+  * States are plain integers produced by the AI modules and passed on RAW (never filtered).
+
+
+=====================================================================================================
+ PART 1 - THE CONTRACT BETWEEN MODULES (inputs and outputs)
+=====================================================================================================
+
+-----------------------------------------------------------------------------------------------------
+ 1.1  WEBCAM -> CORE ENGINE   (what the camera gives us)
+-----------------------------------------------------------------------------------------------------
+ Source        : cv::VideoCapture on camera index 0 (--camera N), or a video file (--video FILE, used by
+                 tests so runs are repeatable).
+ Requested     : 640 x 480, 60 FPS, MJPG codec, driver buffer size 1 (lowest latency). All adjustable:
+                 --width --height --fps. The engine asks for these; the driver may deliver something else
+                 (--check prints what the camera really delivers). In low light many webcams drop to
+                 15-30 FPS - that is the camera's exposure, not the engine.
+ Raw format    : 8-bit BGR, H x W x 3, OpenCV channel order (blue first), NOT mirrored.
+
+ The capture thread converts this ONCE and nothing downstream ever flips or converts again:
+    cv::flip(frame, mirrored, 1)                    -> left-right mirror (so the screen behaves like a mirror)
+    cv::cvtColor(mirrored, slot, COLOR_BGR2RGB)     -> RGB order for MediaPipe
+
+-----------------------------------------------------------------------------------------------------
+ 1.2  CORE ENGINE -> AI MODULES (the input of the gaze and hand modules)
+-----------------------------------------------------------------------------------------------------
+ THIS is "the input from the webcam" that the gaze and hand modules receive. Both get the SAME frame.
+
+   rgb      : numpy uint8 array, shape (H, W, 3), default (480, 640, 3)
+              * RGB channel order (R, G, B)
+              * ALREADY mirrored left-right
+              * C-contiguous
+              * A VIEW onto memory owned by the C++ engine. Use it only during the call. NEVER keep a
+                reference to it, never write into it.
+   ts_ms    : Python int, milliseconds since the pipeline started. STRICTLY increasing (the engine
+              guarantees it: ts = max(real_ts, last_ts + 1)). MediaPipe's VIDEO mode requires this.
+
+ Python's ONLY job in the final pipeline is landmark extraction. The call, always made from ONE thread:
+
+     extractor = FaceLandmarkExtractor()     # or HandLandmarkExtractor(); no constructor arguments
+     pts = extractor.process_frame(rgb, ts_ms)
+     extractor.shutdown()                    # called once at exit
+
+ Rules for anything inside process_frame:
+   * no flipping, no colour conversion, no OS access, no printing in the hot path;
+   * "nothing detected" is NOT an error: return an array of shape (0, 3);
+   * raising an exception is allowed - the engine counts it (shown as "pyerr") and treats that frame as
+     "nothing detected". It never crashes the engine.
+   * Python runs on the AI thread under the GIL; keep it fast (MediaPipe only).
+
+ FaceLandmarkExtractor.process_frame returns float32 array of shape (484, 3):
+   rows   0..477  the 478 MediaPipe face-mesh points (468 mesh + 10 iris points: 468-472 and 473-477).
+                  Columns are (x, y, z): x and y normalised 0..1 to the image, z in MediaPipe's own
+                  units (scaled like x, i.e. multiply by image WIDTH to compare with pixels).
+   rows 478..483  the head-pose matrix, packed: MediaPipe's 4x4 facial_transformation_matrix flattened
+                  ROW-MAJOR into 16 floats, then 2 zeros of padding (6 rows x 3 = 18 values).
+   no face, or MediaPipe gave no matrix  ->  array of shape (0, 3).
+   Needs output_facial_transformation_matrixes=True in the FaceLandmarker options (already set).
+
+ HandLandmarkExtractor.process_frame returns float32 array of shape (42, 3):
+   rows  0..20   the 21 hand landmarks in IMAGE space (x, y normalised 0..1; z relative). Used for the cursor.
+   rows 21..41   the 21 hand WORLD landmarks (metres, origin at the hand centre). Used for the 24 features
+                 that feed the gesture classifier.
+   no hand       ->  array of shape (0, 3).
+   Landmark order is MediaPipe's: 0 wrist, 4 thumb tip, 5 index MCP, 8 index tip, 9 middle MCP, ...
+
+ Environment variables the extractors read: AI_PIPELINE_ROOT (folder that holds ai_pipeline/; the
+ .task model files are looked up in <root>/../assets), HAND_RUNNING_MODE (VIDEO default, or IMAGE).
+
+-----------------------------------------------------------------------------------------------------
+ 1.3  GAZE MODULE   (Eng 3)   native C++: core_engine/include/gaze_math.hpp
+      reference implementation: ai_pipeline/gaze_intent/gaze_intent.py
+-----------------------------------------------------------------------------------------------------
+ INPUT  (per frame)
+   * the (484, 3) face array from 1.2, plus the image width W and height H in pixels
+     (the eye distances are measured in pixels, so W and H matter)
+   * an empty array = no face
+ MODELS (compiled Treelite .dll files, loaded natively by core_engine/include/tl_model.hpp):
+   ai_pipeline/gaze_intent/models/gesture_model.dll   wink/blink classifier : 6 features -> class 0..3
+   ai_pipeline/gaze_intent/models/gaze_pitch.dll      eye-in-socket pitch   : 5 features -> degrees
+   ai_pipeline/gaze_intent/models/gaze_yaw.dll        eye-in-socket yaw     : 5 features -> degrees
+   Wink features : [left_ear, left_min, left_var, right_ear, right_min, right_var]. EAR values are divided
+                   by the baseline measured during the first 30 frames; min and variance are over the last
+                   up to 10 frames.
+   Pose features : [iris_x, iris_y, head_pitch, head_yaw, head_roll]. iris_x/iris_y are averaged over both
+                   eyes, measured against the line between the eye corners (x = position along it, y = signed
+                   distance from it); head angles are degrees from the 4x4 matrix (get_head_pose_angles).
+ PROCESSING (identical to gaze_intent.py; the parity test enforces this)
+   1. first 30 frames with a face = blink calibration: state -1, gaze = 0, 0. Keep both eyes open.
+   2. then: state from the wink model; relative gaze from the pitch/yaw models;
+      absolute gaze = relative + head angle;  EMA smoothing, alpha 0.2, starting from 0.
+ OUTPUT  (ModuleOut, core_engine/include/tracking_types.hpp)
+   yaw_deg, pitch_deg          absolute world gaze in degrees (exactly what gaze_intent.py returns as
+                               final_yaw, final_pitch). 0, 0 while calibrating and when there is no face.
+   head_yaw_deg, head_pitch_deg  the head pose alone.
+   x, y                        yaw/pitch mapped linearly onto 0..1:  x = 0.5 + yaw/60,  y = 0.5 + pitch/60
+                               (clamped; +-30 degrees spans the unit square). THIS is what the DSP and
+                               the OS stage use as the gaze "pointer". The scale (GazeNative::kSpanDeg) and
+                               the signs are a starting guess: the tray app's calibration wizard fits the
+                               real range and direction.
+                               x = y = -1 when there is no face.
+   state                       -1 calibrating | 0 neutral | 1 left wink | 2 right wink | 3 eyes closed/blink
+                               (state 0 when there is no face)
+   ok                          false only if the Python call raised (then x = y = -1, state 0)
+ NOTE FOR ENG 3: the gaze x, y are already EMA-smoothed inside the module (alpha 0.2) and then go through
+ the DSP filter again. If the pointer feels too laggy, tune ONE of the two, not both.
+
+-----------------------------------------------------------------------------------------------------
+ 1.4  HAND MODULE   (Eng 2)   native C++: core_engine/include/hand_math.hpp
+      reference implementation: ai_pipeline/hand_kinematics/hand_tracker.py + hand_features.py
+-----------------------------------------------------------------------------------------------------
+ INPUT  (per frame)
+   * the (42, 3) hand array from 1.2 (image landmarks, then world landmarks). Empty = no hand.
+ PROCESSING
+   1. pointer = one image landmark: index FINGERTIP by default (--hand-anchor tip|knuckle|mid);
+      clamped to 0..1.
+   2. 24 features from the WORLD landmarks (15 joint angles, 4 thumb-to-fingertip distances, 5 wrist-to-
+      fingertip distances; names in hand_features.FEATURE_NAMES and hand_math.hpp, same order).
+   3. Random Forest -> (class, confidence). Confidence below 0.55 counts as neutral.
+   4. majority vote over the last 5 frames (ties go to the class seen first).
+   5. dropout grace: up to 6 consecutive missed frames repeat the last good answer; after that the hand
+      counts as lost and the vote history is cleared.
+   The model is assets/hand_gesture_rf.pkl, compiled to C (core_engine/generated/hand_forest) when the
+   export script has been run; otherwise scikit-learn runs through Python (slow) as a fallback.
+ OUTPUT  (ModuleOut)
+   x, y     pointer position 0..1 in the mirrored frame; -1, -1 = no hand
+   state    0 neutral | 1 pinch | 2 fist
+   ok       false only if the Python call raised
+
+-----------------------------------------------------------------------------------------------------
+ 1.5  TrackingResult   (what the AI thread hands to the main thread, once per processed frame)
+-----------------------------------------------------------------------------------------------------
+   frame_id     uint64   camera frame number
+   ts_ms        int64    strictly increasing milliseconds since pipeline start
+   gaze         ModuleOut as described in 1.3
+   hand         ModuleOut as described in 1.4
+   gaze_ms, hand_ms      time spent in each stage (for the 1 Hz report)
+ Frames can be SKIPPED when the AI is slower than the camera (see Part 2). So the DSP and OS stages
+ receive results at the AI's rate (often 30-60 per second), with irregular spacing: always use the
+ timestamp, never assume a fixed frame rate.
+
+-----------------------------------------------------------------------------------------------------
+ 1.6  DSP MODULE   (Eng 4)   dsp_filter/  ->  engine adapter: core_engine/include/dsp_adapter.hpp
+-----------------------------------------------------------------------------------------------------
+ There are TWO independent filter instances: one for the hand pointer, one for the gaze pointer.
+ Each is a 2D One-Euro filter (dsp::TrackingFilter2D).
+ INPUT  (one call per tracker per frame, ONLY when that tracker detected something)
+   x, y         double, normalised 0..1 (the adapter clamps to 0..1 first because the filter resets
+                itself on out-of-range input)
+   t_seconds    double, = ts_ms / 1000.0, strictly increasing
+   state        NOT an input. States bypass the DSP completely (dsp_filter/README.md).
+ OUTPUT
+   filtered x, y, same units. If a timestamp is rejected (duplicate / not increasing) the adapter keeps
+   the LAST GOOD output; if the filter reports an error it resets itself and the raw point passes through,
+   so the pointer never freezes or jumps to (0,0).
+ WHEN THE TRACKER LOSES ITS TARGET (x < 0): the bridge sends NOTHING to the filter and calls reset() on it,
+   so the cursor does not glide across the gap. (The filter also resets itself after a 0.25 s gap.)
+ CONFIG per filter: {min_cutoff_hz, beta, derivative_cutoff_hz}. Eng 4's initial values: hand 1.2 / 4.0 / 1.0,
+   gaze 0.8 / 6.0 / 1.5. The tray app's "Smoothing" menu changes them live; the engine also accepts
+   --hand-filter MIN,BETA,DCUT and --gaze-filter MIN,BETA,DCUT, and --no-filter / --filter builtin.
+ Anyone replacing the filter only has to implement core::IPointFilter:
+       void reset();   void filter(double& x, double& y, double t_sec);
+
+-----------------------------------------------------------------------------------------------------
+ 1.7  OS INTEGRATION / GUI   (Eng 5)   core_engine/os_integration/
+-----------------------------------------------------------------------------------------------------
+ INPUT   one osi::FramePayload per frame, built by the bridge (core_engine/include/os_bridge.hpp):
+
+       struct FramePayload {
+           double        timestamp_seconds;       // ts_ms / 1000, strictly increasing
+           TrackerSample hand;                    // { optional<NormalizedPoint> point; int state; }
+           TrackerSample gaze;
+       };
+
+   point  = the FILTERED (DSP) x, y in 0..1, or EMPTY when that tracker lost its target
+   state  = the RAW integer from the AI module:
+              hand: 0 neutral, 1 pinch, 2 fist
+              gaze: -1 calibrating, 0 neutral, 1 left wink, 2 right wink, 3 sustained closure
+   Frames whose timestamp is not newer than the previous one are rejected by the OS module.
+ OUTPUT  real Windows mouse input (SendInput) plus the tray icon and the calibration wizard.
+   Default gesture map: pinch down/up = left button down/up (so pinch-and-move is a drag); fist held 0.3 s =
+   right click; left wink = left click; right wink = right click; eyes closed 1 s = pause/resume.
+   While gaze state is -1 the gaze cursor holds still. Moving the physical mouse gives it priority for 1.5 s.
+   Hotkey: Ctrl+Alt+P pause/resume. Settings: %APPDATA%\HandEyeTracker\os_integration.ini
+ NOTE: pointer source (hand vs gaze), screen margins and the input regions are the OS module's business
+   (tray menu / calibration wizard). The engine no longer decides any of that.
+
+
+=====================================================================================================
+ PART 2 - HOW THE CORE ENGINE AND THE BRIDGE WORK
+=====================================================================================================
+
+-----------------------------------------------------------------------------------------------------
+ 2.1  Three threads
+-----------------------------------------------------------------------------------------------------
+ CAPTURE thread   reads the camera, mirrors + converts to RGB into a free slot of the frame pool, pushes a
+                  small Packet {slot, frame_id, ts_ms, captured_at} into the lock-free queue. It never
+                  blocks: if the queue is full it evicts the OLDEST packet (counted as "evict"); if no slot
+                  is free it drops the new frame (counted as "skip").
+ AI thread        pulls packets, runs the extractors (Python, under the GIL) and the native gaze/hand math,
+                  puts one TrackingResult per frame into the results queue. By default it jumps to the
+                  NEWEST queued frame and releases the stale ones (counted as "stale"); --process-all
+                  turns that off. It owns Python for its whole life.
+ MAIN thread      drains the results queue in order: DSP filter -> OS bridge. Prints a 1 Hz status line,
+                  watches for quit keys, and does the shutdown.
+ (The OS module's tray app runs on a 4th thread inside the bridge: the Windows message loop.)
+
+ Why: the camera is never blocked by slow AI, pixels are never copied between threads, memory is bounded,
+ and the cursor always follows the most recent frame instead of a growing backlog.
+
+-----------------------------------------------------------------------------------------------------
+ 2.2  Frame pool
+-----------------------------------------------------------------------------------------------------
+ 8 pre-allocated RGB frames (--pool N). A "slot" is checked out by the capture thread, travels through the
+ queue as a number, is read IN PLACE by the AI thread, and is returned. Steady state = zero heap allocation.
+ At exit the engine checks that every slot came back ("pool slots returned"); a leak means a bug.
+
+-----------------------------------------------------------------------------------------------------
+ 2.3  Timestamps
+-----------------------------------------------------------------------------------------------------
+ ts_ms = milliseconds since the pipeline started, taken at capture. The AI thread forces them strictly
+ increasing (MediaPipe VIDEO mode needs this). The bridge converts to seconds for the DSP and OS stages.
+
+-----------------------------------------------------------------------------------------------------
+ 2.4  The Python <-> C++ bridge   (core_engine/include/py_bridge.hpp)
+-----------------------------------------------------------------------------------------------------
+ * pybind11 embedded interpreter, started by main() before the camera opens.
+ * PyLandmarker wraps one extractor object. call(frame, ts) wraps the frame as a zero-copy numpy view,
+   calls process_frame, and copies the returned (N,3) float32 array into a reusable C++ vector.
+   Return value: N = number of rows, 0 = nothing detected, -1 = Python raised (counted in "pyerr").
+ * Python errors NEVER escape: they are counted and turned into "nothing detected".
+ * The scikit-learn hand fallback (PySklearnHandModel) is the only other use of Python.
+ * Where Python is looked up: the venv created by setup.bat; paths are baked into
+   build_paths.hpp at CMake time (--ai-root and --site override them).
+
+-----------------------------------------------------------------------------------------------------
+ 2.3b The compiled models
+-----------------------------------------------------------------------------------------------------
+ * Hand forest: scikit-learn model -> Treelite -> C source (core_engine/generated/hand_forest, made by
+   core_engine/tools/export_forests.py) -> compiled into the engine. Check: --selftest-hand-forest.
+ * Gaze models: three Treelite .dll files loaded at run time with LoadLibrary (tl_model.hpp). The engine
+   reads each DLL's own metadata (feature count, float32/float64, class count) and calls its predict().
+   They are the SAME binaries Python's tl2cgen loads, so the answers are identical. Windows only.
+
+-----------------------------------------------------------------------------------------------------
+ 2.5  The OS bridge   (core_engine/include/os_bridge.hpp)  - the last link
+-----------------------------------------------------------------------------------------------------
+ One call per TrackingResult:  bridge.update(result)
+   1. If the tray's Smoothing menu changed the filter settings, rebuild the two filters (thread-safe).
+   2. For each tracker (hand, gaze) separately:
+        * not detected  -> point left empty; the filter is reset (only once per loss)
+        * detected      -> run the filter (x, y, t_seconds), clamp to 0..1, store as the point
+        * the raw state integer is copied across unchanged (ok == false -> state 0)
+   3. Build an osi::FramePayload and call TrayApp::submit_frame(). Everything after that is Eng 5's code.
+ Also: single-instance lock (two copies would fight over the cursor), per-monitor DPI awareness, the tray
+ thread, and stop() which closes the tray and releases any held mouse button.
+ Start-up: the engine starts PAUSED unless --start-active. --os log = dry run (the OS module logs mouse
+ actions to %LOCALAPPDATA%\HandEyeTracker\handeye_tray.log and sends nothing); --control = real mouse.
+ On non-Windows builds the bridge is a stub that only counts frames.
+ The bridge is the ONLY file that knows both sides: if either side's interface changes, this is the file
+ that changes (see Part 3).
+
+-----------------------------------------------------------------------------------------------------
+ 2.6  Shutdown, errors, and the status line
+-----------------------------------------------------------------------------------------------------
+ Quit with Ctrl+C, F9, the preview window's q, the tray menu's Exit, or --seconds N. Teardown order:
+ stop capture, drain the AI, drain results, stop the OS bridge (releases mouse buttons), shut Python down.
+ Once per second the engine prints: frames captured / processed, evicted / skipped / stale, Python errors,
+ pool slots, latest gaze and hand (x, y, state), average and max latency, and frames sent to the OS stage.
+ Healthy: pyerr 0, slots back to full at exit. "--check" diagnoses Python, packages, models (gaze .dll,
+ hand forest, MediaPipe .task), camera FPS, and never touches the mouse.
+
+-----------------------------------------------------------------------------------------------------
+ 2.7  Where things live
+-----------------------------------------------------------------------------------------------------
+   core_engine/src/main.cpp                  capture, AI and main threads, CLI, --check
+   core_engine/include/frame_pool.hpp        frame pool + packet
+   core_engine/include/py_bridge.hpp         pybind11 landmark extractor wrapper
+   core_engine/include/tracking_types.hpp    ModuleOut, TrackingResult (THE data contract in C++)
+   core_engine/include/gaze_math.hpp         gaze module (C++ port of gaze_intent.py)
+   core_engine/include/tl_model.hpp          loader for the three gaze .dll models
+   core_engine/include/hand_math.hpp         hand module (C++ port of hand_tracker.py + hand_features.py)
+   core_engine/include/dsp_adapter.hpp       Eng 4's filter behind IPointFilter
+   core_engine/include/os_bridge.hpp         the bridge to Eng 5 (filter + FramePayload + tray)
+   core_engine/os_integration/               Eng 5's module (own README.md, own tests)
+   dsp_filter/                               Eng 4's module (own README.md, own tests)
+   ai_pipeline/bridge/landmark_extractors.py the REAL MediaPipe extractors (face + hand)
+   ai_pipeline/gaze_intent/, hand_kinematics/  Eng 3's / Eng 2's Python reference code and models
+   core_engine/tests/                        unit, parity and end-to-end tests
+
+
+=====================================================================================================
+ PART 3 - I CHANGED MY MODULE: WHAT DO I HAVE TO UPDATE?
+=====================================================================================================
+
+ The engine does not run the Python reference files for the gaze and hand maths: it runs C++ PORTS of
+ them. The Python files stay as the reference. The parity test compares the two frame by frame:
+
+     ctest -C Release --output-on-failure        (test name: gaze_hand_parity)
+
+ If it fails after you edit gaze_intent.py or hand_tracker.py, the C++ port is out of sync. Fix it in the
+ file named below, then re-run the test until it passes.
+
+ You changed...                                        Update
+ ---------------------------------------------------   -----------------------------------------------
+ gaze maths / features / thresholds / smoothing        core_engine/include/gaze_math.hpp
+ gaze models (retrained .dll)                          just replace the .dll files; if the feature count
+                                                       changes, edit tl_model.hpp / gaze_math.hpp too
+ something new needed from MediaPipe for the face      ai_pipeline/bridge/landmark_extractors.py (what is
+                                                       returned) + gaze_math.hpp (how it is read)
+ hand maths / features / thresholds / vote             core_engine/include/hand_math.hpp
+ hand model retrained (.pkl)                           re-run core_engine/tools/export_forests.py, then
+                                                       rebuild from a clean build folder
+ a new state value (new gesture, new wink type)        nothing in the engine or the bridge: states are
+                                                       passed through raw. Eng 5 must handle the value.
+ the DSP filter class / its config                     dsp_adapter.hpp or makeFilter() in os_bridge.hpp
+ the OS module's internals (gestures, mapping, GUI)    nothing in the engine, as long as FramePayload
+                                                       keeps its shape
+ FramePayload gains a field / TrayApp API renamed      os_bridge.hpp (update() and convert()) only
+ a tracker needs a new output (e.g. depth)             tracking_types.hpp (ModuleOut) + the module's
+                                                       port + os_bridge.hpp to forward it
+
+ Rules that keep everybody compatible:
+   * Do not change the meaning of x, y (0..1, mirrored frame, -1 = not detected) or of existing states.
+   * Do not make the extractors flip, convert colours or keep the frame array.
+   * Keep timestamps in seconds for DSP/OS and strictly increasing.
+   * Add tests next to your module; run ctest from a clean build before you push.
+
+=====================================================================================================
+ QUICK COMMANDS (from the x64 Native Tools prompt, in out\build\windows-release)
+=====================================================================================================
+   ctest -C Release --output-on-failure              all tests (unit, parity, end-to-end, OS module)
+   core_engine --check                               diagnose everything, touches nothing
+   core_engine --preview                             dry run with a debug window (mouse untouched)
+   core_engine --control --start-active              real mouse, active immediately
+   core_engine --help                                every option
+=====================================================================================================

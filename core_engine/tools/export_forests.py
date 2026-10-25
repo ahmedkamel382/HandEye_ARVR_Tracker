@@ -12,7 +12,7 @@ Each output folder contains
     header.h, main.c, tu*.c   the forest as plain if/else C code (every global symbol is prefixed gaze_ / hand_
                               so both forests can be linked into one executable)
     parity_cases.csv          cases computed by scikit-learn ITSELF, including points exactly on split thresholds
-                              (used by  core_engine --selftest-forest / --selftest-hand-forest)
+                              (used by  core_engine --selftest-hand-forest)
     MODEL_INFO.txt            what was exported (sha256 of the pkl, library versions)
 
 RE-RUN THIS EVERY TIME A .pkl IS RETRAINED, then delete the build folder and re-configure.
@@ -230,7 +230,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.abspath(os.path.join(here, "..", ".."))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--only", choices=("gaze", "hand"), help="export just one forest (default: both)")
+    ap.add_argument("--only", choices=("gaze", "hand"), help="export just one forest (default: hand; the gaze models are .dll files now)")
     ap.add_argument("--gaze-pkl", default=None)
     ap.add_argument("--hand-pkl", default=None)
     ap.add_argument("--cases", type=int, default=6000, help="rows in each parity_cases.csv")
@@ -246,7 +246,7 @@ def main():
     except OSError as e:                                           # tl2cgen on Windows, plain venv
         fail(f"{e}\n  On Windows with a plain venv create the folder it looks for:  mkdir .venv\\Library\\bin")
 
-    todo = [args.only] if args.only else ["gaze", "hand"]
+    todo = [args.only] if args.only else ["hand"]      # the gaze models are .dll files now (ai_pipeline/gaze_intent/models); "--only gaze" exports the OLD 7-feature forest
     for which in todo:
         spec = SPECS[which]
         pkl = getattr(args, f"{which}_pkl") or os.path.join(repo, *spec["rel_pkl"])
@@ -256,8 +256,7 @@ def main():
             continue
         export_one(which, args, repo, here)
     print("\nNext: delete the build folder, re-configure, build, then run\n"
-          "      core_engine --selftest-forest core_engine/generated/gaze_forest/parity_cases.csv\n"
-          "      core_engine --selftest-hand-forest core_engine/generated/hand_forest/parity_cases.csv")
+                    "      core_engine --selftest-hand-forest core_engine/generated/hand_forest/parity_cases.csv")
 
 
 if __name__ == "__main__":

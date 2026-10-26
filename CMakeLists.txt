@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Force Python3 variables globally to prevent fallback to release python311.lib in Debug mode
+set(Python3_FIND_STRATEGY LOCATION)
+set(Python3_LIBRARY_RELEASE "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
+set(Python3_LIBRARY_DEBUG "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
+set(Python3_LIBRARIES "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
+
 # Point CMake directly to the vcpkg built package files
 set(OpenCV_ROOT "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/share/opencv4")
 
@@ -14,6 +20,9 @@ find_package(OpenCV CONFIG REQUIRED)
 
 # 2. Locate the local Python Environment 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+
+# Tell the MSVC linker to search the venv libs directory directly to satisfy embedded #pragma comment(lib) directives
+link_directories("${CMAKE_SOURCE_DIR}/.venv/libs")
 
 # 3. Ask Python exactly where Pybind11 is installed
 execute_process(
@@ -40,9 +49,12 @@ execute_process(
 execute_process(
     COMMAND "${Python3_EXECUTABLE}" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
     OUTPUT_VARIABLE PY_SITE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+
 file(TO_CMAKE_PATH "${PY_HOME_DIR}" PY_HOME_DIR)   # forward slashes: safe inside C string literals
 file(TO_CMAKE_PATH "${PY_SITE_DIR}" PY_SITE_DIR)
+
 set(AI_PIPELINE_DIR "${CMAKE_SOURCE_DIR}/ai_pipeline")
+
 configure_file(core_engine/include/build_paths.hpp.in
                "${CMAKE_BINARY_DIR}/generated/build_paths.hpp" @ONLY)
 
@@ -65,6 +77,7 @@ target_link_libraries(core_engine PRIVATE ${OpenCV_LIBS} pybind11::embed core_co
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/hand_forest/main.c")
     enable_language(C)
 endif()
+
 function(core_add_forest NAME DIR DEFINE)
     set(${DEFINE} OFF PARENT_SCOPE)
     if(EXISTS "${DIR}/main.c" AND EXISTS "${DIR}/header.h")
@@ -87,6 +100,7 @@ function(core_add_forest NAME DIR DEFINE)
                         "Run  python core_engine/tools/export_forests.py  and re-configure.")
     endif()
 endfunction()
+
 core_add_forest(hand "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/hand_forest" CORE_HAVE_HAND_FOREST)
 
 # 6c. Configure-time pre-flight checks for Python packages, MediaPipe models, and your Gaze/Wink assets.
@@ -104,6 +118,7 @@ foreach(_m gesture_model.dll gaze_pitch.dll gaze_yaw.dll)
         message(WARNING "Gaze model ai_pipeline/gaze_intent/models/${_m} is missing - the engine will fail at startup until it is added.")
     endif()
 endforeach()
+
 foreach(_m face_landmarker.task hand_landmarker.task)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/assets/${_m}")
         message(WARNING "Model file assets/${_m} is missing - the engine will fail at startup until it is added.")

@@ -5,11 +5,19 @@
       "name": "windows-base",
       "hidden": true,
       "generator": "Ninja",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
       "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "environment": {
+        "LIB": "${sourceDir}/.venv/libs;$penv{LIB}"
+      },
       "cacheVariables": {
         "Python3_EXECUTABLE": "${sourceDir}/.venv/Scripts/python.exe",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "CMAKE_VS_PLATFORM_NAME": "x64"
       }
     },
     {
@@ -27,6 +35,16 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows-debug"
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release"
     }
   ]
 }

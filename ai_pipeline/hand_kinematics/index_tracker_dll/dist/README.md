@@ -4,6 +4,108 @@ C-compatible x64 DLL for the existing `IndexFingerTracker`. It exposes landmark 
 as normalized pointer coordinates and preserves the Python tracker's mapping,
 mirroring, EMA smoothing, tracking-loss, and invalid-result behavior.
 
+## Quick Test
+
+Run the complete build and test workflow from the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ai_pipeline\hand_kinematics\index_tracker_dll\scripts\test.ps1
+```
+
+The runner checks the environment, builds `Release` with the existing
+`scripts/build.ps1`, verifies the build artifacts, and tests the DLL through its
+exported C ABI. It does not install packages, download assets, modify Git, move
+the mouse, or create OS clicks. It builds into `build/bin/Release` and does not
+restage `dist/` during a test run.
+
+By default it runs the deterministic mock API tests and a real
+Python/MediaPipe initialization and no-hand-loss test. A hand image is optional
+because no test image is committed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ai_pipeline\hand_kinematics\index_tracker_dll\scripts\test.ps1 `
+  -HandImage "C:\path\to\hand.jpg"
+```
+
+The image must contain a visible hand. Supported formats are the image formats
+supported by Windows Imaging Component, such as JPEG, PNG, and BMP.
+
+The live-camera stage is opt-in and uses the selected camera index:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ai_pipeline\hand_kinematics\index_tracker_dll\scripts\test.ps1 `
+  -Camera -CameraIndex 0 -CameraSeconds 10
+```
+
+The camera is opened only for this stage and is released in a `finally` block.
+The probe auto-stops after `-CameraSeconds` (1-120 seconds) and does not create
+a window or send pointer/click events. A requested camera that cannot be opened
+or does not produce a tracked hand is reported as `FAIL`, not silently skipped.
+
+### Requirements
+
+- Windows x64 and PowerShell 5.1 or newer.
+- Visual Studio C++ x64 build tools and CMake. The build script can use the CMake
+  bundled with Visual Studio.
+- Python 3.11 x64 with `numpy`, `opencv-python` (or OpenCV with the `cv2`
+  module), and `mediapipe`. The repository's `.venv` is used when present.
+- The runtime files under `dist/python/` and the model at
+  `dist/model/hand_landmarker.task`.
+
+Use an explicit Python when the repository `.venv` is not the desired runtime:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ai_pipeline\hand_kinematics\index_tracker_dll\scripts\test.ps1 `
+  -PythonExecutable "C:\path\to\python.exe"
+```
+
+Use `-SkipBuild` only when the existing `build/bin/Release` output is known to be
+current. The runner uses that build output directly; it does not test a stale
+copy from another directory.
+
+### Stages and results
+
+The runner reports these stages separately:
+
+- `Environment preflight`: Windows/PowerShell, repository layout, Python and
+  imports, runtime assets, and (unless `-SkipBuild`) CMake and VS C++ tools.
+- `DLL build` and `Build artifacts`: Release build, DLL/import library, and test
+  executables. Build errors stop the run.
+- `Exported API smoke tests (mock backend)`: deterministic DLL load, symbols,
+  config/ABI validation, valid and lost results, strides, argument errors,
+  repeated calls, and shutdown.
+- `MediaPipe initialization and no-hand loss`: actual embedded Python/MediaPipe
+  initialization, no-hand LOST results, and cleanup.
+- `Landmark tracking / loss / reacquisition`: only when `-HandImage` is supplied;
+  validates landmark 8, normalized ranges, padded frames, loss reset, and
+  reacquisition.
+- `Live camera test`: only when `-Camera` or `-CameraIndex` is supplied.
+
+`PASS` means the stage ran and its assertions passed. `FAIL` means it ran and
+failed, or a requested stage could not run; the exit code is nonzero. `SKIP`
+means an optional stage was intentionally not run and does not fail the run.
+All required stages must pass for exit code `0`.
+
+### Common setup errors
+
+- `Python not found`: create the repository environment with
+  `py -3.11 -m venv .venv` and install the packages listed above, or pass
+  `-PythonExecutable`.
+- `missing Python package ...`: install `numpy`, `opencv-python`, and
+  `mediapipe` into the selected Python. The runner does not install them.
+- `Visual Studio C++ x64 build tools not found` or `CMake not found`: install
+  the Visual Studio Desktop development with C++ workload and CMake.
+- `missing ...dist\...`: restore the tracked `dist/python` files and
+  `dist/model/hand_landmarker.task`.
+- `cannot open camera`: close other camera applications and try another
+  `-CameraIndex`.
+- `no hand was tracked`: use a well-lit image or camera frame with one visible
+  hand; real MediaPipe results vary with lighting, image quality, and hardware.
+
+Real-backend checks depend on MediaPipe and the local image/camera. The runner
+uses fresh `build/bin/Release` output and validates the current machine only;
+teammates may still need to install the tools and Python packages above.
+
 ## 1. Existing eye-tracking integration: what was found
 
 The repository has no C++ eye-tracker interface DLL. The three files under
@@ -145,7 +247,7 @@ Prerequisites:
 The repository's existing environment is used by default:
 
 ```powershell
-cd C:\path\to\HandEye_ARVR_Tracker\index_tracker_dll
+cd C:\path\to\HandEye_ARVR_Tracker\ai_pipeline\hand_kinematics\index_tracker_dll
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
@@ -166,7 +268,7 @@ Manual build:
 ```powershell
 $cmake = "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 & $cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
-  -DPython3_EXECUTABLE="..\.venv\Scripts\python.exe"
+  -DPython3_EXECUTABLE="..\..\..\.venv\Scripts\python.exe"
 & $cmake --build build --config Release --parallel
 ```
 
@@ -270,7 +372,7 @@ with:
 ```powershell
 .\build\bin\Release\hand_index_example.exe `
   ".\dist\python" `
-  "..\.venv\Lib\site-packages" `
+  "..\..\..\.venv\Lib\site-packages" `
   ".\dist\model\hand_landmarker.task"
 ```
 
@@ -288,6 +390,9 @@ Verified in this environment:
   repeated calls, and destroy.
 - Real test initializes the actual Python environment and MediaPipe model, then
   submits three no-hand frames and verifies LOST results.
+- `scripts/test.ps1` rebuilt and tested the release DLL, and the optional
+  live-camera probe opened/released the camera and produced TRACKED results
+  through the real DLL C ABI on this machine.
 - `hand_index_real_backend_integration.exe` decoded a user-supplied image with
   Windows Imaging Component, linked and loaded the compiled DLL, and ran the
   actual embedded Python/MediaPipe backend. It verified:
@@ -322,7 +427,6 @@ be decoded or does not produce a hand detection.
 
 Not verified here:
 
-- A live camera through the DLL.
 - Deployment on a machine different from this build machine.
 - MediaPipe/OpenCV versions other than the installed environment.
 - Video-file decoding; the integration test currently validates still images.
@@ -339,5 +443,5 @@ Not verified here:
 | Valid-result path tested at DLL boundary | Yes, with deterministic mock |
 | Real Python/MediaPipe initialization tested | Yes |
 | Real valid-hand still-image test through the DLL | Yes |
-| Real-camera valid-hand test | Not performed |
+| Real-camera valid-hand test | Yes, with optional `-Camera` test on this machine |
 | Integration guide and example | Yes |

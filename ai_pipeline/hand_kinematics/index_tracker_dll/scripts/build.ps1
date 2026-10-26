@@ -4,14 +4,22 @@ param(
     [ValidateSet("Release", "Debug")]
     [string]$Configuration = "Release",
     [string]$HandImage = "",
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [switch]$SkipStage
 )
 
 $ErrorActionPreference = "Stop"
 $env:PYTHONDONTWRITEBYTECODE = "1"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$RepoRoot = Split-Path -Parent (Split-Path -Parent $ProjectRoot)
+$RepoRoot = $ProjectRoot
+while (-not (Test-Path -LiteralPath (Join-Path $RepoRoot ".git"))) {
+    $Parent = Split-Path -Parent $RepoRoot
+    if ([string]::IsNullOrEmpty($Parent) -or $Parent -eq $RepoRoot) {
+        throw "Could not locate the repository root above $ProjectRoot"
+    }
+    $RepoRoot = $Parent
+}
 $BuildDir = Join-Path $ProjectRoot "build"
 $DistDir = Join-Path $ProjectRoot "dist"
 
@@ -138,6 +146,14 @@ if (-not $SkipTests) {
     }
 }
 
+
+if ($SkipStage) {
+    Write-Host ""
+    Write-Host "Build complete (distribution staging skipped)."
+    Write-Host "DLL:  $DllPath"
+    Write-Host "LIB:  $LibPath"
+    return
+}
 
 Write-Host "Staging distribution..."
 

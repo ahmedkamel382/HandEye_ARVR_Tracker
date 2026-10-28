@@ -7,11 +7,29 @@
 #include <Python.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <new>
 #include <string>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#ifndef HAND_INDEX_PYTHON_BASE
+#define HAND_INDEX_PYTHON_BASE ""   // baked in by CMake: sys.base_prefix of the build interpreter
+#endif
 
 namespace {
 
@@ -76,6 +94,39 @@ void mark_lost(hand_index_result* result) {
     result->camera_y = -1.0f;
 }
 
+std::string describe_exception_value(PyObject* type, PyObject* value) {
+    std::string message;
+    if (type != nullptr) {
+        PyRef type_name(PyObject_GetAttrString(type, "__name__"));
+        const char* type_text = nullptr;
+        if (type_name.get() != nullptr) {
+            type_text = PyUnicode_AsUTF8(type_name.get());
+        }
+        if (type_text != nullptr) {
+            message = type_text;
+        }
+    }
+    if (message.empty()) {
+        message = "PythonError";
+    }
+    if (value != nullptr) {
+        PyRef value_text(PyObject_Str(value));
+        const char* text = nullptr;
+        if (value_text.get() != nullptr) {
+            text = PyUnicode_AsUTF8(value_text.get());
+        }
+        if (text != nullptr && text[0] != '\0') {
+            message += ": ";
+            message += text;
+        }
+    }
+    PyErr_Clear();
+    return message;
+}
+
+// Consumes the pending Python exception. The message contains the whole
+// __cause__ / __context__ chain, because numpy (and others) re-raise a generic
+// ImportError "from" the real failure (e.g. "DLL load failed ...").
 std::string consume_python_exception(bool* is_model_error) {
     PyObject* type = nullptr;
     PyObject* value = nullptr;
@@ -92,49 +143,272 @@ std::string consume_python_exception(bool* is_model_error) {
     PyRef value_ref(value);
     PyRef traceback_ref(traceback);
 
-    std::string message;
-    if (type_ref.get() != nullptr) {
-        PyRef type_name(PyObject_GetAttrString(type_ref.get(), "__name__"));
-        const char* type_text = nullptr;
-        if (type_name.get() != nullptr) {
-            type_text = PyUnicode_AsUTF8(type_name.get());
-        }
-        if (type_text != nullptr) {
-            message = type_text;
-        }
-    }
-    if (message.empty()) {
-        message = "PythonError";
-    }
+    std::string message = describe_exception_value(type_ref.get(), value_ref.get());
 
-    if (value_ref.get() != nullptr) {
-        PyRef value_text(PyObject_Str(value_ref.get()));
-        const char* text = nullptr;
-        if (value_text.get() != nullptr) {
-            text = PyUnicode_AsUTF8(value_text.get());
+    PyObject* current = value_ref.get();
+    for (int depth = 0; current != nullptr && depth < 6; ++depth) {
+        PyObject* next = PyException_GetCause(current);          // new reference
+        if (next == nullptr) {
+            next = PyException_GetContext(current);              // new reference
         }
-        if (text != nullptr && text[0] != '\0') {
-            message += ": ";
-            message += text;
+        if (next == nullptr) {
+            break;
         }
+        PyRef next_ref(next);
+        PyRef next_type(PyObject_Type(next));
+        message += " | caused by ";
+        message += describe_exception_value(next_type.get(), next);
+        current = next;
+        // next_ref may be released here; `current` stays valid because the
+        // chain is owned by the exception that references it.
     }
 
     PyErr_Clear();
     return message;
 }
 
-bool ensure_python(std::string& error) {
-    if (Py_IsInitialized()) {
-        return true;
-    }
+// ---------------------------------------------------------------------------
+// Deterministic interpreter start-up.
+//
+// Py_InitializeEx(0) with no configuration lets CPython guess its home from the
+// host exe location, PATH, the registry, PYTHONHOME/PYTHONPATH, the user site
+// directory and the global site-packages. That is how a "clean .venv" can still
+// lose to some other numpy on the machine. When the caller supplies
+// site_packages_dir we instead start an ISOLATED interpreter whose module search
+// path is exactly:
+//
+//     python_dir, <base>\python3XX.zip, <base>\Lib, <base>\DLLs, site_packages_dir
+//
+// (<base> = the Python install the venv was created from; a venv has no stdlib
+// of its own). Environment variables, user site and global site-packages are
+// ignored. If site_packages_dir is NULL the old behaviour is kept.
+// ---------------------------------------------------------------------------
 
-    Py_InitializeEx(0);
-    if (!Py_IsInitialized()) {
-        error = "Py_InitializeEx failed";
+bool g_strict_paths = false;   // true when this DLL created the interpreter in isolated mode
+
+std::wstring utf8_to_wide(const std::string& text) {
+#ifdef _WIN32
+    if (text.empty()) {
+        return std::wstring();
+    }
+    const int count = MultiByteToWideChar(
+        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (count <= 0) {
+        return std::wstring();
+    }
+    std::wstring wide(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(
+        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), &wide[0], count);
+    return wide;
+#else
+    return std::wstring(text.begin(), text.end());
+#endif
+}
+
+std::string trim_copy(const std::string& value) {
+    const char* whitespace = " \t\r\n\"";
+    const size_t first = value.find_first_not_of(whitespace);
+    if (first == std::string::npos) {
+        return std::string();
+    }
+    const size_t last = value.find_last_not_of(whitespace);
+    return value.substr(first, last - first + 1);
+}
+
+std::string strip_trailing_separators(std::string path) {
+    while (!path.empty() && (path.back() == '/' || path.back() == '\\')) {
+        path.pop_back();
+    }
+    return path;
+}
+
+std::string parent_directory(const std::string& path) {
+    const std::string clean = strip_trailing_separators(path);
+    const size_t cut = clean.find_last_of("/\\");
+    if (cut == std::string::npos) {
+        return std::string();
+    }
+    return clean.substr(0, cut);
+}
+
+bool file_exists(const std::string& path) {
+    std::ifstream stream(path.c_str(), std::ios::binary);
+    return static_cast<bool>(stream);
+}
+
+// site_packages_dir = <venv>\Lib\site-packages -> returns <venv> when it holds pyvenv.cfg.
+std::string find_venv_root(const std::string& site_packages_dir) {
+    std::string candidate = strip_trailing_separators(site_packages_dir);
+    for (int level = 0; level < 3; ++level) {
+        candidate = parent_directory(candidate);
+        if (candidate.empty()) {
+            break;
+        }
+        if (file_exists(candidate + "/pyvenv.cfg")) {
+            return candidate;
+        }
+    }
+    return std::string();
+}
+
+// pyvenv.cfg "home = <dir of the base python.exe>"
+std::string read_pyvenv_home(const std::string& venv_root) {
+    std::ifstream stream((venv_root + "/pyvenv.cfg").c_str());
+    std::string line;
+    while (std::getline(stream, line)) {
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        if (trim_copy(line.substr(0, equals)) == "home") {
+            return trim_copy(line.substr(equals + 1));
+        }
+    }
+    return std::string();
+}
+
+// Base install that provides the standard library.
+// Order: pyvenv.cfg of the venv -> HAND_INDEX_PYTHON_HOME env var -> path baked in at build time.
+std::string resolve_python_home(const std::string& site_packages_dir, std::string& venv_root) {
+    venv_root = find_venv_root(site_packages_dir);
+    if (!venv_root.empty()) {
+        const std::string home = read_pyvenv_home(venv_root);
+        if (!home.empty()) {
+            return home;
+        }
+    }
+    const char* from_env = std::getenv("HAND_INDEX_PYTHON_HOME");
+    if (from_env != nullptr && from_env[0] != '\0') {
+        return from_env;
+    }
+    return HAND_INDEX_PYTHON_BASE;
+}
+
+bool append_search_path(PyConfig* config, const std::string& path, std::string& error) {
+    const std::wstring wide = utf8_to_wide(path);
+    const PyStatus status = PyWideStringList_Append(&config->module_search_paths, wide.c_str());
+    if (PyStatus_Exception(status)) {
+        error = std::string("Cannot extend module search path: ") +
+            (status.err_msg != nullptr ? status.err_msg : "unknown error");
+        return false;
+    }
+    return true;
+}
+
+bool init_isolated_python(const hand_index_config& config, std::string& error) {
+    const std::string site_packages = strip_trailing_separators(config.site_packages_dir);
+
+    std::string venv_root;
+    const std::string home = strip_trailing_separators(resolve_python_home(site_packages, venv_root));
+    if (home.empty()) {
+        error = "Cannot locate the base Python install for site_packages_dir '" + site_packages +
+            "' (no pyvenv.cfg with 'home =', HAND_INDEX_PYTHON_HOME unset, nothing baked in)";
+        return false;
+    }
+    if (!file_exists(home + "/Lib/os.py")) {
+        error = "Python home '" + home + "' has no Lib/os.py; the Python the venv was "
+            "created from is missing. Recreate the .venv (setup.bat) and rebuild.";
         return false;
     }
 
+    PyConfig py_config;
+    PyConfig_InitIsolatedConfig(&py_config);   // ignores PYTHONHOME/PYTHONPATH/env, no argv parsing
+    py_config.install_signal_handlers = 0;     // the host app owns signals
+    py_config.site_import = 0;                 // no global/user site-packages; .pth handled below
+    py_config.user_site_directory = 0;
+    py_config.pathconfig_warnings = 0;
+
+    PyStatus status = PyConfig_SetString(&py_config, &py_config.home, utf8_to_wide(home).c_str());
+    if (!PyStatus_Exception(status) && !venv_root.empty()) {
+        const std::string venv_python = venv_root + "/Scripts/python.exe";
+        if (file_exists(venv_python)) {   // so sys.executable is the venv's python, not the host exe
+            status = PyConfig_SetString(
+                &py_config, &py_config.executable, utf8_to_wide(venv_python).c_str());
+        }
+    }
+
+    bool ok = !PyStatus_Exception(status);
+    if (ok) {
+        py_config.module_search_paths_set = 1;
+        const std::string zip_name = "/python" + std::to_string(PY_MAJOR_VERSION) +
+            std::to_string(PY_MINOR_VERSION) + ".zip";
+        ok = (config.python_dir == nullptr || config.python_dir[0] == '\0' ||
+                 append_search_path(&py_config, config.python_dir, error)) &&
+            append_search_path(&py_config, home + zip_name, error) &&
+            append_search_path(&py_config, home + "/Lib", error) &&
+            append_search_path(&py_config, home + "/DLLs", error) &&
+            append_search_path(&py_config, site_packages, error);
+        if (!ok) {
+            PyConfig_Clear(&py_config);
+            return false;
+        }
+        status = Py_InitializeFromConfig(&py_config);
+    }
+    PyConfig_Clear(&py_config);
+
+    if (PyStatus_Exception(status)) {
+        error = std::string("Py_InitializeFromConfig failed: ") +
+            (status.err_msg != nullptr ? status.err_msg : "unknown error") +
+            " (home='" + home + "')";
+        return false;
+    }
+    g_strict_paths = true;
+    return true;
+}
+
+bool ensure_python(const hand_index_config& config, std::string& error) {
+    if (Py_IsInitialized()) {
+        return true;   // host already owns an interpreter; we can only extend its sys.path
+    }
+
+    if (config.site_packages_dir != nullptr && config.site_packages_dir[0] != '\0') {
+        if (!init_isolated_python(config, error)) {
+            return false;
+        }
+    } else {
+        Py_InitializeEx(0);
+        if (!Py_IsInitialized()) {
+            error = "Py_InitializeEx failed";
+            return false;
+        }
+    }
+
     PyEval_SaveThread();
+    return true;
+}
+
+// Prints where this interpreter is actually importing from. Called only on import failures.
+void print_python_environment() {
+    PyRun_SimpleString(
+        "import sys\n"
+        "print('[hand_index_tracker] executable=%r' % (sys.executable,), file=sys.stderr)\n"
+        "print('[hand_index_tracker] prefix=%r base_prefix=%r' % (sys.prefix, sys.base_prefix), file=sys.stderr)\n"
+        "print('[hand_index_tracker] sys.path=%r' % (sys.path,), file=sys.stderr)\n"
+        "print('[hand_index_tracker] numpy modules=%r' % ([getattr(m, '__file__', None) "
+        "for n, m in sys.modules.items() if n == 'numpy'],), file=sys.stderr)\n");
+}
+
+// In isolated mode site.py is not run at start-up; addsitedir() appends the dir
+// (if missing) and processes .pth files, exactly like a normal start-up would.
+bool process_site_dir(const char* path, std::string& error) {
+    if (!g_strict_paths || path == nullptr || path[0] == '\0') {
+        return true;
+    }
+    PyRef site_module(PyImport_ImportModule("site"));
+    if (site_module.get() == nullptr) {
+        error = consume_python_exception(nullptr);
+        return false;
+    }
+    PyRef path_object(PyUnicode_DecodeFSDefault(path));
+    if (path_object.get() == nullptr) {
+        error = consume_python_exception(nullptr);
+        return false;
+    }
+    PyRef result(PyObject_CallMethod(site_module.get(), "addsitedir", "O", path_object.get()));
+    if (result.get() == nullptr) {
+        error = consume_python_exception(nullptr);
+        return false;
+    }
     return true;
 }
 
@@ -436,7 +710,7 @@ hand_index_error HAND_INDEX_CALL hand_index_create(
     }
 
     std::lock_guard<std::mutex> runtime_lock(g_runtime_mutex);
-    if (!ensure_python(error)) {
+    if (!ensure_python(config, error)) {
         write_error(error_message, error_message_capacity, error);
         return HAND_INDEX_ERROR_PYTHON;
     }
@@ -446,7 +720,8 @@ hand_index_error HAND_INDEX_CALL hand_index_create(
         PyErr_Clear();
 
         if (!add_sys_path(config.site_packages_dir, error) ||
-            !add_sys_path(config.python_dir, error)) {
+            !add_sys_path(config.python_dir, error) ||
+            !process_site_dir(config.site_packages_dir, error)) {
             write_error(error_message, error_message_capacity, error);
             return HAND_INDEX_ERROR_PYTHON;
         }
@@ -455,6 +730,7 @@ hand_index_error HAND_INDEX_CALL hand_index_create(
         if (numpy_module.get() == nullptr) {
             bool model_error = false;
             error = consume_python_exception(&model_error);
+            print_python_environment();
             write_error(error_message, error_message_capacity, error);
             return model_error ? HAND_INDEX_ERROR_MODEL : HAND_INDEX_ERROR_PYTHON;
         }
@@ -470,6 +746,7 @@ hand_index_error HAND_INDEX_CALL hand_index_create(
         if (module.get() == nullptr) {
             bool model_error = false;
             error = consume_python_exception(&model_error);
+            print_python_environment();
             write_error(error_message, error_message_capacity, error);
             return model_error ? HAND_INDEX_ERROR_MODEL : HAND_INDEX_ERROR_PYTHON;
         }

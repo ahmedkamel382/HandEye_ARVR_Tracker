@@ -47,7 +47,12 @@ target_include_directories(hand_index_tracker
         "$<INSTALL_INTERFACE:include>"
 )
 
-target_compile_definitions(hand_index_tracker PRIVATE HAND_INDEX_TRACKER_BUILD)
+target_compile_definitions(hand_index_tracker PRIVATE
+    HAND_INDEX_TRACKER_BUILD
+    # Fallback Python home (sys.base_prefix of the build interpreter) used when the
+    # venv's pyvenv.cfg cannot be found. Same idea as kPyHomeDir in core_engine.
+    HAND_INDEX_PYTHON_BASE="${HAND_INDEX_PYTHON_BASE}"
+)
 target_link_libraries(hand_index_tracker PRIVATE Python3::Python)
 
 set_target_properties(hand_index_tracker PROPERTIES

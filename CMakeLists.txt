@@ -6,11 +6,20 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Force Python3 variables globally to prevent fallback to release python311.lib in Debug mode
+# Python library selection.
+# Default: use the normal (release) python311.lib of the interpreter behind .venv, for Release AND Debug builds.
+# That is what works with the pip packages (numpy, mediapipe, opencv are release builds and cannot be loaded by a
+# debug Python), and pybind11 deliberately compiles Debug code against the release Python headers.
+# Only if you installed the Python "debug binaries" and really want to link python311_d.lib, configure with
+#     -DHANDEYE_USE_PYTHON_DEBUG_LIB=ON
+# (Forcing python311_d.lib unconditionally made every build depend on a file a normal venv does not contain.)
 set(Python3_FIND_STRATEGY LOCATION)
-set(Python3_LIBRARY_RELEASE "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
-set(Python3_LIBRARY_DEBUG "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
-set(Python3_LIBRARIES "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
+option(HANDEYE_USE_PYTHON_DEBUG_LIB "Link python311_d.lib from .venv/libs (needs the Python debug binaries)" OFF)
+if(HANDEYE_USE_PYTHON_DEBUG_LIB)
+    set(Python3_LIBRARY_RELEASE "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
+    set(Python3_LIBRARY_DEBUG "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
+    set(Python3_LIBRARIES "${CMAKE_SOURCE_DIR}/.venv/libs/python311_d.lib")
+endif()
 
 # Point CMake directly to the vcpkg built package files
 set(OpenCV_ROOT "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/share/opencv4")
@@ -52,6 +61,11 @@ execute_process(
 
 file(TO_CMAKE_PATH "${PY_HOME_DIR}" PY_HOME_DIR)   # forward slashes: safe inside C string literals
 file(TO_CMAKE_PATH "${PY_SITE_DIR}" PY_SITE_DIR)
+
+# The directory that really holds python311.lib is <base install>/libs (a venv has no libs folder of its own).
+if(WIN32 AND EXISTS "${PY_HOME_DIR}/libs")
+    link_directories("${PY_HOME_DIR}/libs")
+endif()
 
 set(AI_PIPELINE_DIR "${CMAKE_SOURCE_DIR}/ai_pipeline")
 
@@ -104,7 +118,7 @@ endfunction()
 core_add_forest(hand "${CMAKE_CURRENT_SOURCE_DIR}/core_engine/generated/hand_forest" CORE_HAVE_HAND_FOREST)
 
 # 6c. Configure-time pre-flight checks for Python packages, MediaPipe models, and your Gaze/Wink assets.
-foreach(_pkg numpy mediapipe sklearn cv2)
+foreach(_pkg numpy mediapipe sklearn joblib cv2)
     execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import ${_pkg}"
                     RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
     if(NOT _rc EQUAL 0)

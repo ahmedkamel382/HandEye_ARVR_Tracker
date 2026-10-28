@@ -4,7 +4,8 @@
 This script deliberately does not import index_tracker.py. It loads the
 compiled DLL with ctypes, calls only the exported hand_index_* functions, and
 never calls OS pointer/click APIs. A camera is opened only when this script is
-run explicitly.
+run explicitly. With --preview, an optional OpenCV window shows the mirrored
+camera feed, tracking status, FPS, and the landmark-8 marker.
 """
 
 from __future__ import annotations
@@ -28,6 +29,10 @@ HAND_INDEX_OK = 0
 HAND_INDEX_STATUS_TRACKED = 1
 HAND_INDEX_STATUS_LOST = 0
 HAND_INDEX_LANDMARK_INDEX = 8
+
+PREVIEW_WINDOW = "Hand Index Tracker - Camera (q/Esc to quit)"
+PREVIEW_WIDTH = 960
+PREVIEW_HEIGHT = 720
 
 
 class HandIndexConfig(ctypes.Structure):
@@ -143,6 +148,82 @@ def validate_lost(result: HandIndexResult) -> None:
             raise ProbeFailure(f"lost result has stale {name}={value}", 5)
 
 
+def create_preview_window() -> None:
+    try:
+        cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(PREVIEW_WINDOW, PREVIEW_WIDTH, PREVIEW_HEIGHT)
+    except cv2.error as exc:
+        raise ProbeFailure(
+            "cannot create preview window; run in an interactive desktop session "
+            f"with an OpenCV build that supports GUI windows: {exc}",
+            7,
+        ) from exc
+
+
+def preview_window_visible() -> bool:
+    try:
+        return cv2.getWindowProperty(PREVIEW_WINDOW, cv2.WND_PROP_VISIBLE) >= 1
+    except cv2.error:
+        return False
+
+
+def draw_preview(
+    frame: np.ndarray,
+    result: HandIndexResult,
+    fps: float,
+) -> np.ndarray:
+    display = cv2.flip(frame, 1)
+    height, width = display.shape[:2]
+    tracked = result.valid == 1
+    status = "TRACKED" if tracked else "LOST"
+    status_color = (0, 200, 0) if tracked else (0, 0, 255)
+
+    cv2.rectangle(display, (8, 8), (210, 72), (0, 0, 0), -1)
+    cv2.putText(
+        display,
+        status,
+        (18, 38),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        status_color,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        display,
+        f"FPS {fps:5.1f}",
+        (18, 64),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        display,
+        "q/Esc: quit",
+        (10, height - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    if tracked:
+        x = min(max(float(result.camera_x), 0.0), 1.0)
+        y = min(max(float(result.camera_y), 0.0), 1.0)
+        px = int(round(x * (width - 1)))
+        py = int(round(y * (height - 1)))
+        cv2.circle(display, (px, py), 12, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.circle(display, (px, py), 3, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.line(display, (px - 18, py), (px - 6, py), (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.line(display, (px + 6, py), (px + 18, py), (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.line(display, (px, py - 18), (px, py - 6), (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.line(display, (px, py + 6), (px, py + 18), (0, 255, 0), 2, cv2.LINE_AA)
+    return display
+
+
 def run(args: argparse.Namespace) -> int:
     dll = load_dll(args.dll)
     version = dll.hand_index_version().decode("utf-8", errors="replace")
@@ -189,6 +270,9 @@ def run(args: argparse.Namespace) -> int:
 
     cap = None
     exit_code = 0
+    preview_fps = 0.0
+    last_preview_frame = None
+    preview_rendered = False
     try:
         cap, backend = open_camera(args.camera_index)
         if cap is None:
@@ -206,6 +290,9 @@ def run(args: argparse.Namespace) -> int:
             f"Camera opened: index={args.camera_index}, backend={backend}, "
             f"size={width}x{height}, duration={args.seconds:.1f}s"
         )
+        if args.preview:
+            create_preview_window()
+            print("PASS preview window opened; press q or Esc to close it early")
         print("Show one hand to the camera. This probe never moves the mouse or clicks.")
 
         deadline = time.monotonic() + args.seconds
@@ -253,8 +340,10 @@ def run(args: argparse.Namespace) -> int:
                     5,
                 )
 
+            now = time.monotonic()
             frames += 1
-            if result.valid:
+            current_tracked = result.valid == 1
+            if current_tracked:
                 validate_tracked(result)
                 tracked += 1
                 if seen_tracked and not previous_valid:
@@ -266,7 +355,31 @@ def run(args: argparse.Namespace) -> int:
                 lost += 1
                 previous_valid = False
 
-            now = time.monotonic()
+            if args.preview:
+                if preview_rendered and not preview_window_visible():
+                    print("Preview window closed")
+                    break
+                if last_preview_frame is not None:
+                    delta = now - last_preview_frame
+                    if delta > 0:
+                        instant_fps = 1.0 / delta
+                        preview_fps = (
+                            instant_fps
+                            if preview_fps == 0.0
+                            else 0.9 * preview_fps + 0.1 * instant_fps
+                        )
+                last_preview_frame = now
+                display = draw_preview(frame, result, preview_fps)
+                try:
+                    cv2.imshow(PREVIEW_WINDOW, display)
+                    key = cv2.waitKey(1) & 0xFF
+                except cv2.error as exc:
+                    raise ProbeFailure(f"preview window failed: {exc}", 7) from exc
+                preview_rendered = True
+                if key in (27, ord("q"), ord("Q")):
+                    print("Preview stopped by user")
+                    break
+
             if now - last_report >= 2.0:
                 print(f"  frames={frames} tracked={tracked} lost={lost}")
                 last_report = now
@@ -292,8 +405,17 @@ def run(args: argparse.Namespace) -> int:
                 cap.release()
                 print("PASS camera released")
         finally:
-            dll.hand_index_destroy(tracker)
-            print("PASS tracker destroyed")
+            try:
+                if args.preview:
+                    try:
+                        cv2.destroyAllWindows()
+                    except cv2.error as exc:
+                        print(f"WARN could not destroy preview windows: {exc}")
+                    else:
+                        print("PASS preview windows destroyed")
+            finally:
+                dll.hand_index_destroy(tracker)
+                print("PASS tracker destroyed")
     return exit_code
 
 
@@ -307,6 +429,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--site-packages", type=Path)
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="show a live OpenCV preview window; q or Esc closes it",
+    )
     args = parser.parse_args()
     if args.seconds <= 0:
         parser.error("--seconds must be greater than zero")

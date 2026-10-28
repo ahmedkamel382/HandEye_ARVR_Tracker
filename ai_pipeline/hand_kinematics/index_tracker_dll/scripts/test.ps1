@@ -7,6 +7,7 @@ param(
     [int]$CameraIndex = 0,
     [ValidateRange(1, 120)]
     [int]$CameraSeconds = 10,
+    [switch]$CameraPreview,
     [switch]$SkipBuild
 )
 
@@ -334,7 +335,7 @@ try {
         }
     }
 
-    $cameraRequested = $Camera.IsPresent -or $PSBoundParameters.ContainsKey("CameraIndex")
+    $cameraRequested = $Camera.IsPresent -or $CameraPreview.IsPresent -or $PSBoundParameters.ContainsKey("CameraIndex")
     if (-not $cameraRequested) {
         Write-Status "SKIP" "Camera test - not requested"
     } elseif (-not $realBackendReady) {
@@ -349,8 +350,16 @@ try {
             "--camera-index", [string]$CameraIndex,
             "--seconds", [string]$CameraSeconds
         )
+        if ($CameraPreview) {
+            $cameraArguments += "--preview"
+        }
+        $cameraStageName = if ($CameraPreview) {
+            "Live camera preview (index {0})" -f $CameraIndex
+        } else {
+            "Live camera test (index {0})" -f $CameraIndex
+        }
         $cameraOk = Invoke-TestExecutable -FilePath $PythonExecutable -Arguments $cameraArguments `
-            -Name ("Live camera test (index {0})" -f $CameraIndex)
+            -Name $cameraStageName
         if (-not $cameraOk) {
             $failureCode = 70
         }

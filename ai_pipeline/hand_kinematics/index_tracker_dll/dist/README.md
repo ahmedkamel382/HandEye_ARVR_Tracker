@@ -37,10 +37,26 @@ powershell -ExecutionPolicy Bypass -File .\ai_pipeline\hand_kinematics\index_tra
   -Camera -CameraIndex 0 -CameraSeconds 10
 ```
 
-The camera is opened only for this stage and is released in a `finally` block.
-The probe auto-stops after `-CameraSeconds` (1-120 seconds) and does not create
-a window or send pointer/click events. A requested camera that cannot be opened
-or does not produce a tracked hand is reported as `FAIL`, not silently skipped.
+By default the camera stage is headless: it does not create a window or send
+pointer/click events. The camera is opened only for this stage and is released
+in a `finally` block. The probe auto-stops after `-CameraSeconds` (1-120
+seconds). A requested camera that cannot be opened or does not produce a
+tracked hand is reported as `FAIL`, not silently skipped.
+
+Add `-CameraPreview` to show a live, mirrored OpenCV window with a green
+landmark-8 marker, `TRACKED`/`LOST` status, and FPS. The marker follows the
+DLL's `camera_x`/`camera_y` output. The raw camera frame is passed to the DLL;
+only the preview copy is mirrored. Press `q` or `Esc` to close the window early.
+The camera, window, and tracker are released on exit. Neither mode moves the
+system mouse or generates clicks. `-CameraPreview` also enables the camera stage
+if `-Camera` is omitted.
+
+For a 20-second webcam test with live preview:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ai_pipeline\hand_kinematics\index_tracker_dll\scripts\test.ps1 `
+  -Camera -CameraIndex 0 -CameraSeconds 20 -CameraPreview
+```
 
 ### Requirements
 
@@ -79,7 +95,8 @@ The runner reports these stages separately:
 - `Landmark tracking / loss / reacquisition`: only when `-HandImage` is supplied;
   validates landmark 8, normalized ranges, padded frames, loss reset, and
   reacquisition.
-- `Live camera test`: only when `-Camera` or `-CameraIndex` is supplied.
+- `Live camera test`: only when `-Camera`, `-CameraPreview`, or `-CameraIndex` is
+  supplied. Add `-CameraPreview` for the live OpenCV window.
 
 `PASS` means the stage ran and its assertions passed. `FAIL` means it ran and
 failed, or a requested stage could not run; the exit code is nonzero. `SKIP`
@@ -99,6 +116,9 @@ All required stages must pass for exit code `0`.
   `dist/model/hand_landmarker.task`.
 - `cannot open camera`: close other camera applications and try another
   `-CameraIndex`.
+- `cannot create preview window`: run from an interactive Windows desktop
+  session with an OpenCV build that supports GUI windows; headless sessions can
+  still run without `-CameraPreview`.
 - `no hand was tracked`: use a well-lit image or camera frame with one visible
   hand; real MediaPipe results vary with lighting, image quality, and hardware.
 

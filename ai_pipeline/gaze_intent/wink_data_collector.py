@@ -2,12 +2,15 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-import numpy as np
 import csv
 import time
 import os
-import math
-from collections import deque
+
+# Training/serving parity: EAR maths, calibration, rolling window and face-loss reset come from the
+# runtime module itself, so recorded features are computed exactly as GazeIntent.process_frame computes them.
+from gaze_intent import (
+    EarFeatureState, calculate_ear, LEFT_EYE, RIGHT_EYE, LEFT_IRIS, RIGHT_IRIS,
+)
 
 
 class DataCollector:
@@ -34,52 +37,15 @@ class DataCollector:
             num_faces=1,
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
+            # Same options as the runtime, so "face present" means the same thing in both
+            output_facial_transformation_matrixes=True
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
 
-        # --- 3. LANDMARK MAPPING ---
-        self.LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
-        self.RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
-
-        self.LEFT_IRIS_INDEX = 468
-        self.RIGHT_IRIS_INDEX = 473
-
-        # --- 4. STATE & TEMPORAL WINDOW ---
+        # --- 3. STATE & TEMPORAL WINDOW (shared with the runtime) ---
         self.current_label = 0
-
-        self.window_size = 10
-        self.left_ear_history = deque(maxlen=self.window_size)
-        self.right_ear_history = deque(maxlen=self.window_size)
-
-        # --- 5. CALIBRATION VARIABLES ---
-        self.is_calibrated = False
-        self.calibration_frame_count = 30
-        self.current_calibration_frames = 0
-        self.left_ear_sum = 0.0
-        self.right_ear_sum = 0.0
-        self.baseline_left_ear = 1.0
-        self.baseline_right_ear = 1.0
-
-    @staticmethod
-    def _get_3d_dist(p1, p2, frame_w, frame_h) -> float:
-        # Scale normalized coordinates to physical pixels (MediaPipe z scales with width)
-        return math.sqrt(((p1.x - p2.x) * frame_w)**2 + ((p1.y - p2.y) * frame_h)**2 + ((p1.z - p2.z) * frame_w)**2)
-
-    @classmethod
-    def _calculate_ear(cls, face_landmarks, indices: list, frame_w: int, frame_h: int) -> float:
-        p1, p2, p3, p4, p5, p6 = (face_landmarks[i] for i in indices)
-        v_dist_1 = cls._get_3d_dist(p2, p6, frame_w, frame_h)
-        v_dist_2 = cls._get_3d_dist(p3, p5, frame_w, frame_h)
-        h_dist = cls._get_3d_dist(p1, p4, frame_w, frame_h)
-        return (v_dist_1 + v_dist_2) / (2.0 * h_dist) if h_dist > 0 else 0.0
-
-    def _get_rolling_features(self, history: deque, current_ear: float) -> tuple[float, float]:
-        """Calculates rolling min and variance safely."""
-        if len(history) == self.window_size:
-            ear_array = np.array(history)
-            return float(np.min(ear_array)), float(np.var(ear_array))
-        return float(current_ear), 0.0
+        self.ear_state = EarFeatureState()
 
     def run(self):
         file_exists = os.path.isfile(self.output_file)
@@ -117,26 +83,22 @@ class DataCollector:
 
                 results = self.detector.detect_for_video(mp_image, frame_timestamp_ms)
 
-                if results.face_landmarks:
+                if results.face_landmarks and results.facial_transformation_matrixes:
                     first_face_landmarks = results.face_landmarks[0]
 
-                    raw_left_ear = self._calculate_ear(first_face_landmarks, self.LEFT_EYE_INDICES, frame_w, frame_h)
-                    raw_right_ear = self._calculate_ear(first_face_landmarks, self.RIGHT_EYE_INDICES, frame_w, frame_h)
+                    raw_left_ear = calculate_ear(first_face_landmarks, LEFT_EYE, frame_w, frame_h)
+                    raw_right_ear = calculate_ear(first_face_landmarks, RIGHT_EYE, frame_w, frame_h)
 
-                    if not self.is_calibrated:
-                        self.left_ear_sum += raw_left_ear
-                        self.right_ear_sum += raw_right_ear
-                        self.current_calibration_frames += 1
+                    was_calibrated = self.ear_state.is_calibrated
+                    features = self.ear_state.update(raw_left_ear, raw_right_ear)
 
+                    if features is None:
                         cv2.putText(frame,
-                                    f"CALIBRATING: {self.current_calibration_frames}/{self.calibration_frame_count}",
+                                    f"CALIBRATING: {self.ear_state.current_calibration_frames}"
+                                    f"/{self.ear_state.calibration_frame_count}",
                                     (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
 
-                        if self.current_calibration_frames >= self.calibration_frame_count:
-                            self.baseline_left_ear = self.left_ear_sum / self.calibration_frame_count
-                            self.baseline_right_ear = self.right_ear_sum / self.calibration_frame_count
-                            self.is_calibrated = True
-
+                        if not was_calibrated and self.ear_state.is_calibrated:
                             print("\nCalibration Complete!")
                             print("Press 'SPACE' for NEUTRAL (Hover/Default)")
                             print("Press '1' for LEFT WINK (Left Click)")
@@ -144,14 +106,7 @@ class DataCollector:
                             print("Press '3' for SUSTAINED CLOSURE (Pause/Sleep)")
                             print("Press 'Q' to save and exit.")
                     else:
-                        left_ear = raw_left_ear / self.baseline_left_ear if self.baseline_left_ear > 0 else 0.0
-                        right_ear = raw_right_ear / self.baseline_right_ear if self.baseline_right_ear > 0 else 0.0
-
-                        self.left_ear_history.append(left_ear)
-                        self.right_ear_history.append(right_ear)
-
-                        l_min_ear, l_var_ear = self._get_rolling_features(self.left_ear_history, left_ear)
-                        r_min_ear, r_var_ear = self._get_rolling_features(self.right_ear_history, right_ear)
+                        left_ear, l_min_ear, l_var_ear, right_ear, r_min_ear, r_var_ear = features
 
                         writer.writerow([
                             time.time(),
@@ -184,15 +139,20 @@ class DataCollector:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
                     # Draw Debug Elements
-                    for idx in self.LEFT_EYE_INDICES + self.RIGHT_EYE_INDICES:
+                    for idx in LEFT_EYE + RIGHT_EYE:
                         lm = first_face_landmarks[idx]
                         pos = (int(lm.x * frame_w), int(lm.y * frame_h))
                         cv2.circle(frame, pos, 2, (0, 255, 0), -1)
 
-                    for idx in [self.LEFT_IRIS_INDEX, self.RIGHT_IRIS_INDEX]:
+                    for idx in (LEFT_IRIS, RIGHT_IRIS):
                         lm = first_face_landmarks[idx]
                         pos = (int(lm.x * frame_w), int(lm.y * frame_h))
                         cv2.circle(frame, pos, 3, (0, 0, 255), -1)
+                else:
+                    # Face lost: identical to the runtime (clear EAR windows, restart incomplete calibration)
+                    self.ear_state.reset_tracking_state()
+                    cv2.putText(frame, "NO FACE - window reset", (30, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
                 cv2.imshow('Data Collector (Press Q to Quit)', frame)
 
@@ -210,6 +170,7 @@ class DataCollector:
 
         cap.release()
         cv2.destroyAllWindows()
+        self.detector.close()
         print(f"Data successfully saved to:\n{self.output_file}")
 
 

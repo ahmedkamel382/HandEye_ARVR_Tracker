@@ -3,7 +3,7 @@ import time
 import math
 import numpy as np
 from sklearn.linear_model import Ridge
-from gaze_intent import GazeIntent
+from gaze_intent import GazeIntent, is_valid_output
 
 STATE_LABELS = {
     -1: ("INITIALIZING...", (0, 165, 255)),
@@ -76,12 +76,13 @@ def main():
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         timestamp_ms = int((time.time() - start_time) * 1000)
 
-        # 1. RUN TRACKER ON RAW FRAME (Outputs raw Absolute Gaze)
+        # 1. RUN TRACKER ON RAW FRAME (Outputs raw Absolute Gaze; NaN angles when invalid)
         raw_yaw, raw_pitch, head_yaw, head_pitch, state, landmarks = tracker.process_frame(rgb_frame, timestamp_ms)
         state_text, state_color = STATE_LABELS.get(state, (f"STATE: {state}", (0, 255, 0)))
 
-        # Apply EMA smoothing locally for the visualizer only when gaze is valid
-        is_valid_gaze = (landmarks is not None and state >= 0)
+        # Apply EMA smoothing locally for the visualizer only when gaze is valid.
+        # NaN must never reach the EMA: a single NaN would poison the smoothed value permanently.
+        is_valid_gaze = (landmarks is not None and state >= 0 and is_valid_output(raw_yaw, raw_pitch))
         if is_valid_gaze:
             if smooth_yaw is None or smooth_pitch is None:
                 smooth_yaw = float(raw_yaw)
@@ -179,15 +180,18 @@ def main():
                 baseline_areas.append(get_face_area(landmarks, raw_w, raw_h))
 
             if elapsed >= calib_duration:
-                med_yaw = float(np.median([s[0] for s in current_dot_samples])) if current_dot_samples else (
-                            smooth_yaw or 0.0)
-                med_pitch = float(np.median([s[1] for s in current_dot_samples])) if current_dot_samples else (
-                            smooth_pitch or 0.0)
-                collected_features.append(build_poly_features(med_yaw, med_pitch))
-                target_screen_pts.append([tx, ty])
-                current_dot_samples = []
-                calib_step += 1
-                step_timer = time.time()
+                if not current_dot_samples:
+                    # No valid gaze while this dot was shown (face lost / re-calibrating):
+                    # retry the same dot rather than fabricating a 0.0 deg sample for the fit.
+                    step_timer = time.time()
+                else:
+                    med_yaw = float(np.median([s[0] for s in current_dot_samples]))
+                    med_pitch = float(np.median([s[1] for s in current_dot_samples]))
+                    collected_features.append(build_poly_features(med_yaw, med_pitch))
+                    target_screen_pts.append([tx, ty])
+                    current_dot_samples = []
+                    calib_step += 1
+                    step_timer = time.time()
 
                 if calib_step >= len(calib_grid):
                     baseline_face_area = float(np.median(baseline_areas))

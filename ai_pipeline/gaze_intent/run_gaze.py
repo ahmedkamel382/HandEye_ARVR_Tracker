@@ -1,5 +1,6 @@
 import cv2
 import time
+import math
 import numpy as np
 from sklearn.linear_model import Ridge
 from gaze_intent import GazeIntent
@@ -14,20 +15,21 @@ STATE_LABELS = {
 
 
 def draw_hud_text(frame, text, pos, font_scale=0.8, color=(0, 255, 0), thickness=2):
-    x, y = pos
+    x, y = int(pos[0]), int(pos[1])
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
     cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
 
 
 def build_poly_features(yaw, pitch):
-    return np.array([1.0, yaw, pitch], dtype=np.float64)
+    return np.array([1.0, float(yaw), float(pitch)], dtype=np.float64)
 
 
-def get_face_area(landmarks, frame_w, frame_h):
-    if not landmarks: return 0.0
-    x_coords = [lm.x * frame_w for lm in landmarks]
-    y_coords = [lm.y * frame_h for lm in landmarks]
-    return float((max(x_coords) - min(x_coords)) * (max(y_coords) - min(y_coords)))
+def get_face_area(landmarks, frame_w, frame_h) -> float:
+    if not landmarks:
+        return 0.0
+    x_coords = [float(lm.x * frame_w) for lm in landmarks]
+    y_coords = [float(lm.y * frame_h) for lm in landmarks]
+    return (max(x_coords) - min(x_coords)) * (max(y_coords) - min(y_coords))
 
 
 def main():
@@ -60,9 +62,9 @@ def main():
     last_cursor_x, last_cursor_y = None, None
     CROP_SIZE = 500
 
-    # EMA Variables moved from tracker to runner
-    smooth_yaw = 0.0
-    smooth_pitch = 0.0
+    # EMA Variables
+    smooth_yaw = None
+    smooth_pitch = None
     ema_alpha = 0.20
 
     while cap.isOpened():
@@ -78,22 +80,23 @@ def main():
         raw_yaw, raw_pitch, head_yaw, head_pitch, state, landmarks = tracker.process_frame(rgb_frame, timestamp_ms)
         state_text, state_color = STATE_LABELS.get(state, (f"STATE: {state}", (0, 255, 0)))
 
-        # Apply EMA smoothing locally for the visualizer
-        if raw_yaw != 0.0 or raw_pitch != 0.0:
-            if smooth_yaw == 0.0 and smooth_pitch == 0.0:
-                smooth_yaw = raw_yaw
-                smooth_pitch = raw_pitch
+        # Apply EMA smoothing locally for the visualizer only when gaze is valid
+        is_valid_gaze = (landmarks is not None and state >= 0)
+        if is_valid_gaze:
+            if smooth_yaw is None or smooth_pitch is None:
+                smooth_yaw = float(raw_yaw)
+                smooth_pitch = float(raw_pitch)
             else:
-                smooth_yaw = (ema_alpha * raw_yaw) + ((1 - ema_alpha) * smooth_yaw)
-                smooth_pitch = (ema_alpha * raw_pitch) + ((1 - ema_alpha) * smooth_pitch)
+                smooth_yaw = (ema_alpha * float(raw_yaw)) + ((1.0 - ema_alpha) * smooth_yaw)
+                smooth_pitch = (ema_alpha * float(raw_pitch)) + ((1.0 - ema_alpha) * smooth_pitch)
         else:
-            smooth_yaw = 0.0
-            smooth_pitch = 0.0
+            smooth_yaw = None
+            smooth_pitch = None
 
         # 2. CALCULATE UI CROP
         if landmarks:
-            raw_x_coords = [lm.x * raw_w for lm in landmarks]
-            raw_y_coords = [lm.y * raw_h for lm in landmarks]
+            raw_x_coords = [float(lm.x * raw_w) for lm in landmarks]
+            raw_y_coords = [float(lm.y * raw_h) for lm in landmarks]
 
             target_cx = (min(raw_x_coords) + max(raw_x_coords)) / 2.0
             target_cy = (min(raw_y_coords) + max(raw_y_coords)) / 2.0
@@ -103,9 +106,9 @@ def main():
             if smooth_cx is None:
                 smooth_cx, smooth_cy, smooth_size = target_cx, target_cy, target_size
             else:
-                smooth_cx = smooth_cx * (1 - smooth_factor) + target_cx * smooth_factor
-                smooth_cy = smooth_cy * (1 - smooth_factor) + target_cy * smooth_factor
-                smooth_size = smooth_size * (1 - smooth_factor) + target_size * smooth_factor
+                smooth_cx = (smooth_cx * (1.0 - smooth_factor)) + (target_cx * smooth_factor)
+                smooth_cy = (smooth_cy * (1.0 - smooth_factor)) + (target_cy * smooth_factor)
+                smooth_size = (smooth_size * (1.0 - smooth_factor)) + (target_size * smooth_factor)
 
             crop_w = int(smooth_size)
             crop_x1 = int(smooth_cx - (crop_w / 2.0))
@@ -135,7 +138,7 @@ def main():
                                                                                                            CROP_SIZE))
 
         def map_to_crop(rx, ry):
-            return int(((rx - crop_x1) / crop_w) * CROP_SIZE), int(((ry - crop_y1) / crop_w) * CROP_SIZE)
+            return int(((float(rx) - crop_x1) / crop_w) * CROP_SIZE), int(((float(ry) - crop_y1) / crop_w) * CROP_SIZE)
 
         if calib_grid is None:
             margin_x, margin_y = int(CROP_SIZE * 0.10), int(CROP_SIZE * 0.15)
@@ -162,21 +165,24 @@ def main():
         elif calib_active:
             elapsed = time.time() - step_timer
             remain = max(0.0, calib_duration - elapsed)
-            tx, ty = calib_grid[calib_step]
-            pulse = int(5 * np.sin(time.time() * 8))
+            tx, ty = int(calib_grid[calib_step][0]), int(calib_grid[calib_step][1])
+            pulse = int(5.0 * math.sin(time.time() * 8.0))
+
             cv2.circle(cropped_frame, (tx, ty), 22 + pulse, (0, 255, 255), 2, cv2.LINE_AA)
             cv2.circle(cropped_frame, (tx, ty), 12, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.circle(cropped_frame, (tx, ty), 3, (255, 255, 255), -1, cv2.LINE_AA)
             draw_hud_text(cropped_frame, f"CALIBRATION: DOT {calib_step + 1}/9  ({remain:.1f}s)", (20, 50), 0.85,
                           (0, 255, 255), 2)
 
-            if elapsed > 1.2:
+            if elapsed > 1.2 and is_valid_gaze:
                 current_dot_samples.append((smooth_yaw, smooth_pitch))
-                baseline_areas.append(get_face_area(landmarks, raw_w, raw_h))  # Calculate multiplier on RAW frame
+                baseline_areas.append(get_face_area(landmarks, raw_w, raw_h))
 
             if elapsed >= calib_duration:
-                med_yaw = float(np.median([s[0] for s in current_dot_samples])) if current_dot_samples else smooth_yaw
-                med_pitch = float(np.median([s[1] for s in current_dot_samples])) if current_dot_samples else smooth_pitch
+                med_yaw = float(np.median([s[0] for s in current_dot_samples])) if current_dot_samples else (
+                            smooth_yaw or 0.0)
+                med_pitch = float(np.median([s[1] for s in current_dot_samples])) if current_dot_samples else (
+                            smooth_pitch or 0.0)
                 collected_features.append(build_poly_features(med_yaw, med_pitch))
                 target_screen_pts.append([tx, ty])
                 current_dot_samples = []
@@ -185,50 +191,52 @@ def main():
 
                 if calib_step >= len(calib_grid):
                     baseline_face_area = float(np.median(baseline_areas))
-                    A, targets = np.array(collected_features, dtype=np.float64), np.array(target_screen_pts,
-                                                                                          dtype=np.float64)
+                    A = np.array(collected_features, dtype=np.float64)
+                    targets = np.array(target_screen_pts, dtype=np.float64)
                     reg_x, reg_y = Ridge(alpha=0.5).fit(A, targets[:, 0]), Ridge(alpha=0.5).fit(A, targets[:, 1])
                     calib_active = False
         else:
-            feat = build_poly_features(smooth_yaw, smooth_pitch).reshape(1, -1)
-            raw_cx, raw_cy = float(reg_x.predict(feat)[0]), float(reg_y.predict(feat)[0])
+            if smooth_yaw is not None and smooth_pitch is not None:
+                feat = build_poly_features(smooth_yaw, smooth_pitch).reshape(1, -1)
+                raw_cx, raw_cy = float(reg_x.predict(feat)[0]), float(reg_y.predict(feat)[0])
 
-            current_area = get_face_area(landmarks, raw_w, raw_h)
-            raw_multiplier = float(np.sqrt(baseline_face_area / current_area)) if current_area > 0 else 1.0
-            multiplier = min(raw_multiplier, 2.0)  # Cap to prevent noise explosion
+                current_area = get_face_area(landmarks, raw_w, raw_h)
+                raw_multiplier = float(np.sqrt(baseline_face_area / current_area)) if current_area > 0 else 1.0
+                multiplier = min(raw_multiplier, 2.0)
 
-            mid_x, mid_y = CROP_SIZE // 2, CROP_SIZE // 2
-            scaled_cx = mid_x + ((raw_cx - mid_x) * multiplier)
-            scaled_cy = mid_y + ((raw_cy - mid_y) * multiplier)
+                mid_x, mid_y = CROP_SIZE // 2, CROP_SIZE // 2
+                scaled_cx = mid_x + ((raw_cx - mid_x) * multiplier)
+                scaled_cy = mid_y + ((raw_cy - mid_y) * multiplier)
 
-            if cursor_smooth_x is None:
-                cursor_smooth_x, cursor_smooth_y = scaled_cx, scaled_cy
-            else:
-                c_alpha = 0.20  # Screen smoothing factor
-                cursor_smooth_x = (c_alpha * scaled_cx) + ((1 - c_alpha) * cursor_smooth_x)
-                cursor_smooth_y = (c_alpha * scaled_cy) + ((1 - c_alpha) * cursor_smooth_y)
-
-            cursor_x = int(np.clip(cursor_smooth_x, 15, CROP_SIZE - 15))
-            cursor_y = int(np.clip(cursor_smooth_y, 15, CROP_SIZE - 15))
-
-            # Deadzone: Ignore micro-movements smaller than 8 pixels
-            if last_cursor_x is None:
-                last_cursor_x, last_cursor_y = cursor_x, cursor_y
-            else:
-                # Calculate pixel distance between new frame and old frame
-                dist = np.hypot(cursor_x - last_cursor_x, cursor_y - last_cursor_y)
-                if dist < 8.0:
-                    cursor_x, cursor_y = last_cursor_x, last_cursor_y
+                if cursor_smooth_x is None:
+                    cursor_smooth_x, cursor_smooth_y = scaled_cx, scaled_cy
                 else:
+                    c_alpha = 0.20
+                    cursor_smooth_x = (c_alpha * scaled_cx) + ((1.0 - c_alpha) * cursor_smooth_x)
+                    cursor_smooth_y = (c_alpha * scaled_cy) + ((1.0 - c_alpha) * cursor_smooth_y)
+
+                cursor_x = int(np.clip(cursor_smooth_x, 15, CROP_SIZE - 15))
+                cursor_y = int(np.clip(cursor_smooth_y, 15, CROP_SIZE - 15))
+
+                if last_cursor_x is None:
                     last_cursor_x, last_cursor_y = cursor_x, cursor_y
+                else:
+                    dist = math.hypot(float(cursor_x - last_cursor_x), float(cursor_y - last_cursor_y))
+                    if dist < 8.0:
+                        cursor_x, cursor_y = last_cursor_x, last_cursor_y
+                    else:
+                        last_cursor_x, last_cursor_y = cursor_x, cursor_y
 
-            cv2.circle(cropped_frame, (cursor_x, cursor_y), 15, (0, 0, 255), -1, cv2.LINE_AA)
-            cv2.circle(cropped_frame, (cursor_x, cursor_y), 18, (255, 255, 255), 3, cv2.LINE_AA)
-            cv2.circle(cropped_frame, (cursor_x, cursor_y), 2, (0, 0, 0), -1, cv2.LINE_AA)
+                # Cast explicitly to native Python int to satisfy PyCharm and OpenCV
+                cx, cy = int(cursor_x), int(cursor_y)
+                cv2.circle(cropped_frame, (cx, cy), 15, (0, 0, 255), -1, cv2.LINE_AA)
+                cv2.circle(cropped_frame, (cx, cy), 18, (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.circle(cropped_frame, (cx, cy), 2, (0, 0, 0), -1, cv2.LINE_AA)
 
-            draw_hud_text(cropped_frame,
-                          f"EYE: (Y:{smooth_yaw:.1f} P:{smooth_pitch:.1f}) | HEAD: (Y:{head_yaw:.1f} P:{head_pitch:.1f})",
-                          (20, 35), 0.65, (255, 255, 255), 2)
+                draw_hud_text(cropped_frame,
+                              f"EYE: (Y:{smooth_yaw:.1f} P:{smooth_pitch:.1f}) | HEAD: (Y:{head_yaw:.1f} P:{head_pitch:.1f})",
+                              (20, 35), 0.65, (255, 255, 255), 2)
+
             draw_hud_text(cropped_frame, f"STATE: {state_text}", (20, 70), 0.85, state_color, 2)
 
         cv2.imshow('Gaze Intent Test', cropped_frame)

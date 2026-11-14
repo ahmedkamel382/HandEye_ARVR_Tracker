@@ -19,6 +19,7 @@ the C++ in core_engine/include/{hand_math,gaze_math}.hpp must be updated to matc
 import argparse
 import collections
 import importlib.util
+import math
 import os
 import shutil
 import subprocess
@@ -249,7 +250,11 @@ def main():
     for i, (kind, (ex, ey, es), g) in enumerate(zip(kinds, expected, got)):
         gx, gy, gs = float(g[0]), float(g[1]), int(g[2])
         states[kind][es] += 1
-        ok = (gs == es) and abs(gx - ex) < 2e-6 and abs(gy - ey) < 2e-6
+        # NaN != NaN under IEEE-754: the gaze angles are NaN while calibrating / without a face (INVALID_ANGLE),
+        # so two NaNs count as a match; a NaN against a number is still a mismatch (abs(nan) < eps is False).
+        def same(a, b):
+            return (math.isnan(a) and math.isnan(b)) or abs(a - b) < 2e-6
+        ok = (gs == es) and same(gx, ex) and same(gy, ey)
         if not ok:
             bad[kind] += 1
             if shown < 8:

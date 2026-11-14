@@ -6,11 +6,14 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <vector>
 
 #include "dsp_adapter.hpp"
+#include "freshness_gate.hpp"
+#include "hand_math.hpp"
 #include "tracking_types.hpp"
 
 using namespace core;
@@ -107,6 +110,63 @@ static void t_invalid_config_throws() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Freshness gate + Eng 4's filter: a HELD frame must not touch the DSP history. Proof: the gated adapter produces EXACTLY the
+// outputs of a second adapter that was fed only the real observations; feeding the retained points (the old behaviour) does not.
+struct ConstHandModel : IHandModel {
+    void classify(const double*, int& c, double& p) override { c = 0; p = 1.0; }
+    const char* name() const override { return "const"; }
+};
+static void t_gate_with_dsp_adapter_matches_observation_only() {
+    ConstHandModel model;
+    HandNative hand(&model);
+    float pk[kHandPacked * 3];
+    for (float& v : pk) v = 0.f;
+    for (int i = 0; i < 21; ++i) { pk[3 * (21 + i)] = 0.01f * i; pk[3 * (21 + i) + 1] = 0.02f * (i % 5); }
+    DspFilterAdapter gated(dsp::kInitialHandConfig), ref(dsp::kInitialHandConfig), naive(dsp::kInitialHandConfig);
+    FreshnessGate gate;
+    std::optional<GatedPoint> last_pub;
+    int mismatches = 0, naive_diff = 0, held = 0, lost = 0, tracked = 0;
+    bool after_lost = false;
+    for (int i = 0; i < 900; ++i) {
+        const double t = i / 60.0;
+        const int drop_len = 3 + 3 * ((i / 50) % 3);                           // dropouts of 3, 6, 9 frames
+        const bool miss = (i % 50) >= 40 && (i % 50) < 40 + drop_len;
+        pk[3 * 8] = float(0.5 + 0.35 * std::sin(i * 0.07));
+        pk[3 * 8 + 1] = float(0.5 + 0.25 * std::cos(i * 0.045));
+        const ModuleOut r = miss ? hand.process(nullptr, 0) : hand.process(pk, kHandPacked);
+        const auto pub = gate.update(r, gated, true, t);
+
+        if (r.tracking_state == TrackingState::Tracked) {
+            ++tracked;
+            double x = r.x, y = r.y;
+            ref.filter(x, y, t);
+            if (!pub || pub->x != x || pub->y != y) ++mismatches;
+            if (after_lost) { CHECK_NEAR(pub->x, r.x, 1e-9); after_lost = false; }     // new track starts from the measurement: no glide
+            last_pub = pub;
+        } else if (r.tracking_state == TrackingState::Held) {
+            ++held;
+            if (!pub || !last_pub || pub->x != last_pub->x || pub->y != last_pub->y) ++mismatches;
+        } else {
+            ++lost;
+            if (pub) ++mismatches;
+            ref.reset();
+            last_pub.reset();
+            after_lost = true;
+        }
+        if (r.detected()) {                                                     // old behaviour: retained points filtered as fresh
+            double x = r.x, y = r.y;
+            naive.filter(x, y, t);
+            if (r.tracking_state == TrackingState::Tracked && pub && std::fabs(x - pub->x) > 1e-12) ++naive_diff;
+        } else naive.reset();
+    }
+    CHECK(mismatches == 0);
+    CHECK(tracked > 0 && held > 0 && lost > 0);
+    CHECK(naive_diff > 0);
+    CHECK(gate.counters().filter_updates == uint64_t(tracked));
+    CHECK(gated.errors() == 0 && gated.rejectedTimestamps() == 0);              // the DSP never saw a bad or repeated timestamp
+}
+
+// ---------------------------------------------------------------------------------------------
 int main() {
     struct { const char* name; void (*fn)(); } tests[] = {
         {"adapter == dsp::TrackingFilter2D", t_matches_dsp_directly},
@@ -115,6 +175,7 @@ int main() {
         {"rejected timestamp keeps last output, history intact", t_rejected_timestamp_holds_last_output},
         {"reset / gap / clamp / NaN", t_reset_gap_and_bad_values},
         {"invalid configuration throws", t_invalid_config_throws},
+        {"freshness gate + dsp adapter == observation-only filter", t_gate_with_dsp_adapter_matches_observation_only},
     };
     int failed_before = 0;
     for (const auto& t : tests) {

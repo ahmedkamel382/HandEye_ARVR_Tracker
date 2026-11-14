@@ -27,6 +27,7 @@ struct FrameReport {
     bool inhibited = false;
     bool injection_failed = false;    // Windows refused at least one event
     bool gaze_calibrating = false;
+    bool hand_held = false;           // the hand point used this frame is a cached HELD point, not a new observation
     std::uint32_t unknown_states = 0; // state integers outside the contract, treated as neutral
 };
 

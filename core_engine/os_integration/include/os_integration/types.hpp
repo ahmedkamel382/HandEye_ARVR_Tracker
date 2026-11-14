@@ -62,12 +62,29 @@ enum class EyeState : std::int32_t {
 std::optional<HandGesture> hand_gesture_from_int(std::int32_t value) noexcept;
 std::optional<EyeState> eye_state_from_int(std::int32_t value) noexcept;
 
+// How fresh a tracker sample is. Mirrors core::TrackingState; the host maps it explicitly so this
+// library does not depend on the core headers.
+//   Tracked: observed this frame (a sample with a point and no explicit state is Tracked: the old behaviour).
+//   Held:    short dropout. `point` is the last smoothed point, replayed for cursor continuity; nothing was
+//            measured, so it must not start a gesture or feed calibration.
+//   Lost:    no usable position; any `point` is ignored.
+enum class TrackerState : std::uint8_t { Tracked, Held, Lost };
+
 // One tracker's output for one frame. `point` is empty whenever the tracker
 // lost its target (Python's (-1, -1)) or DSP produced no stabilized value.
 struct TrackerSample {
     std::optional<NormalizedPoint> point;
     std::int32_t state = 0;
+    TrackerState tracking = TrackerState::Tracked; // appended with a default: {point, state} still compiles
 };
+
+// The sample's point only if it is a fresh observation: what calibration may learn from.
+inline std::optional<NormalizedPoint> fresh_point(const TrackerSample& sample) noexcept {
+    if (sample.tracking == TrackerState::Tracked) {
+        return sample.point;
+    }
+    return std::nullopt;
+}
 
 // Phase 4 hand-off: everything the core loop gives the OS layer per frame.
 struct FramePayload {

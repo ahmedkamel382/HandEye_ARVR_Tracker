@@ -32,6 +32,14 @@ std::optional<NormalizedPoint> usable(const std::optional<NormalizedPoint>& poin
     return std::nullopt;
 }
 
+// A LOST sample never moves the cursor, whatever point it still carries. A HELD sample keeps its (cached) point.
+std::optional<NormalizedPoint> usable(const TrackerSample& sample) noexcept {
+    if (sample.tracking == TrackerState::Lost) {
+        return std::nullopt;
+    }
+    return usable(sample.point);
+}
+
 std::size_t index(MouseButton button) noexcept {
     return static_cast<std::size_t>(button);
 }
@@ -80,14 +88,22 @@ FrameReport OsController::update(const FramePayload& frame) noexcept {
     } else {
         ++report.unknown_states;
     }
+    // A HELD hand sample repeats the last observation. It keeps the cursor where it was and keeps a gesture that is
+    // already confirmed (a drag survives a short dropout), but it is no new evidence: it cannot start or confirm a
+    // gesture (a stale pinch must not click). So the debouncer is fed what it already confirmed, nothing more.
+    const bool hand_held = frame.hand.tracking == TrackerState::Held;
+    if (hand_held) {
+        hand_raw = gestures_.confirmed_hand();
+    }
     const bool calibrating = eye_raw == EyeState::Calibrating;
     report.gaze_calibrating = calibrating;
 
     const ActionList actions = gestures_.update(hand_raw, eye_raw, t);
 
     // Map both channels every frame so each keeps its own history.
-    const auto hand_point = usable(frame.hand.point);
-    const auto gaze_point = usable(frame.gaze.point);
+    const auto hand_point = usable(frame.hand);
+    const auto gaze_point = usable(frame.gaze);
+    report.hand_held = hand_held && hand_point.has_value();
     std::optional<PixelPoint> hand_live;
     if (hand_point) {
         hand_live = mapper_.map(settings_.mapping.hand_region, *hand_point);

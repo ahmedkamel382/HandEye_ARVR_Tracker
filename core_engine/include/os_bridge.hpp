@@ -25,6 +25,7 @@
 
 #include "dsp_adapter.hpp"
 #include "euro_builtin.hpp"
+#include "freshness_gate.hpp"
 #include "tracking_types.hpp"
 
 #ifdef CORE_HAVE_OS_INTEGRATION
@@ -93,7 +94,7 @@ public:
         const double t = double(r.ts_ms) / 1000.0;
         osi::FramePayload f;
         f.timestamp_seconds = t;
-        convert(r.hand, hand_flt_, hand_had_, f.hand, t);
+        convertHand(r.hand, f.hand, t);
         convert(r.gaze, gaze_flt_, gaze_had_, f.gaze, t);
         tray_->submit_frame(f);
         ++sent_;
@@ -132,7 +133,8 @@ private:
     void buildFilters(const osi::FilterSettings& h, const osi::FilterSettings& g) {
         std::unique_ptr<IPointFilter> nh = makeFilter(h), ng = makeFilter(g);     // build both first: all or nothing
         hand_flt_ = std::move(nh); gaze_flt_ = std::move(ng);
-        hand_had_ = gaze_had_ = false;
+        hand_gate_.reset();          // new filter object: its history and the cached point of the old one are gone
+        gaze_had_ = false;
         char buf[200];
 #ifdef CORE_HAVE_DSP_FILTER
         const char* kind = cfg_.use_dsp ? "dsp_filter (Eng 4)" : "built-in 1-Euro";
@@ -152,7 +154,20 @@ private:
         catch (const std::exception& e) { osi::app::AppLog::error(std::string("filter settings not applied: ") + e.what()); }
     }
 
-    // Detected -> smoothed point. Lost -> no point, and the filter forgets its history (no glide across the gap).
+    // HAND: only a freshly TRACKED observation updates the filter; HELD (retained during a short dropout) republishes the
+    // cached filtered point without touching the filter; LOST resets it and publishes nothing (see freshness_gate.hpp).
+    // The state integer is forwarded raw: states bypass the DSP stage.
+    void convertHand(const ModuleOut& m, osi::TrackerSample& out, double t) {
+        out.state = m.ok ? m.state : 0;
+        if (const auto p = hand_gate_.update(m, *hand_flt_, cfg_.use_filter, t)) {
+            out.point = osi::NormalizedPoint{p->x, p->y};
+            out.tracking = p->held ? osi::TrackerState::Held : osi::TrackerState::Tracked;   // explicit mapping, no core header in osi
+        } else {
+            out.tracking = osi::TrackerState::Lost;
+        }
+    }
+
+    // GAZE (unchanged): detected -> smoothed point. Lost -> no point, and the filter forgets its history (no glide across the gap).
     // The state integer is forwarded raw: states bypass the DSP stage.
     void convert(const ModuleOut& m, std::unique_ptr<IPointFilter>& flt, bool& had, osi::TrackerSample& out, double t) {
         out.state = m.ok ? m.state : 0;
@@ -173,7 +188,8 @@ private:
     std::atomic<bool> ui_done_{false};
 
     std::unique_ptr<IPointFilter> hand_flt_, gaze_flt_;
-    bool hand_had_ = false, gaze_had_ = false;
+    FreshnessGate hand_gate_;
+    bool gaze_had_ = false;
     std::string filter_desc_;
     uint64_t sent_ = 0;
 

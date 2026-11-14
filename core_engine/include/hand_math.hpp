@@ -172,19 +172,31 @@ public:
 
     // pts: n x 3 floats. n == 0: no hand. n == kHandPacked: image landmarks then world landmarks.
     // Any other n is a bridge error (ok = false, no state change).
+    // Every result carries tracking_state / missed_frames (see tracking_types.hpp): x, y and state of a TRACKED result are
+    // exactly what the tracker returned before this contract existed; HELD repeats the last TRACKED x, y, state.
     ModuleOut process(const float* pts, int n) {
         using namespace hand_idx;
-        if (n != 0 && (n != kHandPacked || !pts)) return ModuleOut{};
+        if (n != 0 && (n != kHandPacked || !pts)) {            // bridge error: no output, tracker state untouched
+            ModuleOut e;                                       // ok = false, x = y = -1, state 0
+            e.tracking_state = TrackingState::Lost;
+            e.missed_frames = missed_;
+            return e;
+        }
         if (n == 0) {                                          // detection miss
             if (missed_ < 1000000) ++missed_;
-            if (missed_ > p_.grace_frames) {                   // genuine hand loss
+            if (!has_track_ || missed_ > p_.grace_frames) {    // startup (never observed) or genuine hand loss
                 votes_.clear();
                 confidence_ = 0.0;
-                last_ = make(-1.0f, -1.0f, 0);
+                has_track_ = false;
+                last_ = make(-1.0f, -1.0f, 0, TrackingState::Lost, missed_);
+            } else {                                           // short dropout: hold the last output, say so
+                last_.tracking_state = TrackingState::Held;
+                last_.missed_frames = missed_;
             }
-            return last_;                                      // otherwise: hold the last output
+            return last_;
         }
         missed_ = 0;
+        has_track_ = true;
 
         double cx = 0.0, cy = 0.0;                             // cursor from the IMAGE landmarks
         switch (p_.anchor) {
@@ -203,7 +215,8 @@ public:
 
         votes_.push_back(state);
         if (int(votes_.size()) > p_.smoothing_frames) votes_.pop_front();
-        last_ = make(float(std::max(0.0, std::min(1.0, cx))), float(std::max(0.0, std::min(1.0, cy))), vote());
+        last_ = make(float(std::max(0.0, std::min(1.0, cx))), float(std::max(0.0, std::min(1.0, cy))), vote(),
+                     TrackingState::Tracked, 0);
         return last_;
     }
 
@@ -211,7 +224,13 @@ public:
     int missedFrames() const { return missed_; }
 
 private:
-    static ModuleOut make(float x, float y, int s) { ModuleOut o; o.ok = true; o.x = x; o.y = y; o.state = s; return o; }
+    static ModuleOut make(float x, float y, int s, TrackingState ts, int missed) {
+        ModuleOut o;
+        o.ok = true; o.x = x; o.y = y; o.state = s;
+        o.tracking_state = ts;
+        o.missed_frames = missed;
+        return o;
+    }
 
     // Counter(votes).most_common(1)[0][0]: the most frequent class; a tie goes to the class that
     // appears first in the window (Counter keeps first-seen order and max() keeps the first maximum).
@@ -232,8 +251,9 @@ private:
     HandParams  p_;
     std::deque<int> votes_;
     int         missed_ = 0;
+    bool        has_track_ = false;        // a real observation exists since startup / the last loss (HELD needs one)
     double      confidence_ = 0.0;
-    ModuleOut   last_ = make(-1.0f, -1.0f, 0);
+    ModuleOut   last_ = make(-1.0f, -1.0f, 0, TrackingState::Lost, 0);
 };
 
 } // namespace core

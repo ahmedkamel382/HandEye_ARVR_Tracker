@@ -129,19 +129,22 @@ Conventions used EVERYWHERE (read this once):
                    eyes, measured against the line between the eye corners (x = position along it, y = signed
                    distance from it); head angles are degrees from the 4x4 matrix (get_head_pose_angles).
  PROCESSING (identical to gaze_intent.py; the parity test enforces this)
-   1. first 30 frames with a face = blink calibration: state -1, gaze = 0, 0. Keep both eyes open.
+   1. first 30 frames with a face = blink calibration: state -1, no pointer (x = y = -1), angles NaN. Keep both
+      eyes open. Only frames with a measurable EAR (> 1e-6 on both eyes) count towards the 30.
    2. then: state from the wink model; relative gaze from the pitch/yaw models;
       absolute gaze = relative + head angle;  EMA smoothing, alpha 0.2, starting from 0.
  OUTPUT  (ModuleOut, core_engine/include/tracking_types.hpp)
    yaw_deg, pitch_deg          absolute world gaze in degrees (exactly what gaze_intent.py returns as
-                               final_yaw, final_pitch). 0, 0 while calibrating and when there is no face.
+                               final_yaw, final_pitch). NaN (the Python's INVALID_ANGLE) while calibrating and when there is no
+                               face, for all four angles: -1 would be a valid angle. Losing the face also clears the
+                               blink window and restarts an unfinished calibration (EarFeatureState.reset_tracking_state).
    head_yaw_deg, head_pitch_deg  the head pose alone.
    x, y                        yaw/pitch mapped linearly onto 0..1:  x = 0.5 + yaw/60,  y = 0.5 + pitch/60
                                (clamped; +-30 degrees spans the unit square). THIS is what the DSP and
                                the OS stage use as the gaze "pointer". The scale (GazeNative::kSpanDeg) and
                                the signs are a starting guess: the tray app's calibration wizard fits the
                                real range and direction.
-                               x = y = -1 when there is no face.
+                               x = y = -1 when there is no face and while calibrating (state -1).
    state                       -1 calibrating | 0 neutral | 1 left wink | 2 right wink | 3 eyes closed/blink
                                (state 0 when there is no face)
    ok                          false only if the Python call raised (then x = y = -1, state 0)
@@ -161,14 +164,23 @@ Conventions used EVERYWHERE (read this once):
       fingertip distances; names in hand_features.FEATURE_NAMES and hand_math.hpp, same order).
    3. Random Forest -> (class, confidence). Confidence below 0.55 counts as neutral.
    4. majority vote over the last 5 frames (ties go to the class seen first).
-   5. dropout grace: up to 6 consecutive missed frames repeat the last good answer; after that the hand
-      counts as lost and the vote history is cleared.
+   5. dropout grace: up to 6 consecutive missed frames repeat the last good answer (marked HELD, see
+      OUTPUT); after that the hand counts as lost and the vote history is cleared. The HELD answer is only a
+      retained position for the debug window and the ROI crop: nothing was measured in that frame.
    The model is assets/hand_gesture_rf.pkl, compiled to C (core_engine/generated/hand_forest) when the
    export script has been run; otherwise scikit-learn runs through Python (slow) as a fallback.
  OUTPUT  (ModuleOut)
    x, y     pointer position 0..1 in the mirrored frame; -1, -1 = no hand
    state    0 neutral | 1 pinch | 2 fist
    ok       false only if the Python call raised
+   tracking_state   (hand only; gaze leaves it unset)  HOW FRESH x, y, state are. Set on EVERY hand result:
+              TRACKED  the hand was observed in this frame (missed_frames = 0)
+              HELD     misses 1..6 after a real observation: x, y, state repeat the last TRACKED ones
+              LOST     startup before the first observation, 7th and later miss, or a bridge error (x, y = -1)
+   missed_frames    consecutive misses since the last real observation (0 when TRACKED)
+   detected() is still "has a usable position" (true for TRACKED and HELD) and is what the preview and the ROI
+   crop use. It is NOT a freshness test: use tracking_state. A still hand also repeats its coordinates, so
+   repeated values prove nothing. (Mirrors hand_tracker.py: detected / held / lost.)
 
 -----------------------------------------------------------------------------------------------------
  1.5  TrackingResult   (what the AI thread hands to the main thread, once per processed frame)
@@ -198,6 +210,14 @@ Conventions used EVERYWHERE (read this once):
    so the pointer never freezes or jumps to (0,0).
  WHEN THE TRACKER LOSES ITS TARGET (x < 0): the bridge sends NOTHING to the filter and calls reset() on it,
    so the cursor does not glide across the gap. (The filter also resets itself after a 0.25 s gap.)
+ WHICH HAND FRAMES REACH THE FILTER (core_engine/include/freshness_gate.hpp):
+   TRACKED  one filter(x, y, t) call; the filtered point is published and remembered.
+   HELD     NO filter call. The remembered FILTERED point is republished so the cursor stays put; the raw retained
+            coordinates are never used. With nothing remembered, no point is published.
+   LOST     reset() once, forget the point, publish nothing.
+   So the filter history only ever contains real measurements. HELD is a Core decision: it is NOT expressed as
+   a tracking_valid = false call, because that resets the filter and the adapter then raw-passes the input.
+   Gaze is not affected: it has no tracking_state and keeps the path described above.
  CONFIG per filter: {min_cutoff_hz, beta, derivative_cutoff_hz}. Eng 4's initial values: hand 1.2 / 4.0 / 1.0,
    gaze 0.8 / 6.0 / 1.5. The tray app's "Smoothing" menu changes them live; the engine also accepts
    --hand-filter MIN,BETA,DCUT and --gaze-filter MIN,BETA,DCUT, and --no-filter / --filter builtin.
@@ -211,10 +231,19 @@ Conventions used EVERYWHERE (read this once):
 
        struct FramePayload {
            double        timestamp_seconds;       // ts_ms / 1000, strictly increasing
-           TrackerSample hand;                    // { optional<NormalizedPoint> point; int state; }
+           TrackerSample hand;     // { optional<NormalizedPoint> point; int state; TrackerState tracking; }
            TrackerSample gaze;
        };
 
+   tracking = TrackerState::Tracked | Held | Lost (hand only; gaze stays Tracked). Held: `point` is the cached
+              filtered point of the last real observation, replayed so the cursor does not stutter.
+              Lost: no usable position, any point is ignored. A sample without it behaves as Tracked.
+   How the OS module treats HELD (decisions of the freshness report, osi::OsController):
+              * the cursor stays on the cached point and the hand stays the cursor source;
+              * a HELD frame can neither start nor confirm a gesture (a stale pinch must not click); a gesture that
+                is already confirmed continues, so a drag survives a short dropout and ends when the hand is LOST;
+              * calibration (wizard) uses TRACKED samples only (osi::fresh_point());
+              * FrameReport::hand_held tells the caller that the hand point of this frame is a replay.
    point  = the FILTERED (DSP) x, y in 0..1, or EMPTY when that tracker lost its target
    state  = the RAW integer from the AI module:
               hand: 0 neutral, 1 pinch, 2 fist
@@ -359,7 +388,11 @@ Conventions used EVERYWHERE (read this once):
  the DSP filter class / its config                     dsp_adapter.hpp or makeFilter() in os_bridge.hpp
  the OS module's internals (gestures, mapping, GUI)    nothing in the engine, as long as FramePayload
                                                        keeps its shape
- FramePayload gains a field / TrayApp API renamed      os_bridge.hpp (update() and convert()) only
+ hand retention / HELD-LOST rules                      hand_math.hpp (HandNative::process), then check
+                                                       freshness_gate.hpp and osi::OsController (types.hpp
+                                                       TrackerState) still agree; tests: test_all.cpp,
+                                                       test_dsp_adapter.cpp, test_os_integration.cpp
+ FramePayload gains a field / TrayApp API renamed      os_bridge.hpp (update(), convert(), convertHand()) only
  a tracker needs a new output (e.g. depth)             tracking_types.hpp (ModuleOut) + the module's
                                                        port + os_bridge.hpp to forward it
 

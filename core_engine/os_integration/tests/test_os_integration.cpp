@@ -101,6 +101,13 @@ FramePayload hand_frame(double t, std::optional<NormalizedPoint> point,
     return frame;
 }
 
+FramePayload hand_frame_tracking(double t, std::optional<NormalizedPoint> point, HandGesture gesture,
+                                 TrackerState tracking) {
+    FramePayload frame = hand_frame(t, point, gesture);
+    frame.hand.tracking = tracking;
+    return frame;
+}
+
 FramePayload gaze_frame(double t, std::optional<NormalizedPoint> point,
                         EyeState state = EyeState::Neutral) {
     FramePayload frame;
@@ -655,6 +662,107 @@ int main() {
         const auto up = find_event(sink, SinkEvent::Kind::Up);
         require(up.has_value(), "drag never released");
         require_pixel(last_move_before(sink, *up), {1142, 540}, "drop position");
+    });
+    // ---- hand freshness (CORE_ENGINE_INTEGRATION_REPORT): TRACKED / HELD / LOST ----
+    run_test("tracker_sample_default_is_tracked_and_fresh_point", [] {
+        TrackerSample legacy{NormalizedPoint{0.2, 0.3}, 1};                     // old two-field aggregate still compiles
+        require(legacy.tracking == TrackerState::Tracked && fresh_point(legacy).has_value(),
+                "a legacy sample must behave as Tracked");
+        TrackerSample held = legacy;
+        held.tracking = TrackerState::Held;
+        TrackerSample lost = legacy;
+        lost.tracking = TrackerState::Lost;
+        require(!fresh_point(held) && !fresh_point(lost), "HELD / LOST samples are not fresh observations");
+        require(!fresh_point(TrackerSample{}).has_value(), "no point, no fresh point");
+    });
+    run_test("controller_held_hand_cannot_start_a_pinch", [] {
+        for (const bool held : {false, true}) {                                 // control run: the same frames as TRACKED do click
+            RecordingInputSink sink;
+            OsController c(unit_regions(), kFullHd, sink);
+            c.set_active(true);
+            double t = 0.0;
+            for (int i = 0; i < 8; ++i, t += kDt) {
+                c.update(hand_frame(t, kCentre));
+            }
+            for (int i = 0; i < 8; ++i, t += kDt) {
+                c.update(hand_frame_tracking(t, kCentre, HandGesture::Pinch,
+                                             held ? TrackerState::Held : TrackerState::Tracked));
+            }
+            if (held) {
+                require(count(sink, SinkEvent::Kind::Down) == 0 && !c.button_held(MouseButton::Left),
+                        "a HELD (retained) pinch started a click");
+                for (int i = 0; i < 6; ++i, t += kDt) {                         // the hand is really seen again: now it counts
+                    c.update(hand_frame(t, kCentre, HandGesture::Pinch));
+                }
+                require(count(sink, SinkEvent::Kind::Down) == 1, "reacquired pinch did not click");
+            } else {
+                require(count(sink, SinkEvent::Kind::Down) == 1, "control: a TRACKED pinch must click");
+            }
+        }
+    });
+    run_test("controller_held_hand_cannot_confirm_a_fist", [] {
+        for (const bool held : {false, true}) {
+            RecordingInputSink sink;
+            OsController c(unit_regions(), kFullHd, sink);
+            c.set_active(true);
+            double t = 0.0;
+            for (int i = 0; i < 8; ++i, t += kDt) {
+                c.update(hand_frame(t, kCentre));
+            }
+            for (int i = 0; i < 24; ++i, t += kDt) {                            // 0.75 s of fist, longer than the 0.30 s onset
+                c.update(hand_frame_tracking(t, kCentre, HandGesture::Fist,
+                                             held ? TrackerState::Held : TrackerState::Tracked));
+            }
+            require(count(sink, SinkEvent::Kind::Click) == (held ? 0u : 1u),
+                    held ? "a HELD fist right-clicked" : "control: a TRACKED fist must right-click");
+        }
+    });
+    run_test("controller_held_keeps_confirmed_pinch_until_lost", [] {
+        for (const HandGesture retained : {HandGesture::Pinch, HandGesture::Neutral}) {
+            RecordingInputSink sink;
+            OsController c(unit_regions(), kFullHd, sink);
+            c.set_active(true);
+            double t = 0.0;
+            for (int i = 0; i < 8; ++i, t += kDt) {
+                c.update(hand_frame(t, kCentre, HandGesture::Pinch));
+            }
+            require(c.button_held(MouseButton::Left), "setup: pinch not confirmed");
+            for (int i = 0; i < 10; ++i, t += kDt) {                            // a dropout longer than the release time
+                const FrameReport r = c.update(hand_frame_tracking(t, kCentre, retained, TrackerState::Held));
+                require(r.hand_held, "HELD hand not reported");
+            }
+            require(c.button_held(MouseButton::Left) && count(sink, SinkEvent::Kind::Up) == 0,
+                    "a short dropout released a drag in progress");
+            for (int i = 0; i < 12; ++i, t += kDt) {                            // the hand is gone for good
+                const FrameReport r = c.update(hand_frame_tracking(t, std::nullopt, HandGesture::Neutral, TrackerState::Lost));
+                require(!r.hand_held, "LOST reported as held");
+            }
+            require(!c.button_held(MouseButton::Left) && count(sink, SinkEvent::Kind::Up) == 1,
+                    "LOST did not release the button");
+        }
+    });
+    run_test("controller_held_keeps_cursor_and_lost_ignores_points", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 4; ++i, t += kDt) {
+            c.update(hand_frame(t, kCentre));
+        }
+        require(count(sink, SinkEvent::Kind::Move) == 1, "setup: cursor not placed");
+        for (int i = 0; i < 6; ++i, t += kDt) {                                 // HELD: cached point, cursor stays, source stays Hand
+            const FrameReport r = c.update(hand_frame_tracking(t, kCentre, HandGesture::Neutral, TrackerState::Held));
+            require(r.hand_held && r.source == CursorSource::Hand, "HELD must keep the hand as the cursor source");
+            require_pixel(r.cursor, {960, 540}, "HELD cursor");
+        }
+        require(count(sink, SinkEvent::Kind::Move) == 1, "HELD frames moved the cursor");
+        // LOST never moves the cursor, even if a point is still attached by mistake.
+        const FrameReport lost = c.update(hand_frame_tracking(t, NormalizedPoint{0.9, 0.9}, HandGesture::Neutral, TrackerState::Lost));
+        require(!lost.hand_held && count(sink, SinkEvent::Kind::Move) == 1, "a LOST sample moved the cursor");
+        // HELD without a point (nothing cached) is no hand at all.
+        t += kDt;
+        const FrameReport nopoint = c.update(hand_frame_tracking(t, std::nullopt, HandGesture::Neutral, TrackerState::Held));
+        require(!nopoint.hand_held, "HELD without a point reported as held");
     });
     run_test("controller_pause_releases_held_button", [] {
         RecordingInputSink sink;

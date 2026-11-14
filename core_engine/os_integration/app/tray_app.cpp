@@ -334,8 +334,8 @@ void TrayApp::submit_frame(const FramePayload& frame) noexcept {
         if (wizard_running_.load()) {
             WizardSample sample;
             sample.timestamp = frame.timestamp_seconds;
-            sample.hand = frame.hand.point;
-            sample.gaze = frame.gaze.point;
+            sample.hand = fresh_point(frame.hand); // calibrate from real observations only, never from HELD replays
+            sample.gaze = fresh_point(frame.gaze);
             sample.eye = eye_state_from_int(frame.gaze.state).value_or(EyeState::Neutral);
             try {
                 inbox_.push(sample);

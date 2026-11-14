@@ -449,7 +449,9 @@ void aiBody(Pipeline& P) {
             } else {
                 n = hand.call(frame, ts, hand_pts);
             }
-            r.hand = (n >= 0) ? handn.process(hand_pts.data(), n) : core::ModuleOut{};
+            core::ModuleOut hand_failed;                     // the Python call raised: no output, and say so
+            hand_failed.tracking_state = core::TrackingState::Lost;
+            r.hand = (n >= 0) ? handn.process(hand_pts.data(), n) : hand_failed;
             hand_valid = r.hand.detected();
             if (hand_valid) { last_hx = r.hand.x; last_hy = r.hand.y; }
             r.hand_ms = usBetween(t_h, Clock::now()) / 1000.0;

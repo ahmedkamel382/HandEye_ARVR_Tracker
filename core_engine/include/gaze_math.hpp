@@ -4,13 +4,15 @@
 //      -> iris ratios (projected on the eye-corner line) + head pose (Euler angles from the matrix)
 //      -> pitch / yaw models (gaze_pitch.dll, gaze_yaw.dll) = eye-in-socket angles
 //      -> + head angles = absolute world gaze (raw, bypassing C++ EMA to let DSP handle filtering)
-// Like the Python: during calibration (state -1) the gaze is 0, 0; with no face the answer is (x = -1, y = -1, state 0).
+// Like the Python: during calibration (state -1) and with no face (state 0) all four angles are NaN (the Python's
+// INVALID_ANGLE) and the pointer is x = y = -1, so no invalid value can reach the DSP stage.
 // All arithmetic is double, like Python's float64; the features are rounded to float32 before the models (what the
 // Python does with np.float32). The head-pose products are float32 too, because the matrix is a float32 array.
 #pragma once
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include "forest.hpp"
 #include "tracking_types.hpp"
 
@@ -39,11 +41,9 @@ namespace core {
             ModuleOut out;
             out.ok = true;
             if (!lm || n < kPacked) {
-                out.x = -1.0f;
-                out.y = -1.0f;
+                resetTrackingState();                               // EarFeatureState.reset_tracking_state()
+                markInvalid(out);                                   // x = y = -1, all four angles NaN
                 out.state = 0;
-                out.yaw_deg = 0.0;
-                out.pitch_deg = 0.0;
                 return out;
             }
             const float* pose = lm + 3 * kFacePoints;
@@ -52,16 +52,18 @@ namespace core {
             const double raw_r = ear(lm, kRightEye, W, H);
 
             if (!calibrated_) {                                     // 30-frame blink calibration
-                sum_l_ += raw_l;
-                sum_r_ += raw_r;
-                ++calib_frames_;
-                if (calib_frames_ >= calib_target_) {
-                    base_l_ = sum_l_ / calib_target_;
-                    base_r_ = sum_r_ / calib_target_;
-                    calibrated_ = true;
+                if (raw_l > kCalibEarEps && raw_r > kCalibEarEps) { // ignore corrupted / zero EAR frames (EarFeatureState.update)
+                    sum_l_ += raw_l;
+                    sum_r_ += raw_r;
+                    ++calib_frames_;
+                    if (calib_frames_ >= calib_target_) {
+                        base_l_ = sum_l_ / calib_target_;
+                        base_r_ = sum_r_ / calib_target_;
+                        calibrated_ = true;
+                    }
                 }
-                out.state = -1;                                     // "calibrating": gaze is 0, 0 and the OS stage holds still
-                setPointer(out, 0.0, 0.0);
+                out.state = -1;                                     // "calibrating": no pointer (x = y = -1) and NaN angles
+                markInvalid(out);
                 return out;
             }
 
@@ -119,6 +121,26 @@ namespace core {
         static constexpr int kLeftEye[6] = { 33, 160, 158, 133, 153, 144 };
         static constexpr int kRightEye[6] = { 362, 385, 387, 263, 373, 380 };
 
+        // Numerical guards, the same values as gaze_intent.py (EAR_DIST_EPS, CALIB_EAR_EPS, IRIS_BASELINE_EPS).
+        static constexpr double kEarDistEps = 1e-12;        // horizontal eye distance below this -> EAR = 0
+        static constexpr double kCalibEarEps = 1e-6;        // calibration ignores frames whose raw EAR is not above this
+        static constexpr double kIrisBaselineEps = 1e-12;   // squared eye-corner baseline below this -> neutral iris ratio
+
+        // The Python's INVALID_ANGLE sentinel: NaN (-1 deg is a valid angle). x = y = -1 keeps detected() false.
+        static void markInvalid(ModuleOut& o) {
+            constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+            o.x = -1.0f;
+            o.y = -1.0f;
+            o.yaw_deg = o.pitch_deg = o.head_yaw_deg = o.head_pitch_deg = kNaN;
+        }
+        // EarFeatureState.reset_tracking_state(): face lost -> stale blink history must not leak into the next track;
+        // an unfinished calibration restarts. A finished calibration (the baselines) is kept.
+        void resetTrackingState() {
+            hist_l_.clear();
+            hist_r_.clear();
+            if (!calibrated_) { calib_frames_ = 0; sum_l_ = 0.0; sum_r_ = 0.0; }
+        }
+
         static double clamp01(double v) { return std::max(0.0, std::min(1.0, v)); }
         static void setPointer(ModuleOut& o, double yaw_deg, double pitch_deg) {
             o.yaw_deg = yaw_deg;
@@ -138,17 +160,18 @@ namespace core {
             const double v1 = d3(lm, i[1], i[5], W, H);
             const double v2 = d3(lm, i[2], i[4], W, H);
             const double h = d3(lm, i[0], i[3], W, H);
-            return h > 0 ? (v1 + v2) / (2.0 * h) : 0.0;
+            return h > kEarDistEps ? (v1 + v2) / (2.0 * h) : 0.0;
         }
         // The iris against the line joining the eye corners, in normalised 2D space (gaze_intent._get_iris_ratio).
         //    x: how far along the line (0 = corner1, 1 = corner2).  y: signed distance from the line / line length.
         static double irisRatio(const float* lm, int c1, int c2, int iris, bool x_axis) {
             const double ax = lm[3 * c1], ay = lm[3 * c1 + 1];
             const double bx = double(lm[3 * c2]) - ax, by = double(lm[3 * c2 + 1]) - ay;        // baseline vector
-            const double len = std::sqrt(bx * bx + by * by);
-            if (len == 0) return x_axis ? 0.5 : 0.0;
+            const double len_sq = bx * bx + by * by;
+            if (len_sq < kIrisBaselineEps) return x_axis ? 0.5 : 0.0;
+            const double len = std::sqrt(len_sq);
             const double ix = double(lm[3 * iris]) - ax, iy = double(lm[3 * iris + 1]) - ay;    // corner1 -> iris
-            const double scale = (ix * bx + iy * by) / (len * len);
+            const double scale = (ix * bx + iy * by) / len_sq;
             if (x_axis) return scale;
             const double px = ix - scale * bx, py = iy - scale * by;                          // perpendicular part
             const double d = std::sqrt(px * px + py * py) / len;

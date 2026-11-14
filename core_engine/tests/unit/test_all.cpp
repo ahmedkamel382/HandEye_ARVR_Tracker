@@ -3,13 +3,16 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "forest.hpp"
 #include "gaze_math.hpp"
 #include "hand_math.hpp"
 #include "euro_builtin.hpp"
+#include "freshness_gate.hpp"
 #include "tracking_types.hpp"
 
 using namespace core;
@@ -141,6 +144,55 @@ static void t_hand_vote_gate_grace() {
     CHECK(h.process(pk.p, kHandPacked).ok);
 }
 
+// Freshness contract (CORE_ENGINE_INTEGRATION_REPORT): TRACKED / HELD / LOST + missed_frames on every hand result.
+static void t_hand_tracking_state_transitions() {
+    int cls = 1; double conf = 1.0;
+    LambdaHandModel model([&](const double*, int& c, double& p) { c = cls; p = conf; });
+    HandNative h(&model);
+    Packed pk;
+    auto is_lost = [](const ModuleOut& o, int missed) {
+        return o.ok && !o.detected() && o.tracking_state == TrackingState::Lost && o.missed_frames == missed &&
+               o.x == -1.0f && o.y == -1.0f && o.state == 0;
+    };
+
+    for (int i = 1; i <= 10; ++i) CHECK(is_lost(h.process(nullptr, 0), i));       // startup: LOST, never HELD
+    ModuleOut fresh = h.process(pk.p, kHandPacked);                                // first observation
+    CHECK(fresh.ok && fresh.detected() && fresh.tracking_state == TrackingState::Tracked && fresh.missed_frames == 0);
+    CHECK_NEAR(fresh.x, 0.42, 1e-6);                                               // coordinates exactly as before the contract
+
+    ModuleOut o;
+    for (int i = 1; i <= 6; ++i) {                                                 // misses 1..6 = HELD, same x, y, state
+        o = h.process(nullptr, 0);
+        CHECK(o.ok && o.detected() && o.tracking_state == TrackingState::Held && o.missed_frames == i);
+        CHECK(o.x == fresh.x && o.y == fresh.y && o.state == fresh.state);         // detected() stays true for ROI / preview
+    }
+    CHECK(is_lost(h.process(nullptr, 0), 7));                                      // 7th miss: LOST, invalid coordinates
+    CHECK(is_lost(h.process(nullptr, 0), 8));
+    o = h.process(pk.p, kHandPacked);                                              // reacquisition after LOST
+    CHECK(o.tracking_state == TrackingState::Tracked && o.missed_frames == 0 && o.detected());
+
+    for (int i = 0; i < 3; ++i) h.process(nullptr, 0);                             // reacquisition after HELD
+    o = h.process(pk.p, kHandPacked);
+    CHECK(o.tracking_state == TrackingState::Tracked && o.missed_frames == 0 && h.missedFrames() == 0);
+
+    h.process(nullptr, 0); h.process(nullptr, 0);                                  // bridge error in the middle of a dropout:
+    ModuleOut e = h.process(pk.p, 10);                                             // no output, and NO state change
+    CHECK(!e.ok && !e.detected() && e.tracking_state == TrackingState::Lost);
+    o = h.process(nullptr, 0);
+    CHECK(o.tracking_state == TrackingState::Held && o.missed_frames == 3);        // counted 1, 2, (error ignored), 3
+
+    HandNative fresh_tracker(&model);                                              // error at startup: still no track
+    CHECK(fresh_tracker.process(pk.p, 10).tracking_state == TrackingState::Lost);
+    CHECK(is_lost(fresh_tracker.process(nullptr, 0), 1));
+
+    HandParams no_grace; no_grace.grace_frames = 0;                                // grace 0: the first miss is already LOST
+    HandNative g(&model, no_grace);
+    g.process(pk.p, kHandPacked);
+    CHECK(is_lost(g.process(nullptr, 0), 1));
+
+    CHECK(std::string(toString(TrackingState::Held)) == "HELD");
+}
+
 static void t_hand_anchor_clamp_and_fallback() {
     LambdaHandModel model([](const double*, int& c, double& p) { c = 0; p = 1.0; });
     Packed pk;  pk.set(8, 1.4f, -0.2f);
@@ -205,18 +257,21 @@ struct GazeRig {
     ModuleOut run(const FacePts& f) { return g.process(f.p.data(), f.count(), FacePts::W, FacePts::H); }
     void calibrate(const FacePts& f) { for (int i = 0; i < 30; ++i) run(f); }
 };
+static bool all_angles_nan(const ModuleOut& o) {
+    return std::isnan(o.yaw_deg) && std::isnan(o.pitch_deg) && std::isnan(o.head_yaw_deg) && std::isnan(o.head_pitch_deg);
+}
 static void t_gaze_calibration_and_features() {
     GazeRig r;
     FacePts open(0.30, 0.30);
     for (int i = 0; i < 29; ++i) {
         ModuleOut o = r.run(open);
-        CHECK(o.detected() && o.state == -1);
-        CHECK(o.yaw_deg == 0.0 && o.pitch_deg == 0.0);                     // calibrating: gaze is 0, 0 (like the Python)
+        CHECK(!o.detected() && o.state == -1);                             // calibrating: no pointer (x = y = -1) ...
+        CHECK(all_angles_nan(o));                                          // ... and NaN angles (the Python's INVALID_ANGLE)
     }
     CHECK(r.wink_calls == 0 && !r.g.calibrated());
     ModuleOut o = r.run(open);                                             // 30th calibration frame still reports -1
     CHECK(o.state == -1 && r.g.calibrated());
-    CHECK_NEAR(o.x, 0.5, 1e-6);
+    CHECK(o.x == -1.0f && o.y == -1.0f && all_angles_nan(o));              // the completing frame is still "calibrating"
     for (int i = 0; i < 12; ++i) o = r.run(open);
     CHECK(o.state == 0 && r.wink_calls == 12);
     CHECK_NEAR(r.wink_in[0], 1.0, 1e-4);                                   // normalised EAR (open) = 1
@@ -235,7 +290,7 @@ static void t_gaze_calibration_and_features() {
 static void t_gaze_no_face_and_recalibrate() {
     GazeRig r;
     ModuleOut none = r.g.process(nullptr, 0, 640, 480);
-    CHECK(none.ok && !none.detected() && none.state == 0 && none.yaw_deg == 0.0);
+    CHECK(none.ok && !none.detected() && none.state == 0 && none.x == -1.0f && none.y == -1.0f && all_angles_nan(none));
     std::vector<float> few(100 * 3, 0.f);
     CHECK(!r.g.process(few.data(), 100, 640, 480).detected());             // too few landmarks
     FacePts open(0.3, 0.3);
@@ -245,6 +300,61 @@ static void t_gaze_no_face_and_recalibrate() {
     r.g.recalibrate();
     CHECK(!r.g.calibrated());
     CHECK(r.run(open).state == -1);
+}
+// EarFeatureState.update(): frames whose raw EAR is not above 1e-6 (either eye) do not count towards the 30.
+static void t_gaze_calibration_ignores_zero_ear() {
+    GazeRig r;
+    FacePts zero(0.0, 0.0), half_zero(0.30, 0.0), open(0.30, 0.30);
+    for (int i = 0; i < 40; ++i) { r.run(zero); r.run(half_zero); }
+    CHECK(!r.g.calibrated());                                              // 80 bad frames: nothing accumulated
+    for (int i = 0; i < 29; ++i) r.run(open);
+    CHECK(!r.g.calibrated());
+    r.run(zero);                                                           // a bad frame in the middle is simply skipped
+    CHECK(!r.g.calibrated());
+    r.run(open);
+    CHECK(r.g.calibrated());                                               // exactly 30 GOOD frames
+}
+// EarFeatureState.reset_tracking_state(): face lost -> history cleared; unfinished calibration restarts; finished one kept.
+static void t_gaze_face_loss_resets_tracking_state() {
+    {   // unfinished calibration restarts, and the baseline is built only from the frames after the loss
+        GazeRig r;
+        FacePts dim(0.15, 0.15), open(0.30, 0.30);
+        for (int i = 0; i < 20; ++i) r.run(dim);
+        ModuleOut lost = r.g.process(nullptr, 0, 640, 480);
+        CHECK(lost.state == 0 && !lost.detected() && all_angles_nan(lost));
+        for (int i = 0; i < 29; ++i) r.run(open);
+        CHECK(!r.g.calibrated());                                          // the 20 old frames did NOT count
+        r.run(open);
+        CHECK(r.g.calibrated());
+        r.run(open);
+        CHECK_NEAR(r.wink_in[0], 1.0, 1e-4);                               // baseline 0.30 only (a mixed baseline would give ~1.5)
+    }
+    {   // calibrated: the rolling window is cleared, the baseline survives
+        GazeRig r;
+        FacePts open(0.30, 0.30), wink(0.075, 0.30);
+        r.calibrate(open);
+        r.run(open);
+        r.run(wink);
+        CHECK_NEAR(r.wink_in[1], 0.25, 1e-3);                              // window min holds the wink
+        r.g.process(nullptr, 0, 640, 480);                                 // face lost
+        CHECK(r.g.calibrated());
+        r.run(open);
+        CHECK_NEAR(r.wink_in[1], 1.0, 1e-4);                               // stale wink gone from the window
+        CHECK_NEAR(r.wink_in[2], 0.0, 1e-8);
+        CHECK_NEAR(r.wink_in[0], 1.0, 1e-4);                               // same baseline as before the loss
+    }
+}
+// The freshness fields are hand-only: gaze results leave them unset, so nothing downstream reinterprets gaze.
+static void t_gaze_has_no_freshness_fields() {
+    GazeRig r;
+    FacePts open(0.30, 0.30);
+    ModuleOut o = r.run(open);                                             // calibrating
+    CHECK(!o.tracking_state.has_value() && o.missed_frames == 0);
+    r.calibrate(open);
+    o = r.run(open);                                                       // running
+    CHECK(o.detected() && !o.tracking_state.has_value() && o.missed_frames == 0);
+    o = r.g.process(nullptr, 0, 640, 480);                                 // no face
+    CHECK(!o.tracking_state.has_value() && o.missed_frames == 0);
 }
 static void t_gaze_ratio_follows_iris() {
     GazeRig r;
@@ -294,6 +404,146 @@ static void t_gaze_adds_head_pose_and_outputs_raw() {
     CHECK_NEAR(o.yaw_deg, 20.0, 0.01);                                     // remains exactly rel + head
 }
 
+// ======================================================================= freshness gate (Core -> DSP)
+// A filter that records every call, so "HELD never updates the DSP" is provable. Output = 0.5 * input + 0.25 (never equal to the raw value).
+struct SpyFilter : IPointFilter {
+    struct Call { double x, y, t; };
+    std::vector<Call> calls;
+    int resets = 0;
+    void reset() override { ++resets; }
+    void filter(double& x, double& y, double t) override {
+        calls.push_back({x, y, t});
+        x = 0.5 * x + 0.25;
+        y = 0.5 * y + 0.25;
+    }
+};
+static ModuleOut hand_result(TrackingState ts, double x, double y, int missed = 0, int state = 0) {
+    ModuleOut o;
+    o.ok = true; o.x = float(x); o.y = float(y); o.state = state;
+    o.tracking_state = ts; o.missed_frames = missed;
+    return o;
+}
+static bool same_point(const std::optional<GatedPoint>& p, double x, double y) {
+    return p && std::fabs(p->x - x) < 1e-12 && std::fabs(p->y - y) < 1e-12;
+}
+
+static void t_gate_tracked_held_lost() {
+    SpyFilter spy;
+    FreshnessGate gate;
+    ModuleOut tracked = hand_result(TrackingState::Tracked, 0.5, 0.75);       // spy: (0.5, 0.75) -> (0.5, 0.625)
+    auto p = gate.update(tracked, spy, true, 1.0);
+    CHECK(same_point(p, 0.5, 0.625) && !p->held);                              // 1: fresh point filtered and published
+    CHECK(spy.calls.size() == 1 && spy.calls[0].x == 0.5f && spy.calls[0].t == 1.0);
+
+    for (int i = 1; i <= 6; ++i) {                                             // 2, 3: HELD x 6 = no DSP update, cached FILTERED point
+        p = gate.update(hand_result(TrackingState::Held, 0.5, 0.75, i), spy, true, 1.0 + i / 60.0);
+        CHECK(same_point(p, 0.5, 0.625) && p->held);                           // not the raw retained 0.75; flagged as a replay
+    }
+    CHECK(spy.calls.size() == 1 && spy.resets == 0);
+    CHECK(gate.counters().held_reused == 6 && gate.counters().filter_updates == 1);
+
+    p = gate.update(hand_result(TrackingState::Lost, -1, -1, 7), spy, true, 1.2);   // 4: LOST = reset, nothing published
+    CHECK(!p && spy.resets == 1 && !gate.hasCache() && spy.calls.size() == 1);
+    p = gate.update(hand_result(TrackingState::Lost, -1, -1, 8), spy, true, 1.22);
+    CHECK(!p && spy.resets == 1);                                              // a second LOST does not reset again
+
+    p = gate.update(hand_result(TrackingState::Tracked, 0.25, 0.25), spy, true, 1.3);   // 7: reacquisition after LOST = new track
+    CHECK(same_point(p, 0.375, 0.375) && !p->held && spy.calls.size() == 2 && spy.calls[1].t == 1.3);
+}
+
+static void t_gate_startup_error_and_edges() {
+    SpyFilter spy;
+    FreshnessGate gate;
+    CHECK(!gate.update(hand_result(TrackingState::Lost, -1, -1, 1), spy, true, 0.0));   // 5: startup LOST: no point, no update, no reset
+    CHECK(spy.calls.empty() && spy.resets == 0);
+    // HELD with nothing cached (cannot come from HandNative, but must never publish the raw retained value)
+    CHECK(!gate.update(hand_result(TrackingState::Held, 0.5, 0.5, 1), spy, true, 0.1));
+    CHECK(spy.calls.empty() && gate.counters().held_without_cache == 1);
+
+    ModuleOut err;                                                             // 8: bridge error (ok = false): nothing reaches the DSP
+    err.tracking_state = TrackingState::Lost;
+    gate.update(hand_result(TrackingState::Tracked, 0.5, 0.5), spy, true, 0.2);
+    CHECK(!gate.update(err, spy, true, 0.3));
+    CHECK(spy.calls.size() == 1 && spy.resets == 1);
+
+    // "Tracked" or "Held" without a usable position is a contract violation: treated as lost, never invented
+    gate.update(hand_result(TrackingState::Tracked, 0.5, 0.5), spy, true, 0.4);
+    CHECK(!gate.update(hand_result(TrackingState::Tracked, -1, -1), spy, true, 0.5));
+    gate.update(hand_result(TrackingState::Tracked, 0.5, 0.5), spy, true, 0.6);
+    CHECK(!gate.update(hand_result(TrackingState::Held, -1, -1, 1), spy, true, 0.7) && !gate.hasCache());
+
+    // unset tracking_state (gaze, disabled module, Python error) = the old behaviour
+    ModuleOut legacy;  legacy.ok = true; legacy.x = 0.5f; legacy.y = 0.5f;
+    const size_t n = spy.calls.size();
+    CHECK(gate.update(legacy, spy, true, 0.8) && spy.calls.size() == n + 1);
+    ModuleOut none;
+    const int r = spy.resets;
+    CHECK(!gate.update(none, spy, true, 0.9) && spy.resets == r + 1);
+
+    // --no-filter: raw value published (clamped), the filter is never called, HELD still replays the cache
+    SpyFilter spy2;
+    FreshnessGate g2;
+    CHECK(same_point(g2.update(hand_result(TrackingState::Tracked, 1.6, 0.25), spy2, false, 0.0), 1.0, 0.25));
+    CHECK(same_point(g2.update(hand_result(TrackingState::Held, 1.6, 0.25, 1), spy2, false, 0.1), 1.0, 0.25));
+    CHECK(spy2.calls.empty());
+
+    // the filter object was replaced (new smoothing settings): cache gone, the NEW filter is not reset
+    SpyFilter spy3;
+    FreshnessGate g3;
+    g3.update(hand_result(TrackingState::Tracked, 0.5, 0.5), spy3, true, 0.0);
+    g3.reset();
+    CHECK(!g3.update(hand_result(TrackingState::Held, 0.5, 0.5, 1), spy3, true, 0.1) && spy3.resets == 0);
+}
+
+// Whole chain: HandNative (retention) -> FreshnessGate -> filter. The gated output must equal a filter that was fed ONLY the
+// real observations; the old path (filter every detected() frame) must NOT, which is exactly the defect of the report.
+static void t_gate_chain_matches_observation_only_filter() {
+    LambdaHandModel model([](const double*, int& c, double& p) { c = 0; p = 1.0; });
+    HandNative hand(&model);
+    Packed pk;
+    OneEuroPoint gated_flt(1.0, 8.0, 1.0), ref_flt(1.0, 8.0, 1.0), naive_flt(1.0, 8.0, 1.0);
+    FreshnessGate gate;
+    std::mt19937 g(3);
+    std::normal_distribution<double> noise(0.0, 0.01);
+    std::optional<GatedPoint> last_pub;
+    int mismatches = 0, naive_diff = 0, held_seen = 0, tracked_seen = 0, lost_seen = 0;
+    for (int i = 0; i < 600; ++i) {
+        const double t = i / 60.0;
+        const int drop_len = 3 + 3 * ((i / 40) % 3);                          // cycle after cycle: dropouts of 3, 6, 9 frames
+        const bool miss = (i % 40) >= 30 && (i % 40) < 30 + drop_len;
+        const double ox = 0.5 + 0.3 * std::sin(i * 0.05), oy = 0.5 + 0.2 * std::cos(i * 0.03);
+        pk.set(8, float(ox + noise(g)), float(oy + noise(g)));
+        const ModuleOut r = miss ? hand.process(nullptr, 0) : hand.process(pk.p, kHandPacked);
+
+        const auto pub = gate.update(r, gated_flt, true, t);                  // the engine path
+
+        if (r.tracking_state == TrackingState::Tracked) {                      // reference: observations only
+            ++tracked_seen;
+            double x = r.x, y = r.y;
+            ref_flt.filter(x, y, t);
+            if (!pub || pub->x != std::min(1.0, std::max(0.0, x)) || pub->y != std::min(1.0, std::max(0.0, y))) ++mismatches;
+            last_pub = pub;
+        } else if (r.tracking_state == TrackingState::Held) {
+            ++held_seen;
+            if (!pub || !last_pub || pub->x != last_pub->x || pub->y != last_pub->y) ++mismatches;   // the last real filtered point
+        } else {
+            ++lost_seen;
+            if (pub) ++mismatches;
+            ref_flt.reset();
+            last_pub.reset();
+        }
+        if (r.detected()) {                                                    // old behaviour: every detected() frame is "fresh"
+            double x = r.x, y = r.y;
+            naive_flt.filter(x, y, t);
+            if (r.tracking_state == TrackingState::Tracked && pub && std::fabs(x - pub->x) > 1e-12) ++naive_diff;
+        } else naive_flt.reset();
+    }
+    CHECK(mismatches == 0);
+    CHECK(held_seen > 0 && lost_seen > 0 && tracked_seen > 0);                 // the scenario really contains all three states
+    CHECK(naive_diff > 0);                                                     // the old path DID corrupt the filter history
+    CHECK(gate.counters().filter_updates == uint64_t(tracked_seen));          // one update per observation, none for HELD
+}
+
 int main() {
     struct T { const char* name; void (*fn)(); };
     const T tests[] = {
@@ -302,9 +552,16 @@ int main() {
         { "filter: reset / equal timestamps", t_filter_reset_and_edges },
         { "hand: 24 features = Python (golden)", t_hand_features_match_python },
         { "hand: gate, vote, grace period", t_hand_vote_gate_grace },
+        { "hand: TRACKED / HELD / LOST transitions", t_hand_tracking_state_transitions },
         { "hand: anchors, clamp, geometric fallback", t_hand_anchor_clamp_and_fallback },
         { "gaze: calibration + feature vector", t_gaze_calibration_and_features },
         { "gaze: no face + recalibrate", t_gaze_no_face_and_recalibrate },
+        { "gaze: calibration ignores zero EAR", t_gaze_calibration_ignores_zero_ear },
+        { "gaze: face loss resets tracking state", t_gaze_face_loss_resets_tracking_state },
+        { "gaze: no freshness fields", t_gaze_has_no_freshness_fields },
+        { "gate: TRACKED / HELD / LOST -> filter calls", t_gate_tracked_held_lost },
+        { "gate: startup, errors, edges, --no-filter", t_gate_startup_error_and_edges },
+        { "gate: chain == observation-only filter", t_gate_chain_matches_observation_only_filter },
         { "gaze: ratio follows the iris", t_gaze_ratio_follows_iris },
         { "gaze: head pose angles", t_head_pose_angles },
         { "gaze: head pose added, raw absolute", t_gaze_adds_head_pose_and_outputs_raw },

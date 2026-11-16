@@ -53,7 +53,8 @@ struct ModuleOut {
 
 struct TrackingResult {
     uint64_t          frame_id = 0;
-    int64_t           ts_ms = 0;          // strictly increasing, ms since pipeline start
+    int64_t           ts_ms = 0;          // strictly increasing, ms since pipeline start (MediaPipe's clock)
+    double            capture_s = -1.0;   // exact capture time, seconds since pipeline start; < 0 = not provided (frame_clock.hpp)
     Clock::time_point captured_at{};
     ModuleOut         gaze;
     ModuleOut         hand;

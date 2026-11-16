@@ -12,12 +12,23 @@
 
 namespace core {
 
+// What one filter update produced. A caller must be able to tell a smoothed point from a substitute.
+//   Ok       : x, y are the smoothed point of THIS observation.
+//   Rejected : the observation was not accepted (duplicate / non-increasing timestamp). The filter history is intact;
+//              x, y hold a substitute (the last good output, or the raw clamped input) that is NOT a new result.
+//   Invalid  : the input or the arithmetic was unusable and the filter reset itself: no valid output exists. x, y hold
+//              a substitute (raw clamped, or untouched for a non-finite input) that must NOT be published.
+enum class FilterOutcome { Ok, Rejected, Invalid };
+
 class IPointFilter {
 public:
     virtual ~IPointFilter() = default;
     virtual void reset() = 0;
     // t_sec must increase between calls. x, y are replaced with the filtered values.
     virtual void filter(double& x, double& y, double t_sec) = 0;
+    // Same, but says whether the result is real. The engine calls this one (see freshness_gate.hpp). The default suits
+    // filters that cannot fail; a filter that can reject or fail overrides it.
+    virtual FilterOutcome update(double& x, double& y, double t_sec) { filter(x, y, t_sec); return FilterOutcome::Ok; }
 };
 
 class OneEuro {

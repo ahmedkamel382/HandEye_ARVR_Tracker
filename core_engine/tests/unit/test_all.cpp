@@ -1,5 +1,6 @@
 // Unit tests for the header-only parts of the core engine. No camera, no Python, no OpenCV.
 //   build + run:  ctest --output-on-failure      (or run core_unit_tests directly)
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "forest.hpp"
+#include "frame_clock.hpp"
 #include "gaze_math.hpp"
 #include "hand_math.hpp"
 #include "euro_builtin.hpp"
@@ -495,6 +497,105 @@ static void t_gate_startup_error_and_edges() {
     CHECK(!g3.update(hand_result(TrackingState::Held, 0.5, 0.5, 1), spy3, true, 0.1) && spy3.resets == 0);
 }
 
+// ======================================================================= frame timestamps (capture_s vs ts_ms)
+static void t_frame_times_exact_and_strictly_increasing() {
+    using namespace std::chrono;
+    const Clock::time_point t0 = Clock::now();
+    const FrameTimes a = frameTimes(t0, t0 + nanoseconds(123456789), -1);
+    CHECK(a.ts_ms == 123);                                                     // MediaPipe clock: truncated milliseconds
+    CHECK(std::fabs(a.capture_s - 0.123456789) < 1e-12);                       // DSP clock: nanosecond resolution, not truncated
+
+    const FrameTimes b = frameTimes(t0, t0 + microseconds(16667), -1);         // two frames of a 60 fps stream
+    const FrameTimes c = frameTimes(t0, t0 + microseconds(33333), b.ts_ms);
+    CHECK(c.ts_ms - b.ts_ms == 17 || c.ts_ms - b.ts_ms == 16);                 // whole milliseconds ...
+    CHECK(std::fabs((c.capture_s - b.capture_s) - 0.016666) < 1e-12);          // ... versus the true 16.666 ms
+
+    // frames captured within the same millisecond (a camera burst): MediaPipe gets +1 ms steps, the DSP the true times
+    int64_t last = -1;
+    double prev_s = -1.0;
+    const int offsets_us[] = {10000, 10200, 10400, 10600, 10800, 11000};
+    for (int us : offsets_us) {
+        const FrameTimes f = frameTimes(t0, t0 + microseconds(us), last);
+        CHECK(f.ts_ms > last);                                                 // strictly increasing, always
+        CHECK(f.capture_s > prev_s);
+        CHECK(std::fabs(f.capture_s - us / 1e6) < 1e-12);                      // the bump never leaks into the DSP time base
+        last = f.ts_ms;
+        prev_s = f.capture_s;
+    }
+    CHECK(last >= 10 + 5);                                                     // 6 frames in ~1 ms were pushed apart for MediaPipe
+
+    // random capture times: both clocks stay valid, ts_ms never goes backwards, capture_s never decreases
+    std::mt19937 g(5);
+    std::uniform_int_distribution<int> step(50, 40000);                        // 0.05 .. 40 ms between frames
+    int64_t lt = -1;
+    double ls = -1.0;
+    long long us = 0;
+    bool ok = true;
+    for (int i = 0; i < 20000; ++i) {
+        us += step(g);
+        const FrameTimes f = frameTimes(t0, t0 + microseconds(us), lt);
+        ok = ok && f.ts_ms > lt && f.capture_s > ls && std::fabs(f.capture_s - us / 1e6) < 1e-9;
+        lt = f.ts_ms;
+        ls = f.capture_s;
+    }
+    CHECK(ok);
+}
+
+// A filter whose outcomes are scripted. Rejected / Invalid leave a marker value (0.123, 0.456) in x, y: it must never be published.
+struct ScriptedFilter : IPointFilter {
+    std::vector<FilterOutcome> script;
+    size_t next = 0;
+    int resets = 0, legacy_calls = 0;
+    void reset() override { ++resets; }
+    void filter(double&, double&, double) override { ++legacy_calls; }          // the gate must use update(), never this
+    FilterOutcome update(double& x, double& y, double) override {
+        const FilterOutcome o = next < script.size() ? script[next++] : FilterOutcome::Ok;
+        if (o == FilterOutcome::Ok) { x = 0.5 * x; y = 0.5 * y; }              // distinguishable from the raw input
+        else { x = 0.123; y = 0.456; }
+        return o;
+    }
+};
+static void t_gate_filter_outcomes() {
+    using O = FilterOutcome;
+    const double ex = 0.5 * double(0.8f), ey = 0.5 * double(0.6f);          // what ScriptedFilter makes of the float inputs
+    ScriptedFilter f;
+    f.script = {O::Ok, O::Rejected, O::Ok, O::Invalid, O::Ok, O::Rejected};
+    FreshnessGate gate;
+    ModuleOut m = hand_result(TrackingState::Tracked, 0.8, 0.6);
+
+    auto p = gate.update(m, f, true, 0.00);
+    CHECK(same_point(p, ex, ey) && !p->held);                                // Ok: smoothed point, cached
+    p = gate.update(m, f, true, 0.01);                                         // Rejected: replay, not the 0.123 marker
+    CHECK(same_point(p, ex, ey) && p->held && gate.counters().rejected == 1 && f.resets == 0);
+    p = gate.update(m, f, true, 0.02);                                         // history intact: the next Ok is a fresh point
+    CHECK(same_point(p, ex, ey) && !p->held);
+    p = gate.update(m, f, true, 0.03);                                         // Invalid: nothing published, cache gone ...
+    CHECK(!p && !gate.hasCache() && gate.counters().invalid == 1);
+    CHECK(f.resets == 0);                                                      // ... and no reset call: the filter reset itself
+    CHECK(!gate.update(hand_result(TrackingState::Held, 0.8, 0.6, 1), f, true, 0.04));       // HELD has nothing to replay
+    CHECK(!gate.update(hand_result(TrackingState::Lost, -1, -1, 7), f, true, 0.05) && f.resets == 0);   // nothing to reset either
+    p = gate.update(m, f, true, 0.06);                                         // new track
+    CHECK(same_point(p, ex, ey) && !p->held);
+    CHECK(!gate.update(hand_result(TrackingState::Lost, -1, -1, 7), f, true, 0.07) && f.resets == 1);   // LOST resets once
+
+    ScriptedFilter g;                                                          // Rejected with nothing cached: nothing to replay
+    g.script = {O::Rejected};
+    FreshnessGate g2;
+    CHECK(!g2.update(m, g, true, 0.0) && g.legacy_calls == 0);
+
+    // gaze: no tracking_state, the plain path, the same outcome handling
+    ScriptedFilter h;
+    h.script = {O::Ok, O::Rejected, O::Invalid, O::Ok};
+    FreshnessGate g3;
+    ModuleOut gz; gz.ok = true; gz.x = 0.8f; gz.y = 0.6f;
+    CHECK(same_point(g3.update(gz, h, true, 0.0), ex, ey));
+    auto r = g3.update(gz, h, true, 0.1);
+    CHECK(same_point(r, ex, ey) && r->held);
+    CHECK(!g3.update(gz, h, true, 0.2) && !g3.hasCache());
+    r = g3.update(gz, h, true, 0.3);
+    CHECK(same_point(r, ex, ey) && !r->held && h.legacy_calls == 0);
+}
+
 // Whole chain: HandNative (retention) -> FreshnessGate -> filter. The gated output must equal a filter that was fed ONLY the
 // real observations; the old path (filter every detected() frame) must NOT, which is exactly the defect of the report.
 static void t_gate_chain_matches_observation_only_filter() {
@@ -562,6 +663,8 @@ int main() {
         { "gate: TRACKED / HELD / LOST -> filter calls", t_gate_tracked_held_lost },
         { "gate: startup, errors, edges, --no-filter", t_gate_startup_error_and_edges },
         { "gate: chain == observation-only filter", t_gate_chain_matches_observation_only_filter },
+        { "gate: filter outcomes (Rejected / Invalid)", t_gate_filter_outcomes },
+        { "clock: capture_s exact, ts_ms strictly increasing", t_frame_times_exact_and_strictly_increasing },
         { "gaze: ratio follows the iris", t_gaze_ratio_follows_iris },
         { "gaze: head pose angles", t_head_pose_angles },
         { "gaze: head pose added, raw absolute", t_gaze_adds_head_pose_and_outputs_raw },

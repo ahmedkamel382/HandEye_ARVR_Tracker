@@ -49,6 +49,7 @@
 #include "dsp_adapter.hpp"
 #include "forest.hpp"
 #include "tl_model.hpp"
+#include "frame_clock.hpp"
 #include "frame_pool.hpp"
 #include "gaze_math.hpp"
 #include "hand_math.hpp"
@@ -417,13 +418,15 @@ void aiBody(Pipeline& P) {
             }
         }
 
-        const int64_t ts = std::max<int64_t>(pkt.ts_ms, last_ts + 1);   // MediaPipe VIDEO mode: strictly increasing
+        const core::FrameTimes ft = core::frameTimes(P.t0, pkt.captured_at, last_ts);
+        const int64_t ts = ft.ts_ms;                    // MediaPipe VIDEO mode: strictly increasing integer ms
         last_ts = ts;
         const cv::Mat& frame = P.pool.mat(pkt.slot);
 
         core::TrackingResult r;
         r.frame_id = pkt.frame_id;
         r.ts_ms = ts;
+        r.capture_s = ft.capture_s;                     // what the DSP and the OS stage use (exact, not truncated or bumped)
         r.captured_at = pkt.captured_at;
 
         if (cfg.use_gaze) {

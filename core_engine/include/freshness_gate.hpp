@@ -1,7 +1,11 @@
 // The gate between a tracker result and the DSP filter (CORE_ENGINE_INTEGRATION_REPORT, section 8.3).
 //
 // Rule: only a result that was really OBSERVED this frame (TrackingState::Tracked) may update the filter.
-//   Tracked : filter(x, y, t) is called once, the filtered point is published and cached.
+//   Tracked : the filter is updated once (IPointFilter::update). Outcome Ok: the filtered point is published and cached.
+//             Outcome Rejected (duplicate / non-increasing timestamp): the observation was not accepted and the filter
+//             history is intact, so the cached point is replayed flagged HELD (never the filter's substitute value); with
+//             no cache nothing is published. Outcome Invalid (the filter reset itself): nothing is published, the cache is
+//             cleared and the next observation starts a new track. A substitute value is never published as a result.
 //   Held    : the filter is NOT called (its history must not see a repeated, never-measured sample). The cached FILTERED
 //             point is republished for cursor continuity; with no cache nothing is published. The raw retained
 //             coordinates are never published.
@@ -36,6 +40,8 @@ public:
         uint64_t held_reused = 0;           // HELD frames answered from the cache
         uint64_t held_without_cache = 0;    // HELD frames with nothing to publish (no TRACKED point since the last reset)
         uint64_t resets = 0;                // filter resets caused by LOST
+        uint64_t rejected = 0;              // observations the filter rejected (timestamp): cached point replayed instead
+        uint64_t invalid = 0;               // observations the filter could not use (it reset itself): nothing published
     };
 
     // t_sec must increase between calls (the engine's frame timestamp). Returns the point to publish, or nothing.
@@ -69,7 +75,22 @@ public:
 private:
     std::optional<GatedPoint> fresh(const ModuleOut& m, IPointFilter& flt, bool use_filter, double t_sec) {
         double x = m.x, y = m.y;
-        if (use_filter) { flt.filter(x, y, t_sec); ++c_.filter_updates; }
+        if (use_filter) {
+            ++c_.filter_updates;
+            switch (flt.update(x, y, t_sec)) {
+                case FilterOutcome::Ok:
+                    break;
+                case FilterOutcome::Rejected:                      // not a new measurement: replay, history untouched
+                    ++c_.rejected;
+                    if (cache_) { GatedPoint p = *cache_; p.held = true; return p; }
+                    return std::nullopt;
+                case FilterOutcome::Invalid:                       // the filter reset itself: no track, no point
+                    ++c_.invalid;
+                    had_ = false;
+                    cache_.reset();
+                    return std::nullopt;
+            }
+        }
         cache_ = GatedPoint{std::min(1.0, std::max(0.0, x)), std::min(1.0, std::max(0.0, y))};
         had_ = true;
         return cache_;

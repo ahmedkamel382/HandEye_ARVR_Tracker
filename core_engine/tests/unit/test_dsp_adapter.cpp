@@ -110,6 +110,78 @@ static void t_invalid_config_throws() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// update() says WHAT happened, so a substitute value can never pass for a smoothed point (issue "DSP adapter rejection behaviour").
+static void t_update_reports_outcome() {
+    DspFilterAdapter a(dsp::kInitialHandConfig), ref(dsp::kInitialHandConfig);
+    double x = 0.30, y = 0.40, rx = 0.30, ry = 0.40;
+    CHECK(a.update(x, y, 0.0) == FilterOutcome::Ok);
+    ref.filter(rx, ry, 0.0);
+    x = 0.35; y = 0.45; rx = x; ry = y;
+    CHECK(a.update(x, y, 1.0 / 60) == FilterOutcome::Ok);
+    ref.filter(rx, ry, 1.0 / 60);
+    const double good_x = x, good_y = y;                                           // last good output
+
+    x = 0.90; y = 0.90;                                                            // same timestamp again
+    CHECK(a.update(x, y, 1.0 / 60) == FilterOutcome::Rejected);
+    CHECK(x == good_x && y == good_y && a.rejectedTimestamps() == 1);              // substitute = last good output ...
+    x = 0.40; y = 0.50; rx = x; ry = y;                                            // ... and the history is untouched:
+    CHECK(a.update(x, y, 2.0 / 60) == FilterOutcome::Ok);
+    ref.filter(rx, ry, 2.0 / 60);
+    CHECK(x == rx && y == ry);                                                     // identical to a filter that never saw the duplicate
+
+    x = INFINITY; y = 0.5;                                                         // non-finite: no output, filter reset
+    CHECK(a.update(x, y, 3.0 / 60) == FilterOutcome::Invalid);
+    CHECK(std::isinf(x) && a.errors() == 1);                                       // input left as it was, never "fixed"
+    x = 0.60; y = 0.20;
+    CHECK(a.update(x, y, 4.0 / 60) == FilterOutcome::Ok);
+    CHECK(x == 0.60 && y == 0.20);                                                 // a new track starts from the measurement
+
+    DspFilterAdapter legacy(dsp::kInitialHandConfig);                              // the status-less call: same values as before
+    double lx = 0.3, ly = 0.4;
+    legacy.filter(lx, ly, 0.0);
+    lx = 0.9; ly = 0.9; legacy.filter(lx, ly, 0.0);                                // duplicate -> last good, no outcome
+    CHECK(lx == 0.3 && ly == 0.4);
+
+    // the default implementation (filters that cannot fail) reports Ok
+    OneEuroPoint builtin(1.0, 8.0, 1.0);
+    double bx = 0.5, by = 0.5;
+    CHECK(builtin.update(bx, by, 0.0) == FilterOutcome::Ok);
+}
+
+static ModuleOut tracked_at(double x, double y) {
+    ModuleOut o;
+    o.ok = true; o.x = float(x); o.y = float(y);
+    o.tracking_state = TrackingState::Tracked;
+    return o;
+}
+// Through the gate with Eng 4's real filter: a rejected timestamp replays the cached point (flagged HELD), a non-finite input
+// publishes nothing and starts a new track; in neither case does a substitute value reach the OS.
+static void t_gate_handles_adapter_rejection_and_invalid() {
+    DspFilterAdapter a(dsp::kInitialHandConfig), ref(dsp::kInitialHandConfig);
+    FreshnessGate gate;
+    const double t0 = 0.0, t1 = 1.0 / 60, t2 = 2.0 / 60, t3 = 3.0 / 60, t4 = 4.0 / 60;
+    auto p0 = gate.update(tracked_at(0.30, 0.30), a, true, t0);
+    auto p1 = gate.update(tracked_at(0.32, 0.31), a, true, t1);
+    CHECK(p0 && p1 && !p0->held && !p1->held);
+
+    auto dup = gate.update(tracked_at(0.90, 0.90), a, true, t1);                   // duplicate timestamp
+    CHECK(dup && dup->held && dup->x == p1->x && dup->y == p1->y);                 // replay of the last real point, not 0.9
+    CHECK(gate.counters().rejected == 1 && a.rejectedTimestamps() == 1);
+
+    double rx = float(0.30), ry = float(0.30);                                     // reference: only the accepted observations
+    ref.filter(rx, ry, t0);                                                        // (ModuleOut carries floats: same inputs)
+    rx = float(0.32); ry = float(0.31); ref.filter(rx, ry, t1);
+    rx = float(0.34); ry = float(0.32); ref.filter(rx, ry, t2);
+    auto p2 = gate.update(tracked_at(0.34, 0.32), a, true, t2);
+    CHECK(p2 && !p2->held && p2->x == rx && p2->y == ry);                          // the duplicate left no trace in the filter
+
+    auto bad = gate.update(tracked_at(INFINITY, 0.5), a, true, t3);                // unusable input
+    CHECK(!bad && !gate.hasCache() && gate.counters().invalid == 1);
+    auto p4 = gate.update(tracked_at(0.60, 0.20), a, true, t4);                    // new track from the measurement
+    CHECK(p4 && !p4->held && std::fabs(p4->x - 0.60) < 1e-6 && std::fabs(p4->y - 0.20) < 1e-6);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Freshness gate + Eng 4's filter: a HELD frame must not touch the DSP history. Proof: the gated adapter produces EXACTLY the
 // outputs of a second adapter that was fed only the real observations; feeding the retained points (the old behaviour) does not.
 struct ConstHandModel : IHandModel {
@@ -176,6 +248,8 @@ int main() {
         {"reset / gap / clamp / NaN", t_reset_gap_and_bad_values},
         {"invalid configuration throws", t_invalid_config_throws},
         {"freshness gate + dsp adapter == observation-only filter", t_gate_with_dsp_adapter_matches_observation_only},
+        {"adapter update() reports Ok / Rejected / Invalid", t_update_reports_outcome},
+        {"gate: adapter rejection and invalid input", t_gate_handles_adapter_rejection_and_invalid},
     };
     int failed_before = 0;
     for (const auto& t : tests) {

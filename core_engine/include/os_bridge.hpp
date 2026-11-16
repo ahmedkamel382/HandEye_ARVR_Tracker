@@ -91,11 +91,13 @@ public:
     // One call per new TrackingResult, from the main loop thread.
     void update(const TrackingResult& r) {
         applyPendingFilters();
-        const double t = double(r.ts_ms) / 1000.0;
+        // The DSP / OS time base is the exact capture time; ts_ms (integer, forced strictly increasing for MediaPipe) is
+        // only the fallback for a result that does not carry it.
+        const double t = r.capture_s >= 0.0 ? r.capture_s : double(r.ts_ms) / 1000.0;
         osi::FramePayload f;
         f.timestamp_seconds = t;
-        convertHand(r.hand, f.hand, t);
-        convert(r.gaze, gaze_flt_, gaze_had_, f.gaze, t);
+        convert(r.hand, hand_gate_, *hand_flt_, f.hand, t);
+        convert(r.gaze, gaze_gate_, *gaze_flt_, f.gaze, t);
         tray_->submit_frame(f);
         ++sent_;
     }
@@ -133,8 +135,8 @@ private:
     void buildFilters(const osi::FilterSettings& h, const osi::FilterSettings& g) {
         std::unique_ptr<IPointFilter> nh = makeFilter(h), ng = makeFilter(g);     // build both first: all or nothing
         hand_flt_ = std::move(nh); gaze_flt_ = std::move(ng);
-        hand_gate_.reset();          // new filter object: its history and the cached point of the old one are gone
-        gaze_had_ = false;
+        hand_gate_.reset();          // new filter objects: their history and the cached points of the old ones are gone
+        gaze_gate_.reset();
         char buf[200];
 #ifdef CORE_HAVE_DSP_FILTER
         const char* kind = cfg_.use_dsp ? "dsp_filter (Eng 4)" : "built-in 1-Euro";
@@ -154,31 +156,18 @@ private:
         catch (const std::exception& e) { osi::app::AppLog::error(std::string("filter settings not applied: ") + e.what()); }
     }
 
-    // HAND: only a freshly TRACKED observation updates the filter; HELD (retained during a short dropout) republishes the
-    // cached filtered point without touching the filter; LOST resets it and publishes nothing (see freshness_gate.hpp).
-    // The state integer is forwarded raw: states bypass the DSP stage.
-    void convertHand(const ModuleOut& m, osi::TrackerSample& out, double t) {
+    // One path for both trackers (see freshness_gate.hpp). Hand: only a freshly TRACKED observation updates the filter,
+    // HELD republishes the cached filtered point, LOST resets. Gaze has no tracking_state and takes the plain path
+    // (detected -> filter, otherwise reset). For both, a filter that rejects or cannot use an observation never has its
+    // substitute value published (FilterOutcome). The state integer is forwarded raw: states bypass the DSP stage.
+    void convert(const ModuleOut& m, FreshnessGate& gate, IPointFilter& flt, osi::TrackerSample& out, double t) {
         out.state = m.ok ? m.state : 0;
-        if (const auto p = hand_gate_.update(m, *hand_flt_, cfg_.use_filter, t)) {
+        if (const auto p = gate.update(m, flt, cfg_.use_filter, t)) {
             out.point = osi::NormalizedPoint{p->x, p->y};
             out.tracking = p->held ? osi::TrackerState::Held : osi::TrackerState::Tracked;   // explicit mapping, no core header in osi
         } else {
             out.tracking = osi::TrackerState::Lost;
         }
-    }
-
-    // GAZE (unchanged): detected -> smoothed point. Lost -> no point, and the filter forgets its history (no glide across the gap).
-    // The state integer is forwarded raw: states bypass the DSP stage.
-    void convert(const ModuleOut& m, std::unique_ptr<IPointFilter>& flt, bool& had, osi::TrackerSample& out, double t) {
-        out.state = m.ok ? m.state : 0;
-        if (!m.detected()) {
-            if (had) { flt->reset(); had = false; }
-            return;
-        }
-        double x = m.x, y = m.y;
-        if (cfg_.use_filter) flt->filter(x, y, t);
-        out.point = osi::NormalizedPoint{std::min(1.0, std::max(0.0, x)), std::min(1.0, std::max(0.0, y))};
-        had = true;
     }
 
     OsBridgeConfig cfg_;
@@ -188,8 +177,7 @@ private:
     std::atomic<bool> ui_done_{false};
 
     std::unique_ptr<IPointFilter> hand_flt_, gaze_flt_;
-    FreshnessGate hand_gate_;
-    bool gaze_had_ = false;
+    FreshnessGate hand_gate_, gaze_gate_;
     std::string filter_desc_;
     uint64_t sent_ = 0;
 

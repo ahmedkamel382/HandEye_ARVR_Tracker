@@ -3,9 +3,12 @@
 // Compiled only when the dsp_filter target exists (CMake defines CORE_HAVE_DSP_FILTER).
 // What the adapter adds, and nothing more:
 //   * clamps the incoming X/Y to [0,1]    (Eng 4's filter resets itself on out-of-range input)
-//   * a rejected timestamp (duplicate / not increasing) keeps the LAST GOOD output, history stays intact
-//   * InvalidInput / NumericalError (the filter has already reset itself): the raw value passes through,
-//     so the pointer never freezes or jumps to (0, 0)
+//   * update() reports WHAT happened (FilterOutcome), so the engine never mistakes a substitute for a smoothed point:
+//       Ok        the smoothed point of this observation
+//       Rejected  duplicate / not increasing timestamp: history intact, x/y = last good output (or the raw clamped input)
+//       Invalid   non-finite input, InvalidInput or NumericalError: the filter is reset, x/y = raw clamped input
+//                 (untouched when the input was not finite); there is NO valid output and the engine must not publish it
+//   * filter() is the old status-less call: same x/y values as update(), the outcome is dropped.
 // Units match the engine: normalised 0..1 coordinates, time in seconds.
 #pragma once
 #ifdef CORE_HAVE_DSP_FILTER
@@ -26,24 +29,32 @@ public:
 
     void reset() override { f_.reset(); have_last_ = false; }
 
-    void filter(double& x, double& y, double t_sec) override {
-        if (!std::isfinite(x) || !std::isfinite(y)) { ++errors_; return; }       // leave as is; never expected
+    void filter(double& x, double& y, double t_sec) override { (void)update(x, y, t_sec); }
+
+    FilterOutcome update(double& x, double& y, double t_sec) override {
+        if (!std::isfinite(x) || !std::isfinite(y)) {                            // never expected; x, y left as they are
+            ++errors_;
+            f_.reset();                                                          // same as the DSP does for non-finite input
+            have_last_ = false;
+            return FilterOutcome::Invalid;
+        }
         const double rx = std::min(1.0, std::max(0.0, x)), ry = std::min(1.0, std::max(0.0, y));
         const dsp::TrackingResult2D r = f_.update({rx, ry}, t_sec, true);
         if (r.point) {
             x = last_x_ = r.point->x;
             y = last_y_ = r.point->y;
             have_last_ = true;
-            return;
+            return FilterOutcome::Ok;
         }
         if (r.status == dsp::FilterStatus::RejectedTimestamp) {
             ++rejected_;
             if (have_last_) { x = last_x_; y = last_y_; } else { x = rx; y = ry; }
-            return;
+            return FilterOutcome::Rejected;
         }
-        ++errors_;                                   // filter already reset itself
+        ++errors_;                                   // the filter already reset itself
         have_last_ = false;
         x = rx; y = ry;
+        return FilterOutcome::Invalid;
     }
 
     uint64_t rejectedTimestamps() const { return rejected_; }

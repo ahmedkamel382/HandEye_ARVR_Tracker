@@ -8,8 +8,10 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from tqdm import tqdm
 
+from gaze_intent import extract_gaze_features
+
 # --- CONFIGURATION ---
-BASE_DIR = os.getcwd()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_PATH = os.path.join(BASE_DIR, "datasets", "MPIIFaceGaze")
 OUTPUT_CSV = os.path.join(BASE_DIR, "datasets", "mpii_spatial_features.csv")
 
@@ -26,59 +28,6 @@ options = vision.FaceLandmarkerOptions(
     output_facial_transformation_matrixes=True
 )
 detector = vision.FaceLandmarker.create_from_options(options)
-
-# --- LANDMARK INDICES ---
-LEFT_IRIS, RIGHT_IRIS = 468, 473
-L_CORNERS, R_CORNERS = (33, 133), (362, 263)
-
-
-def _get_3d_dist(p1, p2, frame_w, frame_h):
-    return math.hypot((p1.x - p2.x) * frame_w, (p1.y - p2.y) * frame_h, p1.z - p2.z)
-
-
-def _get_iris_ratio(landmarks, corners, iris_idx, axis):
-    """Measure the iris against the static line joining the eye corners in normalized 2D space."""
-    p_corner1, p_corner2 = landmarks[corners[0]], landmarks[corners[1]]
-    p_iris = landmarks[iris_idx]
-
-    corner1 = np.array([p_corner1.x, p_corner1.y], dtype=float)
-    corner2 = np.array([p_corner2.x, p_corner2.y], dtype=float)
-    iris = np.array([p_iris.x, p_iris.y], dtype=float)
-
-    baseline = corner2 - corner1
-    baseline_length = float(np.linalg.norm(baseline))
-    if baseline_length == 0:
-        return 0.5 if axis == "x" else 0.0
-
-    iris_vec = iris - corner1
-    scale = float(np.dot(iris_vec, baseline) / (baseline_length ** 2))
-
-    if axis == "x":
-        return scale
-    if axis == "y":
-        proj = scale * baseline
-        perp_vec = iris_vec - proj
-        norm_dist = float(np.linalg.norm(perp_vec) / baseline_length)
-        if perp_vec[1] < 0:
-            return -norm_dist
-        return norm_dist
-
-    raise ValueError(f"Unsupported iris ratio axis: {axis}")
-
-
-def _get_head_pose_angles(matrix):
-    R = matrix[:3, :3]
-    sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
-    singular = sy < 1e-6
-    if not singular:
-        pitch = math.atan2(R[2, 1], R[2, 2])
-        yaw = math.atan2(-R[2, 0], sy)
-        roll = math.atan2(R[1, 0], R[0, 0])
-    else:
-        pitch = math.atan2(-R[1, 2], R[1, 1])
-        yaw = math.atan2(-R[2, 0], sy)
-        roll = 0
-    return math.degrees(pitch), math.degrees(yaw), math.degrees(roll)
 
 
 def vector_to_pitch_yaw(gaze_vector):
@@ -143,15 +92,9 @@ def process_mpiigaze():
                 landmarks = results.face_landmarks[0]
                 pose_matrix = results.facial_transformation_matrixes[0]
 
-                l_x = _get_iris_ratio(landmarks, L_CORNERS, LEFT_IRIS, "x")
-                r_x = _get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "x")
-                student_x = (l_x + r_x) / 2.0
-
-                l_y = _get_iris_ratio(landmarks, L_CORNERS, LEFT_IRIS, "y")
-                r_y = _get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "y")
-                student_y = (l_y + r_y) / 2.0
-
-                head_pitch, head_yaw, head_roll = _get_head_pose_angles(pose_matrix)
+                student_x, student_y, head_pitch, head_yaw, head_roll = extract_gaze_features(
+                    landmarks, pose_matrix
+                )
 
                 features_list.append({
                     "student_feature_x": student_x,

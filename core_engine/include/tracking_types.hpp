@@ -60,6 +60,10 @@ struct TrackingResult {
     ModuleOut         hand;
     double            gaze_ms = 0.0;      // time in the gaze stage (MediaPipe call + native math)
     double            hand_ms = 0.0;      // same for the hand stage
+    // Optional Engineer 4 recording metadata: actual detector return counts, never inferred from retained points.
+    // Populated only when numerical recording is requested; -1 otherwise (or a detector-call error).
+    int               hand_landmarks = -1;
+    int               gaze_landmarks = -1;
 };
 
 } // namespace core

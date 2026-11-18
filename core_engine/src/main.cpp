@@ -133,6 +133,7 @@ struct Config {
     bool        use_filter = true;          // --no-filter
     std::string filter  = "auto";           // auto | dsp (Eng 4) | builtin
     std::vector<double> hand_filter, gaze_filter;   // optional "min_cutoff,beta,d_cutoff" overrides (Hz, -, Hz)
+    std::string dsp_record_dir;             // opt-in numerical diagnostics; empty = no recorder
     core::HandParams   hand;
 };
 
@@ -432,6 +433,7 @@ void aiBody(Pipeline& P) {
         if (cfg.use_gaze) {
             const auto t_g = Clock::now();
             const int n = face.call(frame, ts, face_pts);
+            if (!cfg.dsp_record_dir.empty()) r.gaze_landmarks = n;
             r.gaze = (n >= 0) ? gaze.process(face_pts.data(), n, fs.width, fs.height) : core::ModuleOut{};
             r.gaze_ms = usBetween(t_g, Clock::now()) / 1000.0;
         }
@@ -453,6 +455,7 @@ void aiBody(Pipeline& P) {
                 n = hand.call(frame, ts, hand_pts);
             }
             core::ModuleOut hand_failed;                     // the Python call raised: no output, and say so
+            if (!cfg.dsp_record_dir.empty()) r.hand_landmarks = n;
             hand_failed.tracking_state = core::TrackingState::Lost;
             r.hand = (n >= 0) ? handn.process(hand_pts.data(), n) : hand_failed;
             hand_valid = r.hand.detected();
@@ -514,8 +517,9 @@ void usage() {
 "output:   --os log|win32 (default log = dry run) | --control (same as --os win32) | --start-active\n"
 "paths:    --ai-root DIR | --site DIR\n"
 "checks:   --check (diagnose Python, packages, models, forest and camera; sends nothing to the OS)\n"
+"record:   --dsp-record-dir NEW_DIRECTORY (4096 numerical frames; --filter dsp --os log; exactly one tracker)\n"
 "          --selftest-hand-forest hand_forest/parity_cases.csv\n"
-"exit codes: 0 ok | 1 bad options / source or filter config | 2 AI stage or Python failed to start | 3 camera lost | 130 interrupted\n"
+"exit codes: 0 ok | 1 bad options / source or filter config | 2 AI stage or Python failed to start | 3 camera lost | 4 recording incomplete | 130 interrupted\n"
 "hotkeys (Windows): Ctrl+Alt+P = pause/resume (OS integration), F9 = quit.  Ctrl+C also quits.  Tray icon: Calibrate, Exit.\n");
 }
 
@@ -608,6 +612,10 @@ Config parseArgs(int argc, char** argv, bool& ok) {
         else if (a == "--filter")         c.filter = next();
         else if (a == "--hand-filter")    { if (!parseTriple(next(), c.hand_filter)) { std::fprintf(stderr, "--hand-filter needs MIN,BETA,DCUT\n"); ok = false; } }
         else if (a == "--gaze-filter")    { if (!parseTriple(next(), c.gaze_filter)) { std::fprintf(stderr, "--gaze-filter needs MIN,BETA,DCUT\n"); ok = false; } }
+        else if (a == "--dsp-record-dir") {
+            c.dsp_record_dir = next();
+            if (c.dsp_record_dir.empty()) { std::fprintf(stderr, "--dsp-record-dir needs a new output directory\n"); ok = false; }
+        }
         else if (a == "--hand-anchor") {
             const std::string v = next();
             if (v == "tip") c.hand.anchor = core::HandAnchor::Tip;
@@ -630,6 +638,18 @@ Config parseArgs(int argc, char** argv, bool& ok) {
 #ifndef CORE_HAVE_DSP_FILTER
     if (c.filter == "dsp") { std::fprintf(stderr, "--filter dsp: this build has no dsp_filter target\n"); ok = false; }
 #endif
+    if (!c.dsp_record_dir.empty()) {
+#if defined(CORE_HAVE_DSP_FILTER) && defined(CORE_HAVE_OS_INTEGRATION)
+        if (c.os != "log" || !c.use_filter || c.filter != "dsp" || c.use_hand == c.use_gaze ||
+            c.check || !c.selftest_hand.empty()) {
+            std::fprintf(stderr, "--dsp-record-dir requires --filter dsp --os log, exactly one enabled tracker, and a normal tracking run\n");
+            ok = false;
+        }
+#else
+        std::fprintf(stderr, "--dsp-record-dir requires the DSP library and OS bridge in this build\n");
+        ok = false;
+#endif
+    }
     return c;
 }
 
@@ -756,6 +776,25 @@ int main(int argc, char** argv) {
     if (!args_ok) return 1;
     cv::setNumThreads(1);          // OpenCV's worker pool only adds wake-ups/heat on small images
 
+#if defined(CORE_HAVE_DSP_FILTER) && defined(CORE_HAVE_OS_INTEGRATION)
+    // Reserve bounded memory and a NEW output directory before Python/camera startup.
+    // A failed/aborted run leaves INCOMPLETE; destructors never write measurement data.
+    std::unique_ptr<dsp::recording::Recorder> recorder;
+    std::unique_ptr<dsp::recording::OutputSession> recording_output;
+    if (!cfg.dsp_record_dir.empty()) {
+        try {
+            recorder = std::make_unique<dsp::recording::Recorder>(
+                cfg.use_hand ? dsp::recording::Channel::Hand : dsp::recording::Channel::Gaze);
+            recording_output = std::make_unique<dsp::recording::OutputSession>(
+                std::filesystem::u8path(cfg.dsp_record_dir));
+            std::printf("DSP numerical recording enabled: capacity 4096 frames; disk output after shutdown only\n");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[recording] startup failed: %s\n", e.what());
+            return 4;
+        }
+    }
+#endif
+
 #ifndef _WIN32
     if (cfg.os == "win32") { std::fprintf(stderr, "--control / --os win32 is only available on Windows\n"); return 1; }
 #endif
@@ -816,6 +855,10 @@ int main(int argc, char** argv) {
     oc.use_dsp = (cfg.filter != "builtin");
     oc.hand_filter = cfg.hand_filter;
     oc.gaze_filter = cfg.gaze_filter;
+#if defined(CORE_HAVE_DSP_FILTER) && defined(CORE_HAVE_OS_INTEGRATION)
+    oc.recorder = recorder.get();
+    oc.recording_epoch = P.t0;
+#endif
     std::unique_ptr<core::OsBridge> os;
     try { os.reset(new core::OsBridge(oc)); }
     catch (const std::exception& e) { std::fprintf(stderr, "[FATAL] OS integration: %s\n", e.what()); return 1; }
@@ -893,9 +936,21 @@ int main(int argc, char** argv) {
     std::printf("os stage: %llu frames submitted\n", (unsigned long long)os->framesSent());
     std::printf("pool slots returned: %zu/%zu %s\n", P.pool.free_count(), P.pool.capacity(),
                 P.pool.free_count() == P.pool.capacity() ? "(no leaks)" : "(LEAK!)");
+    bool recording_incomplete = false;
+#if defined(CORE_HAVE_DSP_FILTER) && defined(CORE_HAVE_OS_INTEGRATION)
+    if (recorder) {
+        const auto saved = recording_output->finish(*recorder, os->framesSent());
+        recording_incomplete = !saved.complete;
+        std::printf("DSP recording: %s | stored %zu | attempted %llu | overflow %llu\n",
+                    saved.complete ? "COMPLETE" : "INCOMPLETE", recorder->size(),
+                    (unsigned long long)recorder->attempted(), (unsigned long long)recorder->overflow());
+        if (!saved.complete) std::fprintf(stderr, "[recording] %s\n", saved.error.c_str());
+        else std::printf("DSP trace saved: %s\n", saved.trace_path.string().c_str());
+    }
+#endif
     std::printf("Engine safely shut down.\n");
 #ifdef _WIN32
     g_teardown_done.store(true);        // lets a pending console-close handler return
 #endif
-    return P.source_lost.load() ? 3 : 0;     // 3 = the camera disappeared; release_gil reacquires the GIL, then Python finalises
+    return P.source_lost.load() ? 3 : (recording_incomplete ? 4 : 0); // release_gil reacquires the GIL before Python finalises
 }

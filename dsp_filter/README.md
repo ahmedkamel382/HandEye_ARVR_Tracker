@@ -4,28 +4,28 @@ This module implements a C++17, allocation-free update path for canonical/curren
 Casiez-style 1 Euro filtering. It stabilizes numerical tracking observations after
 AI inference and before downstream coordinate mapping or action execution.
 
-**DSP MODULE COMPLETE - AWAITING UPSTREAM/DOWNSTREAM INTEGRATION**
-
-The current core executable only captures and displays frames. It does not yet
-receive Python AI results. This module is independently built and tested; no
-runtime bridge, webcam logic, AI classification, GUI, or OS integration is added.
+The Windows core links this library and uses it for hand and gaze when
+`--filter dsp` is selected. The recorder work is based on the working demo at
+`6354a14`, including the precise capture clock and filter-outcome handling from
+`839dcd6`. Live dry-run traces at the earlier `d455492` verified accepted output
+through Engineer 5's controller. The outstanding experiments are controlled live
+jitter, movement response, and confirmed gaze loss followed by recovery.
+[Evaluation procedure](evaluation/README.md)
 
 ## Ownership and signal flow
 
 ```text
-Future core receives actual hand/gaze (X, Y, State) results and frame timestamps
-    -> core determines coordinate usability
-    -> hand TrackingFilter2D: independent X and Y OneEuroFilter1D instances
-    -> gaze TrackingFilter2D: independent X and Y OneEuroFilter1D instances
-    -> optional stabilized X/Y, with explicit DSP status
-    -> core / Engineer 5 mapping and execution
-
-Original hand and gaze State integers bypass DSP unchanged.
+Camera capture -> Python MediaPipe landmark extraction -> native HandNative / GazeNative
+    -> TrackingResult (frame ID, time, hand and gaze ModuleOut)
+    -> OsBridge::update -> convert -> each channel's FreshnessGate
+    -> fresh hand or usable gaze -> channel's DspFilterAdapter -> TrackingFilter2D::update
+    -> FramePayload (optional point and state per channel) -> TrayApp::submit_frame -> OsController::update
 ```
 
-Production headers live directly in `include/`; implementations live directly in
-`src/`. Both original `.gitkeep` files remain. No third-party runtime dependency
-is required, including Python, OpenCV, MediaPipe, Pybind11, or Windows APIs.
+The library under `include/` and `src/` uses only the C++17 standard library.
+Each channel owns separate X and Y filter histories. The bridge carries the
+module state alongside the coordinates. Engineer 5 maps them and decides which
+source and gesture actions to use.
 
 ## Public API
 
@@ -76,23 +76,32 @@ as normalized coordinates or the 100/500-valued synthetic tests.
 `TrackingFilter2D` enforces the current project's finite normalized `[0,1]` X/Y
 domain, inclusively. It does not clamp invalid input into the valid range.
 
-- Hand runtime returns mirrored-image normalized index-fingertip X/Y and State.
-- Gaze runtime returns normalized eye-relative X/Y ratios and State. These are
-  not yet calibrated screen coordinates and are not the same physical signal as
-  hand positions.
-- Missing hand/face tracking currently returns `(-1.0, -1.0, 0)`.
-- Core must translate tracking usability into explicit `tracking_valid`.
-- `State == 0` is not a validity test; both neutral and missing results use it.
-- `(0,0)` is a legitimate position. `(-1,-1)` is rejected even if a caller
-  incorrectly passes `tracking_valid=true`.
-- Invalid/nonfinite/out-of-range coordinates or false validity clear both axes
-  and return no position. No Z dimension is invented.
-- Pinch/fist, calibration, wink, closure, pause, and cursor-source decisions stay
-  in the upstream/core/OS layers. DSP accepts no State integer.
-
-Numeric validity does not prove observation accuracy. The current upstream API
-does not expose confidence or track identity. An in-range outlier may look like
-rapid motion to this filter; no undocumented outlier classifier is included.
+- **Hand.** The default point is the index fingertip in the full mirrored image.
+  Optional anchors use the index knuckle or the midpoint between the thumb and
+  index tips. On `3ea3ce3`, each fresh hand detection is marked `Tracked`.
+  After an established detection the first six consecutive misses are `Held`.
+  The upstream tracker repeats the last coordinates and gesture. The bridge
+  skips DSP and republishes the cached output. With an empty cache it publishes
+  no point and marks the output `Lost`. The seventh miss publishes upstream
+  `(-1,-1,0)` with freshness `Lost` and clears established hand filter history.
+- **Gaze.** The native tracker adds head pose to the predicted eye-in-socket yaw
+  and pitch. It publishes `x=clamp(0.5+yaw_deg/60,0,1)` and
+  `y=clamp(0.5+pitch_deg/60,0,1)`. These are normalized angular coordinates
+  before screen mapping. The native path applies no positional EMA. During blink
+  calibration, including the completing frame, it returns `(-1,-1,-1)` with
+  invalid coordinates, gesture state −1 and NaN angles.
+  The bridge forwards the state with an empty point and skips the DSP update.
+  An unusable face/pose packet yields `(-1,-1,0)`. The first usable observation
+  after calibration seeds the gaze filter directly.
+- **Validity and freshness.** The bridge's `ModuleOut::detected()` tests
+  `ok && x >= 0 && y >= 0`. Neutral state zero and position `(0,0)` are both
+  legitimate. State, detector freshness, track identity and confidence are not
+  inputs to the filter. Core uses hand freshness and position validity to decide
+  when to call it. The hand trace records the upstream and outgoing freshness
+  alongside the detector count, including when coordinates happen to repeat.
+- **Library contract.** A direct call with false validity resets both axes and
+  returns no point. A direct call with invalid normalized coordinates, including
+  `(-1,-1)`, also resets both axes. The core adapter has its own policies below.
 
 ## Canonical mathematics
 
@@ -126,12 +135,18 @@ interpolation forms. It uses a portable `constexpr` pi value, not `M_PI`.
 
 ## Timing, reset, and numerical-error policy
 
-Timestamps are explicit `double` seconds on one monotonic observation timeline.
-DSP never queries the clock or assumes a frame rate. Engineer 1 should associate
-a `steady_clock` timestamp with each captured frame and preserve it through
-inference. Acquisition time and inference-completion time are different.
-Tests can supply synthetic timestamps directly. A finite arbitrary time origin
-is permitted; seconds since application start are a practical choice.
+DSP receives explicit `double` seconds. In `core_engine/src/main.cpp`, capture
+records a host `steady_clock` time immediately after a successful camera read.
+Since `839dcd6`, `frameTimes` derives `TrackingResult::capture_s` directly from
+that original `captured_at` time relative to pipeline start. `OsBridge::update`
+passes this precise value to both DSP channels and the OS payload. It is neither
+truncated to whole milliseconds nor bumped to satisfy MediaPipe. Separately,
+`TrackingResult::ts_ms` is the greater of the whole capture milliseconds and the
+preceding MediaPipe timestamp plus 1 ms. Only results lacking `capture_s` use
+`ts_ms / 1000.0` as a compatibility fallback. Hardware exposure time and AI
+completion time are outside this contract; buffered camera reads can still have
+nearly identical host timestamps. Tests supply their own timestamps, including
+irregular intervals.
 
 The initial timing policies are configurable engineering choices, not measured
 optima: `min_dt_seconds=1e-6`, `reset_gap_seconds=0.25`.
@@ -202,40 +217,100 @@ Tune hand and gaze separately using representative sessions:
 6. Compare RMS jitter, bias, movement error, rise/settling time, and user targeting.
 7. Keep separate held-out sessions for evaluation; do not tune only to one trace.
 
-The synthetic results below establish implementation behavior, not real-world
-profile optimality. Real-world tuning is pending valid integrated/recorded data.
+The Windows bridge reads saved filter settings and then applies any
+`--hand-filter` and `--gaze-filter` overrides. Record the active parameters
+for each session. In-session changes rebuild both instances and clear history.
+Real-world tuning requires labeled holds and movement trials on identical input
+sequences for each candidate.
 
-## Integration example (documentation only)
+## Integrated adapter behavior
 
-These objects should live across observations, not be reconstructed every frame:
+`OsBridge::update` sends both channels through `convert` and separate freshness
+gates. Gaze has no upstream freshness enum and uses position detection. A hand
+hold leaves the filter's timestamp and both axis histories unchanged. If the next
+fresh hand observation is more than the
+configured gap after the last accepted update, it reinitializes even during the
+grace period. For either channel, the first loss of an established track calls
+the adapter's `reset()`, clears its history and publishes no point. Either channel's
+loss also clears its gate's publication cache. This path bypasses `update(..., false)`,
+so a live loss has no returned DSP `TrackingLost` status. The next valid
+observation initializes directly.
 
-```cpp
-dsp::TrackingFilter2D hand(dsp::kInitialHandConfig, dsp::kInitialHandConfig);
-dsp::TrackingFilter2D gaze(dsp::kInitialGazeConfig, dsp::kInitialGazeConfig);
+For a detected point, `DspFilterAdapter::update` clamps finite coordinates
+to the unit square and calls `f_.update({rx, ry}, t_sec, true)`. A present result
+returns outcome `Ok` and becomes the published and cached point. Timestamp
+rejection returns `Rejected` while preserving DSP history; the gate republishes
+its cached point marked `Held`, or publishes no point when the cache is empty.
+A nonfinite input, invalid input or numerical error returns `Invalid`, clears
+filter history and causes the gate to clear its cache and publish no point.
+The adapter's compatibility X/Y fallback values are never published as an
+accepted result. Its nonfinite-input guard resets without calling the DSP update.
+The bridge applies a final clamp. The outgoing payload contains optional
+positions, gesture state integers and publication freshness. It omits the DSP
+status, so a point in the payload alone cannot establish that DSP accepted the
+observation. The optional recorder captures the actual status and outcome.
+[Adapter](../core_engine/include/dsp_adapter.hpp) · [OS bridge](../core_engine/include/os_bridge.hpp)
 
-// At the future core's actual result-consumption point:
-auto filtered_hand = hand.update({hand_x, hand_y}, frame_time_seconds, hand_usable);
-auto filtered_gaze = gaze.update({gaze_x, gaze_y}, frame_time_seconds, gaze_usable);
-// Forward only present .point values to downstream mapping.
-// Carry original hand_state and gaze_state separately and unchanged.
-```
+The ordinary console line reads raw module outputs from the latest
+`TrackingResult` and rounds them to two decimal places. To compare DSP on/off,
+pair the adapter input and accepted output for the **same observation**. Exclude
+calibration, retained detections and reset transients from steady-state jitter.
 
-The variable names represent values supplied by the future bridge, not functions
-or structures implemented here. No fake production observations are created.
-Core owns RGB/BGR/mirroring, calibration/closure gating, timestamps, and routing.
-Engineer 5 owns mapping and action execution. Update once per new observation,
-not repeatedly on a stale result at the display-loop frequency.
-
-One owning update thread per instance is required. The module has no mutex,
-clock, I/O, logging, per-update heap allocation, or dynamic history. Concurrent
+One owning update thread per filter instance is required. The filter update has
+no mutex, clock, I/O, logging, heap allocation or dynamic history. Concurrent
 updates to the same instance require external coordination.
+
+## Optional numerical recorder and review scope
+
+Recording is disabled by default. Opt in with `--dsp-record-dir NEW_DIRECTORY`,
+`--filter dsp`, `--os log`, and exactly one tracker: `--no-gaze` for hand or
+`--no-hand` for gaze. The parent directory must already exist; the run directory
+must not exist, even if empty. The recorder reserves 4096 numerical frame slots
+before capture. It records one selected-channel row after each actual
+`TrayApp::submit_frame` call, including Held, Lost and calibration observations.
+This establishes submission to the receiver, not an acknowledgement of mouse
+movement or an action executed by Windows. It records no camera images or video.
+
+The processing path copies numerical fields into preallocated memory; it performs
+no recorder allocation, formatting, locking, clock query or disk I/O. Startup
+reserves the directory and writes `INCOMPLETE`. After capture and AI threads join,
+remaining results are submitted, the OS bridge stops, and the camera is released;
+only then are records serialized. A usable run requires `COMPLETE`, no
+`INCOMPLETE`, and a valid `E4REC END` footer with equal positive submitted,
+attempted and stored counts, zero overflow and zero configuration changes.
+Overflow, truncated output, write failure or a filter change invalidates the
+run. Overflow does not stop tracking. Preserve failed runs for diagnosis.
+
+The v2 importer produces 26 CSV columns while retaining the older 12-column and
+15-column debugger formats. It keeps precise `dsp_timestamp_seconds` separately
+from MediaPipe milliseconds, actual DSP input/optional output/status, adapter
+outcome/reset count, upstream tracker data and downstream publication/freshness.
+Recorder rows contain no DSP execution duration. The separate Release recorder
+benchmark compares enabled/disabled synthetic adapter-and-gate workloads;
+live cadence impact and end-to-end latency still need measurement.
+[Capture, import and scoring workflow](evaluation/README.md)
+
+Only four core files contain recorder instrumentation for teammate review:
+
+| Core file | Recorder addition |
+| --- | --- |
+| `core_engine/include/tracking_types.hpp` | Optional actual hand/gaze detector counts carried with the existing result. |
+| `core_engine/src/main.cpp` | Opt-in CLI validation, detector-count capture, recorder lifetime, and shutdown save. |
+| `core_engine/include/dsp_adapter.hpp` | Optional observation slot for actual update input, status, optional result, outcome and resets. |
+| `core_engine/include/os_bridge.hpp` | Clear slots each frame, attach them to the selected filters, track configuration generation and append after submission. |
+
+The precise clock, freshness gates and `Rejected`/`Invalid` behavior already
+belong to the working-demo base. Recorder storage, tests, benchmark and offline
+tools remain under `dsp_filter/`. Review the changes on
+`codex/engineer4-dsp-recorder`; these instructions do not merge the branch.
 
 ## Build and test independently in Visual Studio
 
 1. Open the installed Visual Studio **Developer PowerShell**, configured for x64,
    or use its **x64 Native Tools Command Prompt** from the Start menu.
 2. Change to the repository root. Confirm `git branch --show-current` reports
-   `bassel-development`; the following commands do not change branches.
+   `codex/engineer4-dsp-recorder` for recorder review; do not switch or merge
+   branches as part of these checks.
 3. Configure/build/test Debug:
 
 ```powershell
@@ -254,6 +329,7 @@ cmake --build out/build/dsp-release
 ctest --test-dir out/build/dsp-release --output-on-failure
 .\out\build\dsp-release\dsp_filter_tests.exe
 .\out\build\dsp-release\dsp_filter_benchmark.exe
+.\out\build\dsp-release\dsp_trace_recorder_benchmark.exe
 ```
 
 The CMake binary bundled with this machine's Visual Studio is under
@@ -268,7 +344,7 @@ metrics, and long-run counts; failure returns a nonzero exit code. Checks remain
 active under Release `NDEBUG`. CTest registers this executable as one suite.
 No GoogleTest, Catch2, or additional package is required.
 
-### Verified build matrix
+### Historical DSP build matrix
 
 All **60 individual tests** passed in each configuration below. The benchmark
 is separate from the correctness suite and is not a CTest timing assertion.
@@ -280,9 +356,10 @@ is separate from the correctness suite and is not a CTest timing assertion.
 | Root project Debug, including existing core executable | PASS | PASS |
 | Root project Release, including existing core executable | PASS | PASS |
 
-Root registration adds only `include(CTest)` and `add_subdirectory(dsp_filter)`.
-The core is not linked to DSP until it actually consumes AI results. No global
-compiler flag or dependency/preset/source file was changed. Root Release reused
+The current root CMake registers the DSP directory, links `dsp_filter`
+privately into `core_engine` and defines `CORE_HAVE_DSP_FILTER` for that target
+when the DSP target exists. Standalone builds avoid the tracking and OS
+dependencies. The earlier root Release verification reused
 the existing installation at `out/build/windows-debug/vcpkg_installed`, which
 already contains both Debug and Release libraries. Manifest installation was
 disabled, so these builds did not install/update packages. Exact root commands
@@ -305,13 +382,66 @@ ctest --test-dir out/build/windows-release --output-on-failure
 These explicit Release overrides reuse this machine's existing toolchain and
 installed packages; they do not edit `CMakePresets.json`. On another machine,
 the corresponding already-installed paths must be supplied by the core owner.
-No compiler/linker warnings were emitted. CMake's Release discovery tried POSIX
-pthread probes, reported them unavailable on Windows, and then successfully
-reported `Found Threads: TRUE`; this was not a failed build or test. An initial
-manual compiler-launch quoting error was corrected by loading the Visual Studio
-environment into the child PowerShell process, without changing project files.
+
+### Recorder verification, 2026-11-18
+
+Both root builds passed all seven CTest suites: Debug in 115.69 seconds and
+Release in 64.58 seconds. Each build passed the 60 DSP tests, 13 recorder cases
+with 4,520 checks, 76 OS tests, 20 core tests with 347 checks, 13 end-to-end checks,
+and 9 adapter tests with 47 checks. Parity covered 3,000 gaze and 3,000 hand cases
+with zero mismatches. These are synthetic/deterministic checks, not live quality
+measurements.
+
+The offline Python suite passed 75 tests in 1.005 seconds, including 13 mocked
+verifier-guard cases. The real-executable synthetic recorder/importer runs also
+passed: Debug retained/imported 324 hand and 329 gaze submissions; Release
+retained/imported 327 hand and 329 gaze submissions. Each run captured 329 input
+frames. The 5 Debug hand and 2 Release hand stale frames were discarded before
+DSP, so they are not missing recorder rows; neither gaze run discarded stale
+frames. Every submitted frame was retained and imported. All four runs reported
+zero Python errors, all 8/8 pool slots returned, unchanged saved tray settings,
+and refusal to reuse the existing output directory with its trace hash preserved.
+Synthetic pipeline cadence is not a recorder-overhead or live-FPS measurement.
+[Per-status integration results](evaluation/README.md#verified-recorder-checks-2026-11-18)
+
+On the Intel Core i7-1255U (10 cores, 12 logical processors), AMD64 Windows 11 Pro
+10.0.26200, MSVC 19.51.36260.0 Release build, the recorder benchmark ran 31
+alternating enabled/disabled pairs of 4,096 frames, after two warm-up batches per
+mode. Output checksums matched exactly.
+
+| Recorder mode | Mean ns/frame | Median batch mean ns/frame | p95 batch mean ns/frame | Maximum batch mean ns/frame |
+| --- | ---: | ---: | ---: | ---: |
+| Disabled | 221.0654 | 188.2568 | 331.5186 | 343.5059 |
+| Enabled | 282.9810 | 256.0303 | 400.9277 | 430.5664 |
+
+The paired mean increase was 61.9156 ns/frame (28.0078%). This measures synthetic
+adapter/gate updates plus recorder observation and record-copy work. It excludes
+AI-thread detector metadata/queue cost, startup/preallocation, serialization,
+disk I/O, camera and OS calls. These are machine-specific batch averages, not
+worst individual call times or a live FPS/latency result. The separate DSP-only
+benchmark rerun measured means of 87.3406 ns/scalar update, 204.2164 ns/2D update,
+and 370.4211 ns/hand-plus-gaze update, with zero rejected updates. Earlier
+measurements below are retained as separate historical runs.
 
 ## Deterministic validation and measurement definitions
+
+The offline evaluation tools have a separate Python unittest suite. It covers
+same-frame pairing, DSP-to-publication equality, hand cache reuse and loss,
+older recordings, exclusion counts, timing gaps, target bias and analytical
+2D jitter values.
+Run it from the repository root with
+`.\.venv\Scripts\python.exe -B -m unittest discover -s dsp_filter/evaluation -p "test_*.py"`.
+These tests are independent of CTest. With the sibling core headers present,
+CTest also registers `dsp_trace_recorder_tests`, which exercises the actual
+adapter and freshness gate without a camera, Python inference or OS actions.
+The separate `evaluation/check_recorder_pipeline.py --exe ABSOLUTE_EXE_PATH`
+check runs the real executable and recorder on existing synthetic-video/fake-AI
+fixtures, verifies completed imports and file-preservation behavior, and keeps
+its artifacts outside Git. It opens no webcam and runs the OS bridge in logging
+mode. Existing readable tray settings are required and verified before/after
+every run; they are never silently restored. The tray may append its ordinary
+LocalAppData log outside the experiment folder. See the
+[reproduction commands](evaluation/README.md#verify-the-integration-with-synthetic-video).
 
 The analytical fixture uses `min_cutoff=derivative_cutoff=5/pi`, `beta=1/(2*pi)`:
 
@@ -386,7 +516,7 @@ calls, and 98 gap reinitializations. It also included explicit resets, varying
 intervals, stationary periods, noise, motion, and reversals. No invalid output,
 crash, or recovery failure occurred.
 
-### Release microbenchmark
+### Historical Release microbenchmark
 
 Machine: Intel Core i7-1255U, AMD64 Windows; MSVC 19.51.36260.0; Release `/O2`.
 Each workload uses 10,000 warm-up calls followed by 100 batches of 10,000 measured
@@ -418,20 +548,57 @@ network access during configure/build/test. The independently derived analytical
 test remains mandatory and passes; this external validation is a separately
 documented nonblocking pending item.
 
-## Team-document consistency and integration limits
+## Live verification and open measurements
 
-The teammate hand/gaze documents require numerical X/Y stabilization with State
-preserved separately. This module honors those boundaries. Gaze calibration and
-OS gating remain upstream/downstream responsibilities. The report's broader 3D
-and multithreaded architecture is not evidence of a current Z output or completed
-runtime bridge. Treelite/Pybind11 choices remain outside Engineer 4 ownership.
+The following evidence comes from earlier webcam dry runs of the integrated
+Windows executable at `d455492`, included in development merge `66485b0`.
+It establishes behavior of that earlier base, not validation of the current
+precise-clock recorder integration.
 
-Known upstream issues are preserved: the expected hand model asset is missing;
-the gaze runner omits its required timestamp/RGB preparation; saved classifier
-feature names use 15-frame features while current source uses 10. No collector,
-trainer, model, inference file, asset, setup, dependency, or core source is fixed
-as part of this module. The current gaze collector's feature CSV also does not
-provide the runtime gaze X/Y trajectories needed for real profile tuning.
+| Evidence | Observed result |
+| --- | --- |
+| Independent numerical replay of accepted live observations | Across two traces, 517 accepted hand/gaze updates matched replay to a maximum absolute coordinate difference of approximately `1.11e-16`. |
+| Engineer 5 handoff | In one trace, both accepted channel outputs matched the actual controller input for 100 paired frames (200 channel outputs). The OS ran in logging mode. |
+| Live hand loss and recovery | Three completed intervals showed published loss, a channel reset and direct initialization from the first returning hand point. |
+| Live gaze loss and recovery | The face detector continued to report landmarks during the attempted trial. This case still needs a confirmed missing-face interval and a returning observation. |
 
-No measured user study, real-world profile validation, full-system latency claim,
-or fully integrated cursor-control claim is made.
+Debugger tracepoints altered the processed frame intervals. The prior traces
+verify numerical behavior under their observed timestamps. They contain no
+labeled stationary or controlled movement intervals from which to report live
+jitter reduction or responsiveness. In Bassel's separate 60-second dry run,
+900 processed frames reached the OS submission boundary with zero Python errors.
+That throughput summary contains no paired raw and filtered positions.
+
+A later debugger pilot validated import of 28 real paired hand records at
+approximately 5.36 Hz. Debugger overhead altered cadence, and hand state 1
+(pinch) made that run unsuitable for the Neutral stationary protocol.
+
+### Live recorder results
+
+The following webcam experiments ran outside the debugger with OS logging.
+Hand used `1.2,4,1` and gaze used `0.8,6,1.5`. Stationary trials paired the
+raw DSP input and filtered output from each eligible observation in the fixed
+5–25 s window, using the evaluator's 500 ms wash-in. Each signal's 2D RMS
+jitter is its dispersion about its own mean. Reduction is
+`100 × (1 − filtered RMS / raw RMS)`. This measures steadiness at the DSP
+boundary. Absolute pointing accuracy requires a separate reference.
+
+| Live experiment | Result under its predeclared criteria |
+| --- | --- |
+| Stationary hand | **PASS.** The Neutral open-hand trial measured **4.1626%** RMS jitter reduction. |
+| Stationary gaze | **PASS, Trial 2.** RMS jitter reduction was **21.3619%**. Trial 1 measured **17.3995%** and missed the 18 s coverage requirement with 17.888472 s. |
+| Horizontal SLOW hand | **PASS in both directions, Trial 2.** Trial 1 passed LEFT → RIGHT. Its return was inconclusive because the movement duration fell outside the SLOW category. |
+| Vertical SLOW hand | **PASS in both directions, Trial 1.** The largest added-delay upper bounds were 144.9 ms for crossing and 113.9 ms for settling, within the respective 200 ms and 250 ms limits. |
+| Horizontal FAST hand | **INCONCLUSIVE after four trials.** In Trial 4 both directions exceeded the endpoint Y-alignment limit. The return also had a 224.9 ms gap between fresh detections. All four trials passed independent DSP replay. |
+| Scored horizontal gaze responsiveness | **ON HOLD.** Upstream raw gaze fixation did not meet the stability limits during unscored qualification. Independent DSP replay passed all 1,269 accepted updates in the fixation-only experiment. |
+| Tracking-loss recovery and combined live end-to-end validation | **INCOMPLETE.** Earlier live traces verified three hand recoveries. Confirmed live gaze loss and return, and validation of both channels together through the complete system, remain outstanding. |
+
+Movement delays are measured relative to the upstream observation using actual
+frame timestamps. The results apply to these recorded trials and settings.
+[Evaluation procedure](evaluation/README.md)
+
+The [audio-guided launcher](evaluation/run_cued_responsiveness.py) is specific
+to this Windows hand responsiveness experiment series. Its preflight requires
+the recorder development branch and the verified Debug executable's SHA-256.
+Live recording also requires manual `RECORD` confirmation and `--os log`.
+Use the core executable for the general team demo.

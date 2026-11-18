@@ -1,9 +1,10 @@
+import argparse
 import cv2
 import time
 import math
 import numpy as np
 from sklearn.linear_model import Ridge
-from gaze_intent import GazeIntent, is_valid_output
+from gaze_intent import GazeIntent, is_valid_output, angle_to_norm_coord
 
 STATE_LABELS = {
     -1: ("INITIALIZING...", (0, 165, 255)),
@@ -32,18 +33,53 @@ def get_face_area(landmarks, frame_w, frame_h) -> float:
     return (max(x_coords) - min(x_coords)) * (max(y_coords) - min(y_coords))
 
 
-def main():
-    tracker = GazeIntent()
-    cap = cv2.VideoCapture(0)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Live Gaze & Intent Visualizer and Diagnostic Telemetry Runner")
+    parser.add_argument(
+        "--diag-log",
+        type=str,
+        default=None,
+        help="Optional CSV file path to record per-frame GazeDiagnosticPayload telemetry (zero overhead if omitted)."
+    )
+    parser.add_argument(
+        "--skip-calib",
+        action="store_true",
+        help="Skip the 9-point UI screen-mapping calibration and immediately track after the 30-frame EAR baseline."
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=0.0,
+        help="Optional duration in seconds (after EAR baseline completes) to auto-stop the run (0 = run until 'q')."
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=0,
+        help="Webcam device index (default: 0)."
+    )
+    return parser.parse_args()
 
-    print("Starting 9-Point Calibration... Follow the dots.")
+
+def main():
+    args = parse_args()
+    tracker = GazeIntent(diag_log_path=args.diag_log)
+    cap = cv2.VideoCapture(args.camera)
+
+    if args.diag_log:
+        print(f"[DIAG-LOG] Recording per-frame gaze telemetry to: {args.diag_log}")
+    if args.skip_calib:
+        print("Skipping 9-Point UI Calibration (--skip-calib). Look straight ahead for 30-frame EAR baseline...")
+    else:
+        print("Starting 9-Point Calibration... Follow the dots.")
     start_time = time.time()
 
     # 9-point calibration setup
-    calib_active = True
+    calib_active = not args.skip_calib
     calib_step = 0
     calib_duration = 3.0  # seconds per dot
     step_timer = time.time()
+    post_baseline_start = None
 
     # Data collection containers
     current_dot_samples = []
@@ -69,7 +105,8 @@ def main():
 
     while cap.isOpened():
         success, frame = cap.read()
-        if not success: break
+        if not success:
+            break
 
         frame = cv2.flip(frame, 1)
         raw_h, raw_w, _ = frame.shape
@@ -79,6 +116,9 @@ def main():
         # 1. RUN TRACKER ON RAW FRAME (Outputs raw Absolute Gaze; NaN angles when invalid)
         raw_yaw, raw_pitch, head_yaw, head_pitch, state, landmarks = tracker.process_frame(rgb_frame, timestamp_ms)
         state_text, state_color = STATE_LABELS.get(state, (f"STATE: {state}", (0, 255, 0)))
+
+        if state >= 0 and post_baseline_start is None:
+            post_baseline_start = time.time()
 
         # Apply EMA smoothing locally for the visualizer only when gaze is valid.
         # NaN must never reach the EMA: a single NaN would poison the smoothed value permanently.
@@ -201,16 +241,21 @@ def main():
                     calib_active = False
         else:
             if smooth_yaw is not None and smooth_pitch is not None:
-                feat = build_poly_features(smooth_yaw, smooth_pitch).reshape(1, -1)
-                raw_cx, raw_cy = float(reg_x.predict(feat)[0]), float(reg_y.predict(feat)[0])
+                if reg_x is not None and reg_y is not None:
+                    feat = build_poly_features(smooth_yaw, smooth_pitch).reshape(1, -1)
+                    raw_cx, raw_cy = float(reg_x.predict(feat)[0]), float(reg_y.predict(feat)[0])
 
-                current_area = get_face_area(landmarks, raw_w, raw_h)
-                raw_multiplier = float(np.sqrt(baseline_face_area / current_area)) if current_area > 0 else 1.0
-                multiplier = min(raw_multiplier, 2.0)
+                    current_area = get_face_area(landmarks, raw_w, raw_h)
+                    raw_multiplier = float(np.sqrt(baseline_face_area / current_area)) if current_area > 0 else 1.0
+                    multiplier = min(raw_multiplier, 2.0)
 
-                mid_x, mid_y = CROP_SIZE // 2, CROP_SIZE // 2
-                scaled_cx = mid_x + ((raw_cx - mid_x) * multiplier)
-                scaled_cy = mid_y + ((raw_cy - mid_y) * multiplier)
+                    mid_x, mid_y = CROP_SIZE // 2, CROP_SIZE // 2
+                    scaled_cx = mid_x + ((raw_cx - mid_x) * multiplier)
+                    scaled_cy = mid_y + ((raw_cy - mid_y) * multiplier)
+                else:
+                    # Direct normalized mapping matching GazeNative::setPointer when --skip-calib is used
+                    scaled_cx = angle_to_norm_coord(smooth_yaw) * CROP_SIZE
+                    scaled_cy = angle_to_norm_coord(smooth_pitch) * CROP_SIZE
 
                 if cursor_smooth_x is None:
                     cursor_smooth_x, cursor_smooth_y = scaled_cx, scaled_cy
@@ -244,7 +289,12 @@ def main():
             draw_hud_text(cropped_frame, f"STATE: {state_text}", (20, 70), 0.85, state_color, 2)
 
         cv2.imshow('Gaze Intent Test', cropped_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        if args.duration > 0.0 and post_baseline_start is not None:
+            if (time.time() - post_baseline_start) >= args.duration:
+                print(f"[DIAG-LOG] Reached requested duration ({args.duration:.1f}s post-baseline). Stopping...")
+                break
 
     cap.release()
     cv2.destroyAllWindows()

@@ -5,11 +5,72 @@ on:
     branches: [ "master", "first-full-working-demo" ]
   pull_request:
     branches: [ "master", "first-full-working-demo" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build Pipeline & Parity Checks
+  python-fast-checks:
+    name: Python Suites & Asset Checks (Eng 2, 3, 4)
     runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python Dependencies & Pybind11
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pybind11
+
+      - name: Bytecode Compilation Check (All Python Modules)
+        run: |
+          python -m compileall -q ai_pipeline core_engine/tests core_engine/tools dsp_filter/evaluation
+
+      - name: Verify Required Model Assets & Non-Zero Sizes
+        shell: pwsh
+        run: |
+          $required = @(
+            "assets/face_landmarker.task",
+            "assets/hand_landmarker.task",
+            "assets/hand_gesture_rf.pkl",
+            "ai_pipeline/gaze_intent/models/gesture_model.dll",
+            "ai_pipeline/gaze_intent/models/gaze_pitch.dll",
+            "ai_pipeline/gaze_intent/models/gaze_yaw.dll",
+            "core_engine/generated/hand_forest/parity_cases.csv"
+          )
+          foreach ($p in $required) {
+            if (-not (Test-Path -LiteralPath $p) -or (Get-Item -LiteralPath $p).Length -le 0) {
+              throw "Missing or empty required model/asset file: $p"
+            }
+          }
+          Write-Host "All required model assets verified."
+
+      - name: Engineer 2 — Hand Kinematics Index Tracker Unit Tests
+        run: |
+          python ai_pipeline/hand_kinematics/tests/check_index_tracker.py
+
+      - name: Engineer 4 — DSP Evaluation Unit Tests (138 Tests)
+        run: |
+          python -m unittest discover -s dsp_filter/evaluation -p "test_*.py" -v
+
+  cpp-engine-and-e2e:
+    name: C++ Engine, Parity & E2E Pipeline (Eng 1-5)
+    runs-on: windows-latest
+    timeout-minutes: 35
 
     steps:
       - name: Checkout Code
@@ -29,32 +90,25 @@ jobs:
           pip install -r requirements.txt
           pip install pybind11
 
-      - name: Syntax & Compilation Check (Gaze Intent)
+      - name: Fix tl2cgen Windows DLL Path Issue
+        shell: pwsh
         run: |
-          python -m py_compile ai_pipeline/gaze_intent/gaze_intent.py
+          $pythonDir = Split-Path (Get-Command python).Source
+          $libBinPath = Join-Path $pythonDir "Library\bin"
+          New-Item -ItemType Directory -Force -Path $libBinPath | Out-Null
 
-      - name: Set up vcpkg Caching
-        uses: actions/github-script@v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg Installed Packages
+      - name: Cache vcpkg Binary Archives
         uses: actions/cache@v5
         with:
-          path: |
-            ${{ env.LOCALAPPDATA }}/vcpkg/archives
-            ${{ github.workspace }}/build/vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-v2-${{ hashFiles('vcpkg.json') }}
+          path: ${{ env.LOCALAPPDATA }}\vcpkg\archives
+          key: ${{ runner.os }}-vcpkg-archives-v1-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            ${{ runner.os }}-vcpkg-v2-
-            ${{ runner.os }}-vcpkg-
+            ${{ runner.os }}-vcpkg-archives-v1-
 
       - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1.13.0
 
-      - name: Configure CMake
+      - name: Configure CMake (with Benchmarks Enabled)
         shell: pwsh
         run: |
           $pythonPath = (Get-Command python).Source
@@ -63,18 +117,54 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET="x64-windows" `
             -DPython3_EXECUTABLE="$pythonPath" `
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release `
+            -DDSP_BUILD_BENCHMARKS=ON `
+            -DOSI_BUILD_BENCHMARKS=ON
 
-      - name: Build Core Engine & DSP Filter
-        run: cmake --build build --config Release --parallel
+      - name: Build Core Engine, Tests & Benchmarks
+        run: cmake --build build --parallel
 
-      - name: Fix tl2cgen Windows DLL Path Issue
+      - name: Run Hand Forest Self-Test (6000 Golden Parity Cases)
         shell: pwsh
         run: |
           $pythonDir = Split-Path (Get-Command python).Source
-          $libBinPath = Join-Path $pythonDir "Library\bin"
-          New-Item -ItemType Directory -Force -Path $libBinPath
+          $env:PATH = "$PWD\build;$PWD\build\vcpkg_installed\x64-windows\bin;$pythonDir;$env:PATH"
+          .\build\core_engine.exe --selftest-hand-forest core_engine/generated/hand_forest/parity_cases.csv
+          if ($LASTEXITCODE -ne 0) { throw "Hand forest self-test failed with exit code $LASTEXITCODE" }
 
-      - name: Execute CTest (Unit, Parity & E2E Tests)
+      - name: Run Real Production AI Bridge & MediaPipe Landmarker Preflight (--check)
+        shell: pwsh
+        run: |
+          $pythonDir = Split-Path (Get-Command python).Source
+          $env:PATH = "$PWD\build;$PWD\build\vcpkg_installed\x64-windows\bin;$pythonDir;$env:PATH"
+          $tmpAvi = Join-Path $env:RUNNER_TEMP "ci_preflight_check.avi"
+          if (-not $env:RUNNER_TEMP) { $tmpAvi = Join-Path $env:TEMP "ci_preflight_check.avi" }
+          python -c "import cv2, numpy as np, sys; vw = cv2.VideoWriter(sys.argv[1], cv2.VideoWriter_fourcc(*'MJPG'), 60, (640, 480)); f = np.zeros((480, 640, 3), dtype=np.uint8); vw.write(f); vw.write(f); vw.release()" $tmpAvi
+          try {
+            .\build\core_engine.exe --check --ai-root "$PWD\ai_pipeline" --gaze-models "$PWD\ai_pipeline\gaze_intent\models" --video $tmpAvi
+            if ($LASTEXITCODE -ne 0) { throw "core_engine --check failed with exit code $LASTEXITCODE" }
+          } finally {
+            Remove-Item -Force $tmpAvi -ErrorAction SilentlyContinue
+          }
+
+      - name: Execute CTest Suite (7/7 Unit, Parity & E2E Tests)
         working-directory: build
-        run: ctest -C Release --output-on-failure
+        run: ctest --output-on-failure --timeout 180
+
+      - name: Execute Engineer 4 DSP Recorder E2E Integration Check
+        shell: pwsh
+        run: |
+          $pythonDir = Split-Path (Get-Command python).Source
+          $env:PATH = "$PWD\build;$PWD\build\vcpkg_installed\x64-windows\bin;$pythonDir;$env:PATH"
+          python dsp_filter/evaluation/check_recorder_pipeline.py --exe build/core_engine.exe
+          if ($LASTEXITCODE -ne 0) { throw "check_recorder_pipeline.py failed with exit code $LASTEXITCODE" }
+
+      - name: Upload CTest & Tray Diagnostics on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-diagnostics
+          if-no-files-found: ignore
+          path: |
+            build/Testing/Temporary/LastTest.log
+            ${{ env.LOCALAPPDATA }}/HandEyeTracker/handeye_tray.log

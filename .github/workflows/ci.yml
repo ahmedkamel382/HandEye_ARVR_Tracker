@@ -19,9 +19,6 @@ jobs:
     name: Python Suites & Asset Checks (Eng 2, 3)
     runs-on: windows-latest
     timeout-minutes: 15
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
 
     steps:
       - name: Checkout Code
@@ -69,10 +66,6 @@ jobs:
     name: C++ Engine & DSP Filter Pipeline (Eng 1, 4)
     runs-on: windows-latest
     timeout-minutes: 35
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}\vcpkg-archives
 
     steps:
       - name: Checkout Code
@@ -94,7 +87,9 @@ jobs:
       - name: Prepare vcpkg Cache Directory & Export Paths
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $vcpkgCache = Join-Path $env:RUNNER_TEMP "vcpkg-archives"
+          New-Item -ItemType Directory -Force -Path $vcpkgCache | Out-Null
+          "VCPKG_DEFAULT_BINARY_CACHE=$vcpkgCache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "LOCALAPPDATA_PATH=$env:LOCALAPPDATA" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Cache vcpkg Binary Archives

@@ -19,9 +19,6 @@ jobs:
     name: Python Suites & Asset Checks (Eng 2, 3, 4)
     runs-on: windows-latest
     timeout-minutes: 15
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
 
     steps:
       - name: Checkout Code
@@ -77,8 +74,10 @@ jobs:
       - name: Engineer 4 — DSP Evaluation Unit Tests (138 Tests)
         shell: pwsh
         run: |
-          $env:TEMP = (Resolve-Path -LiteralPath $env:TEMP).Path
-          $env:TMP = $env:TEMP
+          $baseTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+          $resolvedTemp = (Resolve-Path -LiteralPath $baseTemp).Path
+          $env:TEMP = $resolvedTemp
+          $env:TMP = $resolvedTemp
           python -m unittest discover -s dsp_filter/evaluation -p "test_*.py" -v
           if ($LASTEXITCODE -ne 0) { throw "DSP evaluation unit tests failed with exit code $LASTEXITCODE" }
 
@@ -86,10 +85,6 @@ jobs:
     name: C++ Engine, Parity & E2E Pipeline (Eng 1-5)
     runs-on: windows-latest
     timeout-minutes: 35
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
-      VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}\vcpkg-archives
 
     steps:
       - name: Checkout Code
@@ -115,7 +110,9 @@ jobs:
           $pythonDir = Split-Path (Get-Command python).Source
           $libBinPath = Join-Path $pythonDir "Library\bin"
           New-Item -ItemType Directory -Force -Path $libBinPath | Out-Null
-          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $vcpkgCache = Join-Path $env:RUNNER_TEMP "vcpkg-archives"
+          New-Item -ItemType Directory -Force -Path $vcpkgCache | Out-Null
+          "VCPKG_DEFAULT_BINARY_CACHE=$vcpkgCache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "LOCALAPPDATA_PATH=$env:LOCALAPPDATA" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Cache vcpkg Binary Archives
@@ -202,8 +199,10 @@ jobs:
       - name: Execute Engineer 4 DSP Recorder E2E Integration Check
         shell: pwsh
         run: |
-          $env:TEMP = (Resolve-Path -LiteralPath $env:TEMP).Path
-          $env:TMP = $env:TEMP
+          $baseTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+          $resolvedTemp = (Resolve-Path -LiteralPath $baseTemp).Path
+          $env:TEMP = $resolvedTemp
+          $env:TMP = $resolvedTemp
           $pythonDir = Split-Path (Get-Command python).Source
           $env:PATH = "$PWD\build;$PWD\build\vcpkg_installed\x64-windows\bin;$pythonDir;$env:PATH"
           python dsp_filter/evaluation/check_recorder_pipeline.py --exe build/core_engine.exe

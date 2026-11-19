@@ -262,19 +262,27 @@ const std::vector<Field>& fields() {
             return s.gestures.closure_toggles_pause;
         }));
 
-        for (auto [section, member] :
-             {std::pair{"hand_filter", &Settings::hand_filter},
-              std::pair{"gaze_filter", &Settings::gaze_filter}}) {
+        struct FilterSection {
+            const char* section;
+            decltype(&Settings::hand_filter) member;
+        };
+        const FilterSection filter_sections[] = {
+            {"hand_filter", &Settings::hand_filter},
+            {"gaze_filter", &Settings::gaze_filter},
+        };
+        for (const auto& entry : filter_sections) {
+            const char* section = entry.section;
+            const auto member = entry.member;
             f.push_back(double_field(section, "min_cutoff_hz",
-                                     [member = member](Settings& s) -> double& {
+                                     [member](Settings& s) -> double& {
                                          return (s.*member).min_cutoff_hz;
                                      }, 0.0, 1000.0, true));
             f.push_back(double_field(section, "beta",
-                                     [member = member](Settings& s) -> double& {
+                                     [member](Settings& s) -> double& {
                                          return (s.*member).beta;
                                      }, 0.0, 1000.0));
             f.push_back(double_field(section, "derivative_cutoff_hz",
-                                     [member = member](Settings& s) -> double& {
+                                     [member](Settings& s) -> double& {
                                          return (s.*member).derivative_cutoff_hz;
                                      }, 0.0, 1000.0, true));
         }

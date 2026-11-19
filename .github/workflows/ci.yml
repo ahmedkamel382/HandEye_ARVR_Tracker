@@ -92,14 +92,14 @@ jobs:
           "VCPKG_DEFAULT_BINARY_CACHE=$vcpkgCache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "LOCALAPPDATA_PATH=$env:LOCALAPPDATA" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Cache vcpkg Binary Archives
-        uses: actions/cache@v5
+      - name: Restore vcpkg Binary Archives
+        id: vcpkg-cache
+        uses: actions/cache/restore@v5
         with:
           path: ${{ runner.temp }}\vcpkg-archives
           key: ${{ runner.os }}-vcpkg-rel-v1-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
             ${{ runner.os }}-vcpkg-rel-v1-
-          save-always: true
 
       - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1.13.0
@@ -141,6 +141,13 @@ jobs:
             }
           }
           if (-not $configured) { throw "CMake configure failed after 3 attempts" }
+
+      - name: Save vcpkg Binary Archives
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}\vcpkg-archives
+          key: ${{ runner.os }}-vcpkg-rel-v1-${{ hashFiles('vcpkg.json') }}
 
       - name: Build Core Engine, DSP Filter & Benchmarks
         run: cmake --build build --parallel

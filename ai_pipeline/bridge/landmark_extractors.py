@@ -27,8 +27,13 @@ Environment:
     AI_PIPELINE_ROOT   same meaning as in gaze_intent.py / hand_tracker.py (default: the folder above this one)
     HAND_RUNNING_MODE  VIDEO (default, what hand_tracker.py uses: MediaPipe tracks the hand between frames)
                        or IMAGE (palm detection on every frame; use it together with --hand-roi)
+    HAND_LANDMARK_DIAG 1/true/yes/on: write one scalar CSV line per processed hand frame (default: off).
+                       This is observation only: it does not change the returned array or the tracking path.
+    HAND_LANDMARK_DIAG_FILE  optional CSV path (default: hand_landmark_diag_<pid>.csv in the current folder)
 """
+import csv
 import os
+import sys
 
 import mediapipe as mp
 import numpy as np
@@ -55,6 +60,139 @@ def _to_array(landmarks) -> np.ndarray:
         out[i, 1] = lm.y
         out[i, 2] = lm.z
     return out
+
+
+# One row per processed hand frame. ts_ms is the same integer the engine passes to
+# process_frame (TrackingResult::ts_ms / "observation_ms" in the E4DSP trace), so the
+# diagnostic joins the trial log exactly. "seq" is a per-extractor counter, not frame_id.
+_DIAG_FIELDS = (
+    "seq", "ts_ms", "mode", "img_n", "world_n", "n", "reason",
+    "min_x", "max_x", "min_y", "max_y", "edge_l", "edge_r", "edge_t", "edge_b",
+)
+
+
+def _diag_enabled() -> bool:
+    return os.environ.get("HAND_LANDMARK_DIAG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _describe_hand(result, seq: int, ts_ms: int, mode: str) -> dict:
+    """Classify one MediaPipe hand result for the diagnostic log.
+
+    Mirrors the exact branch used by process_frame: the outer lists decide whether a
+    result is empty; the inner counts are recorded so a short list is visible as
+    MALFORMED instead of being silently packed. No value is changed here.
+    """
+    groups_img = getattr(result, "hand_landmarks", None) or []
+    groups_world = getattr(result, "hand_world_landmarks", None) or []
+    img_present = bool(groups_img)
+    world_present = bool(groups_world)
+    img_n = len(groups_img[0]) if img_present else 0
+    world_n = len(groups_world[0]) if world_present else 0
+
+    if not img_present and not world_present:
+        reason = "BOTH_EMPTY"
+    elif img_present and not world_present:
+        reason = "IMAGE_ONLY"
+    elif not img_present and world_present:
+        reason = "WORLD_ONLY"
+    elif img_n != 21 or world_n != 21:
+        reason = "MALFORMED"
+    else:
+        reason = "OK"
+
+    info = {
+        "seq": seq,
+        "ts_ms": ts_ms,
+        "mode": mode,
+        "img_n": img_n,
+        "world_n": world_n,
+        "n": 0 if reason in ("BOTH_EMPTY", "IMAGE_ONLY", "WORLD_ONLY") else img_n + world_n,
+        "reason": reason,
+        "min_x": "", "max_x": "", "min_y": "", "max_y": "",
+        "edge_l": "", "edge_r": "", "edge_t": "", "edge_b": "",
+    }
+    if img_n:
+        try:
+            xs = [float(p.x) for p in groups_img[0]]
+            ys = [float(p.y) for p in groups_img[0]]
+        except Exception:
+            xs, ys = [], []
+        if xs and ys:
+            info.update(
+                min_x=round(min(xs), 6),
+                max_x=round(max(xs), 6),
+                min_y=round(min(ys), 6),
+                max_y=round(max(ys), 6),
+                edge_l=round(min(xs), 6),
+                edge_r=round(1.0 - max(xs), 6),
+                edge_t=round(min(ys), 6),
+                edge_b=round(1.0 - max(ys), 6),
+            )
+    return info
+
+
+class _HandDiagWriter:
+    """One CSV line per processed hand frame. Enabled only by HAND_LANDMARK_DIAG."""
+
+    def __init__(self, path=None):
+        self.path = path or os.environ.get("HAND_LANDMARK_DIAG_FILE") or f"hand_landmark_diag_{os.getpid()}.csv"
+        self._file = None
+        self._writer = None
+        self._failed = False
+        self._rows = 0
+
+    def write(self, info: dict) -> None:
+        if self._failed:
+            return
+        try:
+            if self._file is None:
+                self._file = open(self.path, "w", newline="", encoding="utf-8")
+                self._writer = csv.DictWriter(self._file, fieldnames=_DIAG_FIELDS)
+                self._writer.writeheader()
+                try:
+                    print(f"[hand-diag] writing {self.path}", file=sys.stderr)
+                except Exception:
+                    pass
+            self._writer.writerow(info)
+            self._rows += 1
+            # Flush in batches, not on every frame: an fsync per row is visible
+            # in the inference timing. shutdown() always flushes the remainder.
+            if self._rows % 64 == 0:
+                self._file.flush()
+        except Exception as exc:
+            self._failed = True
+            try:
+                print(f"[hand-diag] disabled after write error: {exc}", file=sys.stderr)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._file is not None:
+            try:
+                self._file.flush()
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+            self._writer = None
+
+
+def _pack_hand(result, diag=None, seq: int = 0, ts_ms: int = 0, mode: str = "") -> np.ndarray:
+    """Pack image + world landmarks exactly as before; optionally log the decision.
+
+    The diagnostic is called before the early return so the image/world split is
+    visible even when the packed result is empty. A logging failure must never
+    change the tracking path.
+    """
+    if diag is not None:
+        try:
+            diag.write(_describe_hand(result, seq, ts_ms, mode))
+        except Exception:
+            pass
+    # hand_tracker.py: "no hand" = no world landmarks OR no image landmarks
+    if not result.hand_landmarks or not result.hand_world_landmarks:
+        return _EMPTY
+    return np.concatenate([_to_array(result.hand_landmarks[0]), _to_array(result.hand_world_landmarks[0])])
 
 
 class FaceLandmarkExtractor:
@@ -103,6 +241,8 @@ class HandLandmarkExtractor:
         if mode_name not in ("IMAGE", "VIDEO"):
             raise ValueError("HAND_RUNNING_MODE must be IMAGE or VIDEO")
         self._video = mode_name == "VIDEO"
+        self._frame = 0
+        self._diag = None
         options = vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=_asset_path("hand_landmarker.task")),
             running_mode=vision.RunningMode.VIDEO if self._video else vision.RunningMode.IMAGE,
@@ -112,6 +252,8 @@ class HandLandmarkExtractor:
             min_tracking_confidence=0.3,
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
+        if _diag_enabled():
+            self._diag = _HandDiagWriter()
 
     def process_frame(self, rgb: np.ndarray, timestamp_ms: int) -> np.ndarray:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -119,12 +261,14 @@ class HandLandmarkExtractor:
             result = self.detector.detect_for_video(mp_image, int(timestamp_ms))
         else:
             result = self.detector.detect(mp_image)
-        # hand_tracker.py: "no hand" = no world landmarks OR no image landmarks
-        if not result.hand_landmarks or not result.hand_world_landmarks:
-            return _EMPTY
-        return np.concatenate([_to_array(result.hand_landmarks[0]), _to_array(result.hand_world_landmarks[0])])
+        self._frame += 1
+        return _pack_hand(result, self._diag, self._frame, int(timestamp_ms),
+                          "VIDEO" if self._video else "IMAGE")
 
     def shutdown(self):
+        if getattr(self, "_diag", None) is not None:
+            self._diag.close()
+            self._diag = None
         if getattr(self, "detector", None) is not None:
             self.detector.close()
             self.detector = None

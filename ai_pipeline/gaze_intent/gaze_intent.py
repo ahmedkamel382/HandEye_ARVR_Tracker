@@ -44,11 +44,15 @@ INVALID_ANGLE = float("nan")
 class GazeDiagnosticPayload:
     """
     Opt-in per-frame diagnostic telemetry row (--diag-log <csv_path>).
-    Captures the 5-D regressor features, bilateral iris ratios, raw eye-corner/iris landmarks
-    (33, 133, 468 left and 362, 263, 473 right), relative/head/absolute angles, and normalized X/Y.
+    Unified 32-column schema matching C++ GazeDiagRow / kGazeDiagCsvHeader 1:1.
+    Captures timing/validity (frame_id, ts_ms, capture_s, detected, state), the 5-D regressor
+    features, bilateral iris ratios, relative/head/absolute angles, normalized X/Y, and the 12 raw
+    normalized 2D MediaPipe eye-corner/iris landmark coordinates (33, 133, 468, 362, 263, 473).
     """
     frame_id: int
-    timestamp_ms: int
+    ts_ms: int
+    capture_s: float
+    detected: int
     state: int
     left_iris_x: float
     right_iris_x: float
@@ -307,7 +311,14 @@ class GazeIntent:
 
     def _write_diag_row(self, payload: GazeDiagnosticPayload) -> None:
         if self._diag_writer is not None:
-            self._diag_writer.writerow(tuple(getattr(payload, name) for name in _DIAG_FIELD_NAMES))
+            row = []
+            for name in _DIAG_FIELD_NAMES:
+                val = getattr(payload, name)
+                if name == "capture_s":
+                    row.append("nan" if math.isnan(val) else f"{val:.9f}")
+                else:
+                    row.append(val)
+            self._diag_writer.writerow(row)
 
     def shutdown(self):
         if getattr(self, '_diag_file', None) is not None:
@@ -357,7 +368,8 @@ class GazeIntent:
                     r_y = get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "y")
                     hp, hy, hr = get_head_pose_angles(pose_matrix)
                     self._write_diag_row(GazeDiagnosticPayload(
-                        frame_id=frame_id, timestamp_ms=timestamp_ms, state=-1,
+                        frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                        detected=0, state=-1,
                         left_iris_x=l_x, right_iris_x=r_x, sx=(l_x + r_x) / 2.0,
                         left_iris_y=l_y, right_iris_y=r_y, sy=(l_y + r_y) / 2.0,
                         head_pitch_deg=hp, head_yaw_deg=hy, head_roll_deg=hr,
@@ -403,14 +415,17 @@ class GazeIntent:
             abs_yaw = rel_yaw + head_yaw
 
             if self._diag_writer is not None:
+                nx = angle_to_norm_coord(abs_yaw)
+                ny = angle_to_norm_coord(abs_pitch)
                 self._write_diag_row(GazeDiagnosticPayload(
-                    frame_id=frame_id, timestamp_ms=timestamp_ms, state=state,
+                    frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                    detected=1 if (nx >= 0.0 and ny >= 0.0) else 0, state=state,
                     left_iris_x=l_x, right_iris_x=r_x, sx=student_x,
                     left_iris_y=l_y, right_iris_y=r_y, sy=student_y,
                     head_pitch_deg=head_pitch, head_yaw_deg=head_yaw, head_roll_deg=head_roll,
                     rel_pitch_deg=rel_pitch, rel_yaw_deg=rel_yaw,
                     abs_pitch_deg=abs_pitch, abs_yaw_deg=abs_yaw,
-                    norm_x=angle_to_norm_coord(abs_yaw), norm_y=angle_to_norm_coord(abs_pitch),
+                    norm_x=nx, norm_y=ny,
                     lm33_x=float(landmarks[33].x), lm33_y=float(landmarks[33].y),
                     lm133_x=float(landmarks[133].x), lm133_y=float(landmarks[133].y),
                     lm468_x=float(landmarks[468].x), lm468_y=float(landmarks[468].y),
@@ -425,7 +440,8 @@ class GazeIntent:
         self.ear_state.reset_tracking_state()
         if self._diag_writer is not None:
             self._write_diag_row(GazeDiagnosticPayload(
-                frame_id=frame_id, timestamp_ms=timestamp_ms, state=0,
+                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                detected=0, state=0,
                 left_iris_x=INVALID_ANGLE, right_iris_x=INVALID_ANGLE, sx=INVALID_ANGLE,
                 left_iris_y=INVALID_ANGLE, right_iris_y=INVALID_ANGLE, sy=INVALID_ANGLE,
                 head_pitch_deg=INVALID_ANGLE, head_yaw_deg=INVALID_ANGLE, head_roll_deg=INVALID_ANGLE,

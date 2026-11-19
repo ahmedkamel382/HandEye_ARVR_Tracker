@@ -17,6 +17,18 @@ if(BUILD_TESTING)
     target_link_libraries(dsp_filter_tests PRIVATE dsp_filter)
     add_test(NAME dsp_filter_tests COMMAND dsp_filter_tests)
     list(APPEND dsp_local_targets dsp_filter_tests)
+
+    # These tests exercise the real, dependency-free core adapter and freshness
+    # gate. A standalone DSP checkout without the sibling core still builds its
+    # mathematical library/tests without Python, OpenCV or Windows dependencies.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../core_engine/include/dsp_adapter.hpp")
+        add_executable(dsp_trace_recorder_tests tests/test_trace_recorder.cpp)
+        target_link_libraries(dsp_trace_recorder_tests PRIVATE dsp_filter)
+        target_include_directories(dsp_trace_recorder_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../core_engine/include")
+        target_compile_definitions(dsp_trace_recorder_tests PRIVATE CORE_HAVE_DSP_FILTER=1)
+        add_test(NAME dsp_trace_recorder_tests COMMAND dsp_trace_recorder_tests)
+        list(APPEND dsp_local_targets dsp_trace_recorder_tests)
+    endif()
 endif()
 
 option(DSP_BUILD_BENCHMARKS "Build the independent DSP microbenchmark" OFF)
@@ -28,6 +40,18 @@ if(DSP_BUILD_BENCHMARKS)
         DSP_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
         DSP_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}")
     list(APPEND dsp_local_targets dsp_filter_benchmark)
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../core_engine/include/dsp_adapter.hpp")
+        add_executable(dsp_trace_recorder_benchmark tests/benchmark_trace_recorder.cpp)
+        target_link_libraries(dsp_trace_recorder_benchmark PRIVATE dsp_filter)
+        target_include_directories(dsp_trace_recorder_benchmark PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../core_engine/include")
+        target_compile_definitions(dsp_trace_recorder_benchmark PRIVATE
+            CORE_HAVE_DSP_FILTER=1
+            DSP_BUILD_CONFIGURATION="$<CONFIG>"
+            DSP_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+            DSP_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}")
+        list(APPEND dsp_local_targets dsp_trace_recorder_benchmark)
+    endif()
 endif()
 
 # Apply warnings only to Engineer 4 targets, never to teammate targets.

@@ -44,6 +44,10 @@ struct OsBridgeConfig {
     bool use_filter   = true;    // --no-filter
     bool use_dsp      = true;    // Eng 4's filter when compiled in; false = built-in 1-Euro (--filter builtin)
     std::vector<double> hand_filter, gaze_filter;   // optional "min_cutoff,beta,d_cutoff" overrides of the saved settings
+#ifdef CORE_HAVE_DSP_FILTER
+    dsp::recording::Recorder* recorder = nullptr;   // optional, main-thread owned; outlives this bridge
+    Clock::time_point recording_epoch{};           // existing pipeline start, not a new clock
+#endif
 };
 
 #ifdef CORE_HAVE_OS_INTEGRATION
@@ -52,6 +56,11 @@ class OsBridge {
 public:
     // Throws std::runtime_error if another instance is already running (two would fight over the cursor).
     explicit OsBridge(const OsBridgeConfig& cfg) : cfg_(cfg) {
+#ifdef CORE_HAVE_DSP_FILTER
+        if (cfg_.recorder && (cfg_.real_mouse || !cfg_.use_filter || !cfg_.use_dsp)) {
+            throw std::invalid_argument("DSP recording requires the DSP filter and dry-run OS mode");
+        }
+#endif
         single_ = CreateMutexW(nullptr, TRUE, L"Local\\HandEyeTrackerTray");
         if (single_ == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
             if (single_) CloseHandle(single_);
@@ -90,6 +99,12 @@ public:
 
     // One call per new TrackingResult, from the main loop thread.
     void update(const TrackingResult& r) {
+#ifdef CORE_HAVE_DSP_FILTER
+        if (cfg_.recorder) {
+            hand_observation_ = {};
+            gaze_observation_ = {};             // Held/Lost/calibration cannot reuse a previous DSP call
+        }
+#endif
         applyPendingFilters();
         // The DSP / OS time base is the exact capture time; ts_ms (integer, forced strictly increasing for MediaPipe) is
         // only the fallback for a result that does not carry it.
@@ -100,6 +115,9 @@ public:
         convert(r.gaze, gaze_gate_, *gaze_flt_, f.gaze, t);
         tray_->submit_frame(f);
         ++sent_;
+#ifdef CORE_HAVE_DSP_FILTER
+        if (cfg_.recorder) recordFrame(r, f, t);
+#endif
     }
 
     // True once the user chose Exit in the tray menu (or the tray failed to start): the engine should stop.
@@ -137,6 +155,19 @@ private:
         hand_flt_ = std::move(nh); gaze_flt_ = std::move(ng);
         hand_gate_.reset();          // new filter objects: their history and the cached points of the old ones are gone
         gaze_gate_.reset();
+#ifdef CORE_HAVE_DSP_FILTER
+        if (cfg_.recorder) {
+            // Recording is accepted only with actual DspFilterAdapter instances.
+            static_cast<DspFilterAdapter*>(hand_flt_.get())->observe(&hand_observation_);
+            static_cast<DspFilterAdapter*>(gaze_flt_.get())->observe(&gaze_observation_);
+            if (filter_generation_ == 0) {
+                const auto& selected = cfg_.recorder->channel() == dsp::recording::Channel::Hand ? h : g;
+                cfg_.recorder->set_initial_parameters(
+                    {selected.min_cutoff_hz, selected.beta, selected.derivative_cutoff_hz});
+            }
+            ++filter_generation_;              // a changed configuration makes the measurement incomplete
+        }
+#endif
         char buf[200];
 #ifdef CORE_HAVE_DSP_FILTER
         const char* kind = cfg_.use_dsp ? "dsp_filter (Eng 4)" : "built-in 1-Euro";
@@ -170,12 +201,46 @@ private:
         }
     }
 
+#ifdef CORE_HAVE_DSP_FILTER
+    // One complete numerical copy after the actual submission. No clock query, allocation or I/O.
+    void recordFrame(const TrackingResult& r, const osi::FramePayload& f, double t) noexcept {
+        const bool hand = cfg_.recorder->channel() == dsp::recording::Channel::Hand;
+        const auto& source = hand ? r.hand : r.gaze;
+        const auto& published = hand ? f.hand : f.gaze;
+        dsp::recording::FrameRecord record;
+        record.frame_id = r.frame_id;
+        record.mediapipe_ms = r.ts_ms;
+        record.capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            r.captured_at - cfg_.recording_epoch).count();
+        record.dsp_seconds = t;
+        record.detector_count = hand ? r.hand_landmarks : r.gaze_landmarks;
+        record.ok = source.ok;
+        record.tracker_x = source.x; record.tracker_y = source.y;
+        record.state = source.state;
+        record.tracking = source.tracking_state ? static_cast<int>(*source.tracking_state) : -1;
+        record.missed = source.missed_frames;
+        record.dsp = hand ? hand_observation_ : gaze_observation_;
+        record.published = published.point.has_value();
+        if (published.point) {
+            record.published_x = published.point->x;
+            record.published_y = published.point->y;
+        }
+        record.published_tracking = static_cast<int>(published.tracking);
+        record.generation = filter_generation_;
+        cfg_.recorder->append(record);
+    }
+#endif
+
     OsBridgeConfig cfg_;
     HANDLE single_ = nullptr;
     std::unique_ptr<osi::app::TrayApp> tray_;
     std::thread ui_;
     std::atomic<bool> ui_done_{false};
 
+#ifdef CORE_HAVE_DSP_FILTER
+    dsp::recording::Observation hand_observation_, gaze_observation_;
+    uint64_t filter_generation_ = 0;
+#endif
     std::unique_ptr<IPointFilter> hand_flt_, gaze_flt_;
     FreshnessGate hand_gate_, gaze_gate_;
     std::string filter_desc_;

@@ -133,6 +133,7 @@ struct Config {
     bool        use_filter = true;          // --no-filter
     std::string filter  = "auto";           // auto | dsp (Eng 4) | builtin
     std::vector<double> hand_filter, gaze_filter;   // optional "min_cutoff,beta,d_cutoff" overrides (Hz, -, Hz)
+    std::string gaze_diag_log;                      // optional per-frame gaze diagnostic CSV (--gaze-diag-log FILE.csv)
     std::string dsp_record_dir;             // opt-in numerical diagnostics; empty = no recorder
     core::HandParams   hand;
 };
@@ -401,6 +402,17 @@ void aiBody(Pipeline& P) {
     face_pts.reserve(size_t(core::GazeNative::kPacked) * 3);
     hand_pts.reserve(size_t(core::kHandPacked) * 3);
 
+    std::ofstream gaze_diag_out;
+    if (!cfg.gaze_diag_log.empty()) {
+        gaze_diag_out.open(cfg.gaze_diag_log, std::ios::out | std::ios::trunc);
+        if (!gaze_diag_out.is_open()) {
+            std::fprintf(stderr, "[warning] could not open --gaze-diag-log file: %s\n", cfg.gaze_diag_log.c_str());
+        } else {
+            gaze_diag_out << core::kGazeDiagCsvHeader << '\n';
+        }
+    }
+    const bool log_gaze_diag = gaze_diag_out.is_open();
+
     int64_t last_ts = -1;
     uint64_t err_printed = 0;
     core::Packet pkt;
@@ -434,7 +446,16 @@ void aiBody(Pipeline& P) {
             const auto t_g = Clock::now();
             const int n = face.call(frame, ts, face_pts);
             if (!cfg.dsp_record_dir.empty()) r.gaze_landmarks = n;
-            r.gaze = (n >= 0) ? gaze.process(face_pts.data(), n, fs.width, fs.height) : core::ModuleOut{};
+            if (log_gaze_diag) {
+                core::GazeDiagRow diag_row;
+                r.gaze = (n >= 0) ? gaze.process(face_pts.data(), n, fs.width, fs.height, &diag_row) : core::ModuleOut{};
+                diag_row.frame_id = r.frame_id;
+                diag_row.ts_ms = r.ts_ms;
+                diag_row.capture_s = r.capture_s;
+                gaze_diag_out << core::formatGazeDiagCsvRow(diag_row) << '\n';
+            } else {
+                r.gaze = (n >= 0) ? gaze.process(face_pts.data(), n, fs.width, fs.height) : core::ModuleOut{};
+            }
             r.gaze_ms = usBetween(t_g, Clock::now()) / 1000.0;
         }
         if (cfg.use_hand) {
@@ -490,6 +511,10 @@ void aiBody(Pipeline& P) {
         P.results.enqueue(r);
     }
 
+    if (log_gaze_diag) {
+        gaze_diag_out.flush();
+        gaze_diag_out.close();
+    }
     if (cfg.preview) cv::destroyAllWindows();
     face.shutdown();                                           // releases MediaPipe resources
     hand.shutdown();
@@ -511,6 +536,7 @@ void usage() {
 "loop:     --pool N (frames in flight, default 8) | --process-all | --seconds N | --preview\n"
 "modules:  --no-gaze | --no-hand | --hand-roi N (experimental crop) | --gaze-models DIR (default <ai-root>/gaze_intent/models)\n"
 "          --hand-forest auto|treelite|sklearn | --hand-model FILE.pkl (default assets/hand_gesture_rf.pkl)\n"
+"          --gaze-diag-log FILE.csv (optional per-frame gaze diagnostic CSV; disabled by default)\n"
 "hand:     --hand-anchor tip|knuckle|mid   (pointer source, margins and calibration: tray app / os_integration.ini)\n"
 "filter:   --filter auto|dsp|builtin (auto = Eng 4's dsp_filter when compiled in) | --no-filter\n"
 "          --hand-filter MIN,BETA,DCUT | --gaze-filter MIN,BETA,DCUT   (Hz, -, Hz; tune with real recordings)\n"
@@ -601,6 +627,7 @@ Config parseArgs(int argc, char** argv, bool& ok) {
         else if (a == "--ai-root")        c.ai_root = next();
         else if (a == "--site")           c.site = next();
         else if (a == "--gaze-models")    c.gaze_models = next();
+        else if (a == "--gaze-diag-log")  { c.gaze_diag_log = next(); if (c.gaze_diag_log.empty()) { std::fprintf(stderr, "--gaze-diag-log needs FILE.csv\n"); ok = false; } }
         else if (a == "--selftest-hand-forest") c.selftest_hand = next();
         else if (a == "--hand-forest")    c.hand_forest = next();
         else if (a == "--hand-model")     c.hand_model = next();

@@ -11,12 +11,97 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <deque>
 #include <limits>
+#include <string>
 #include "forest.hpp"
 #include "tracking_types.hpp"
 
 namespace core {
+
+    // Opt-in per-frame diagnostic telemetry payload (--gaze-diag-log <file.csv>).
+    // Unified 32-column schema shared 1:1 between C++ GazeNative and Python GazeIntent.
+    struct GazeDiagRow {
+        uint64_t frame_id = 0;
+        int64_t  ts_ms = 0;
+        double   capture_s = -1.0;
+        int      detected = 0;
+        int      state = 0;
+        double   left_iris_x  = std::numeric_limits<double>::quiet_NaN();
+        double   right_iris_x = std::numeric_limits<double>::quiet_NaN();
+        double   sx           = std::numeric_limits<double>::quiet_NaN();
+        double   left_iris_y  = std::numeric_limits<double>::quiet_NaN();
+        double   right_iris_y = std::numeric_limits<double>::quiet_NaN();
+        double   sy           = std::numeric_limits<double>::quiet_NaN();
+        double   head_pitch_deg = std::numeric_limits<double>::quiet_NaN();
+        double   head_yaw_deg   = std::numeric_limits<double>::quiet_NaN();
+        double   head_roll_deg  = std::numeric_limits<double>::quiet_NaN();
+        double   rel_pitch_deg  = std::numeric_limits<double>::quiet_NaN();
+        double   rel_yaw_deg    = std::numeric_limits<double>::quiet_NaN();
+        double   abs_pitch_deg  = std::numeric_limits<double>::quiet_NaN();
+        double   abs_yaw_deg    = std::numeric_limits<double>::quiet_NaN();
+        double   norm_x = -1.0;
+        double   norm_y = -1.0;
+        double   lm33_x  = std::numeric_limits<double>::quiet_NaN(), lm33_y  = std::numeric_limits<double>::quiet_NaN();
+        double   lm133_x = std::numeric_limits<double>::quiet_NaN(), lm133_y = std::numeric_limits<double>::quiet_NaN();
+        double   lm468_x = std::numeric_limits<double>::quiet_NaN(), lm468_y = std::numeric_limits<double>::quiet_NaN();
+        double   lm362_x = std::numeric_limits<double>::quiet_NaN(), lm362_y = std::numeric_limits<double>::quiet_NaN();
+        double   lm263_x = std::numeric_limits<double>::quiet_NaN(), lm263_y = std::numeric_limits<double>::quiet_NaN();
+        double   lm473_x = std::numeric_limits<double>::quiet_NaN(), lm473_y = std::numeric_limits<double>::quiet_NaN();
+    };
+
+    inline constexpr const char* kGazeDiagCsvHeader =
+        "frame_id,ts_ms,capture_s,detected,state,"
+        "left_iris_x,right_iris_x,sx,left_iris_y,right_iris_y,sy,"
+        "head_pitch_deg,head_yaw_deg,head_roll_deg,"
+        "rel_pitch_deg,rel_yaw_deg,abs_pitch_deg,abs_yaw_deg,"
+        "norm_x,norm_y,"
+        "lm33_x,lm33_y,lm133_x,lm133_y,lm468_x,lm468_y,"
+        "lm362_x,lm362_y,lm263_x,lm263_y,lm473_x,lm473_y";
+
+    inline std::string formatGazeDiagCsvRow(const GazeDiagRow& d) {
+        auto fmtVal = [](char* b, size_t n, double v) -> const char* {
+            if (std::isnan(v)) return "nan";
+            std::snprintf(b, n, "%.9g", v);
+            return b;
+        };
+        char c_cap[32];
+        if (std::isnan(d.capture_s)) std::snprintf(c_cap, sizeof c_cap, "nan");
+        else std::snprintf(c_cap, sizeof c_cap, "%.9f", d.capture_s);
+
+        char b[27][32];
+        const double vals[27] = {
+            d.left_iris_x, d.right_iris_x, d.sx, d.left_iris_y, d.right_iris_y, d.sy,
+            d.head_pitch_deg, d.head_yaw_deg, d.head_roll_deg,
+            d.rel_pitch_deg, d.rel_yaw_deg, d.abs_pitch_deg, d.abs_yaw_deg,
+            d.norm_x, d.norm_y,
+            d.lm33_x, d.lm33_y, d.lm133_x, d.lm133_y, d.lm468_x, d.lm468_y,
+            d.lm362_x, d.lm362_y, d.lm263_x, d.lm263_y, d.lm473_x, d.lm473_y
+        };
+        const char* s[27];
+        for (int i = 0; i < 27; ++i) s[i] = fmtVal(b[i], sizeof b[i], vals[i]);
+
+        char line[1024];
+        std::snprintf(
+            line, sizeof line,
+            "%llu,%lld,%s,%d,%d,"
+            "%s,%s,%s,%s,%s,%s,"
+            "%s,%s,%s,"
+            "%s,%s,%s,%s,"
+            "%s,%s,"
+            "%s,%s,%s,%s,%s,%s,"
+            "%s,%s,%s,%s,%s,%s",
+            (unsigned long long)d.frame_id, (long long)d.ts_ms, c_cap, d.detected, d.state,
+            s[0], s[1], s[2], s[3], s[4], s[5],
+            s[6], s[7], s[8],
+            s[9], s[10], s[11], s[12],
+            s[13], s[14],
+            s[15], s[16], s[17], s[18], s[19], s[20],
+            s[21], s[22], s[23], s[24], s[25], s[26]
+        );
+        return std::string(line);
+    }
 
     class GazeNative {
     public:
@@ -37,13 +122,20 @@ namespace core {
 
         // lm: n x 3 floats = kFacePoints landmarks (normalised to the image) + the packed pose matrix (n == kPacked).
         // n == 0 (or no matrix) means "no face" -> x = y = -1, state 0.
-        ModuleOut process(const float* lm, int n, int W, int H) {
+        ModuleOut process(const float* lm, int n, int W, int H, GazeDiagRow* diag = nullptr) {
             ModuleOut out;
             out.ok = true;
             if (!lm || n < kPacked) {
                 resetTrackingState();                               // EarFeatureState.reset_tracking_state()
                 markInvalid(out);                                   // x = y = -1, all four angles NaN
                 out.state = 0;
+                if (diag) {
+                    *diag = GazeDiagRow{};
+                    diag->detected = 0;
+                    diag->state = 0;
+                    diag->norm_x = -1.0;
+                    diag->norm_y = -1.0;
+                }
                 return out;
             }
             const float* pose = lm + 3 * kFacePoints;
@@ -64,6 +156,29 @@ namespace core {
                 }
                 out.state = -1;                                     // "calibrating": no pointer (x = y = -1) and NaN angles
                 markInvalid(out);
+                if (diag) {
+                    const double l_ix = irisRatio(lm, 33, 133, 468, true);
+                    const double r_ix = irisRatio(lm, 362, 263, 473, true);
+                    const double l_iy = irisRatio(lm, 33, 133, 468, false);
+                    const double r_iy = irisRatio(lm, 362, 263, 473, false);
+                    double hp, hy, hr;
+                    headPose(pose, hp, hy, hr);
+                    *diag = GazeDiagRow{};
+                    diag->detected = 0;
+                    diag->state = -1;
+                    diag->left_iris_x = l_ix;
+                    diag->right_iris_x = r_ix;
+                    diag->sx = 0.5 * (l_ix + r_ix);
+                    diag->left_iris_y = l_iy;
+                    diag->right_iris_y = r_iy;
+                    diag->sy = 0.5 * (l_iy + r_iy);
+                    diag->head_pitch_deg = hp;
+                    diag->head_yaw_deg = hy;
+                    diag->head_roll_deg = hr;
+                    diag->norm_x = -1.0;
+                    diag->norm_y = -1.0;
+                    fillDiagLandmarks(lm, *diag);
+                }
                 return out;
             }
 
@@ -78,8 +193,12 @@ namespace core {
             out.state = wink_ ? wink_->predict(wf) : 0;
 
             // iris position, averaged over both eyes
-            const double sx = 0.5 * (irisRatio(lm, 33, 133, 468, true) + irisRatio(lm, 362, 263, 473, true));
-            const double sy = 0.5 * (irisRatio(lm, 33, 133, 468, false) + irisRatio(lm, 362, 263, 473, false));
+            const double l_ix = irisRatio(lm, 33, 133, 468, true);
+            const double r_ix = irisRatio(lm, 362, 263, 473, true);
+            const double sx = 0.5 * (l_ix + r_ix);
+            const double l_iy = irisRatio(lm, 33, 133, 468, false);
+            const double r_iy = irisRatio(lm, 362, 263, 473, false);
+            const double sy = 0.5 * (l_iy + r_iy);
 
             double head_pitch, head_yaw, head_roll;
             headPose(pose, head_pitch, head_yaw, head_roll);
@@ -95,6 +214,27 @@ namespace core {
             setPointer(out, abs_yaw, abs_pitch);
             out.head_yaw_deg = head_yaw;
             out.head_pitch_deg = head_pitch;
+            if (diag) {
+                *diag = GazeDiagRow{};
+                diag->detected = out.detected() ? 1 : 0;
+                diag->state = out.state;
+                diag->left_iris_x = l_ix;
+                diag->right_iris_x = r_ix;
+                diag->sx = sx;
+                diag->left_iris_y = l_iy;
+                diag->right_iris_y = r_iy;
+                diag->sy = sy;
+                diag->head_pitch_deg = head_pitch;
+                diag->head_yaw_deg = head_yaw;
+                diag->head_roll_deg = head_roll;
+                diag->rel_pitch_deg = rel_pitch;
+                diag->rel_yaw_deg = rel_yaw;
+                diag->abs_pitch_deg = abs_pitch;
+                diag->abs_yaw_deg = abs_yaw;
+                diag->norm_x = double(out.x);
+                diag->norm_y = double(out.y);
+                fillDiagLandmarks(lm, *diag);
+            }
             return out;
         }
 
@@ -132,6 +272,14 @@ namespace core {
             o.x = -1.0f;
             o.y = -1.0f;
             o.yaw_deg = o.pitch_deg = o.head_yaw_deg = o.head_pitch_deg = kNaN;
+        }
+        static void fillDiagLandmarks(const float* lm, GazeDiagRow& d) {
+            d.lm33_x  = double(lm[3 * 33]);  d.lm33_y  = double(lm[3 * 33 + 1]);
+            d.lm133_x = double(lm[3 * 133]); d.lm133_y = double(lm[3 * 133 + 1]);
+            d.lm468_x = double(lm[3 * 468]); d.lm468_y = double(lm[3 * 468 + 1]);
+            d.lm362_x = double(lm[3 * 362]); d.lm362_y = double(lm[3 * 362 + 1]);
+            d.lm263_x = double(lm[3 * 263]); d.lm263_y = double(lm[3 * 263 + 1]);
+            d.lm473_x = double(lm[3 * 473]); d.lm473_y = double(lm[3 * 473 + 1]);
         }
         // EarFeatureState.reset_tracking_state(): face lost -> stale blink history must not leak into the next track;
         // an unfinished calibration restarts. A finished calibration (the baselines) is kept.

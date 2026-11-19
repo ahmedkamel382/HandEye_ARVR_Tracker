@@ -3,9 +3,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -15,6 +19,7 @@
 #include "hand_math.hpp"
 #include "euro_builtin.hpp"
 #include "freshness_gate.hpp"
+#include "tl_model.hpp"
 #include "tracking_types.hpp"
 
 using namespace core;
@@ -406,6 +411,209 @@ static void t_gaze_adds_head_pose_and_outputs_raw() {
     CHECK_NEAR(o.yaw_deg, 20.0, 0.01);                                     // remains exactly rel + head
 }
 
+static bool double_bits_eq(double a, double b) {
+    if (std::isnan(a) && std::isnan(b)) return true;
+    return std::memcmp(&a, &b, sizeof(double)) == 0;
+}
+static bool float_bits_eq(float a, float b) {
+    if (std::isnan(a) && std::isnan(b)) return true;
+    return std::memcmp(&a, &b, sizeof(float)) == 0;
+}
+static bool module_out_bit_eq(const ModuleOut& a, const ModuleOut& b) {
+    return a.ok == b.ok &&
+           a.state == b.state &&
+           a.tracking_state == b.tracking_state &&
+           a.missed_frames == b.missed_frames &&
+           float_bits_eq(a.x, b.x) &&
+           float_bits_eq(a.y, b.y) &&
+           double_bits_eq(a.yaw_deg, b.yaw_deg) &&
+           double_bits_eq(a.pitch_deg, b.pitch_deg) &&
+           double_bits_eq(a.head_yaw_deg, b.head_yaw_deg) &&
+           double_bits_eq(a.head_pitch_deg, b.head_pitch_deg);
+}
+
+static double reconstruct_iris_ratio(double c1x, double c1y, double c2x, double c2y, double ix, double iy, bool x_axis) {
+    const double bx = c2x - c1x, by = c2y - c1y;
+    const double len_sq = bx * bx + by * by;
+    if (len_sq < 1e-12) return x_axis ? 0.5 : 0.0;
+    const double len = std::sqrt(len_sq);
+    const double vx = ix - c1x, vy = iy - c1y;
+    const double scale = (vx * bx + vy * by) / len_sq;
+    if (x_axis) return scale;
+    const double px = vx - scale * bx, py = vy - scale * by;
+    const double d = std::sqrt(px * px + py * py) / len;
+    return py < 0.0 ? -d : d;
+}
+
+static std::vector<std::string> split_csv(const std::string& line) {
+    std::vector<std::string> cols;
+    std::stringstream ss(line);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) cols.push_back(tok);
+    return cols;
+}
+
+static double parse_csv_num(const std::string& s) {
+    if (s == "nan" || s == "NaN" || s == "NAN") return std::numeric_limits<double>::quiet_NaN();
+    return std::strtod(s.c_str(), nullptr);
+}
+
+// Engineer 4 Requirement #9:
+//   (a) Bit-identical ModuleOut predictions across 100 frames (calibration, tracking, face loss, reacquisition)
+//       when diagnostic logging is OFF (diag = nullptr) vs ON (diag = &row).
+//   (b) Exact 32-column CSV formatting (capture_s formatted to 9 decimal places) and offline reconstruction
+//       of all 12 derived columns from the 12 logged landmarks + head pose + 6354a14 models within <= 1e-6.
+static void t_gaze_diag_off_vs_on_and_csv_reconstruction() {
+    std::unique_ptr<IForest> wink_owned;
+    std::unique_ptr<IRegressor> pitch_owned, yaw_owned;
+    bool using_real_dlls = false;
+
+#ifdef _WIN32
+    const char* candidates[] = {
+        "ai_pipeline/gaze_intent/models",
+        "../ai_pipeline/gaze_intent/models",
+        "../../ai_pipeline/gaze_intent/models",
+        "../../../ai_pipeline/gaze_intent/models",
+        "../../../../ai_pipeline/gaze_intent/models"
+    };
+    for (const char* dir : candidates) {
+        const std::string p_wink = std::string(dir) + "/gesture_model.dll";
+        if (std::ifstream(p_wink).good()) {
+            wink_owned.reset(new TlForest(p_wink));
+            pitch_owned.reset(new TlRegressor(std::string(dir) + "/gaze_pitch.dll"));
+            yaw_owned.reset(new TlRegressor(std::string(dir) + "/gaze_yaw.dll"));
+            using_real_dlls = true;
+            break;
+        }
+    }
+#endif
+    if (!using_real_dlls) {
+        wink_owned.reset(new LambdaForest([](const float* f) { return (f[0] < 0.5f && f[3] > 0.7f) ? 1 : 0; }));
+        pitch_owned.reset(new LambdaRegressor([](const float* f) { return -15.0 * double(f[1]) - 0.35 * double(f[2]); }));
+        yaw_owned.reset(new LambdaRegressor([](const float* f) { return 40.0 * (double(f[0]) - 0.5) - 0.50 * double(f[3]); }));
+    }
+
+    GazeNative g_off(wink_owned.get(), pitch_owned.get(), yaw_owned.get());
+    GazeNative g_on(wink_owned.get(), pitch_owned.get(), yaw_owned.get());
+
+    const auto hdr_cols = split_csv(kGazeDiagCsvHeader);
+    CHECK(hdr_cols.size() == 32);
+    CHECK(hdr_cols[0] == "frame_id" && hdr_cols[1] == "ts_ms" && hdr_cols[2] == "capture_s" &&
+          hdr_cols[3] == "detected" && hdr_cols[4] == "state" && hdr_cols[18] == "norm_x" &&
+          hdr_cols[19] == "norm_y" && hdr_cols[31] == "lm473_y");
+
+    int bit_mismatches = 0;
+    double max_err[12] = {}; // l_ix, r_ix, sx, l_iy, r_iy, sy, rel_p, rel_y, abs_p, abs_y, nx, ny
+
+    for (int i = 0; i < 100; ++i) {
+        const bool is_loss = (i >= 80 && i < 90);
+        const double l_ear = (i == 55 || i == 56) ? 0.08 : 0.30;
+        const double r_ear = 0.30;
+        FacePts fp(l_ear, r_ear);
+
+        // Sweep iris position and head pose across frames
+        const double dx = 6.0 * std::sin(i * 0.13);
+        const double dy = 3.0 * std::cos(i * 0.17);
+        fp.set(468, (232.0 + dx) / FacePts::W, (200.0 + dy) / FacePts::H);
+        fp.set(473, (412.0 + dx) / FacePts::W, (200.0 + dy) / FacePts::H);
+
+        constexpr double D = 3.14159265358979323846 / 180.0;
+        const double yaw_rad = (8.0 * std::sin(i * 0.09)) * D;
+        const float cy = float(std::cos(yaw_rad)), sy_m = float(std::sin(yaw_rad));
+        const float pose[16] = { cy, 0, sy_m, 0,  0, 1, 0, 0,  -sy_m, 0, cy, 0,  0, 0, 0, 1 };
+        fp.setPose(pose);
+
+        GazeDiagRow row;
+        ModuleOut out_off = is_loss
+            ? g_off.process(nullptr, 0, FacePts::W, FacePts::H)
+            : g_off.process(fp.p.data(), fp.count(), FacePts::W, FacePts::H);
+        ModuleOut out_on = is_loss
+            ? g_on.process(nullptr, 0, FacePts::W, FacePts::H, &row)
+            : g_on.process(fp.p.data(), fp.count(), FacePts::W, FacePts::H, &row);
+
+        if (!module_out_bit_eq(out_off, out_on)) ++bit_mismatches;
+
+        row.frame_id = uint64_t(i);
+        row.ts_ms = int64_t(i * 16 + (i / 3));
+        row.capture_s = double(i) * 0.016666667 + 0.000123456;
+
+        const std::string csv_line = formatGazeDiagCsvRow(row);
+        const auto c = split_csv(csv_line);
+        CHECK(c.size() == 32);
+
+        // Verify capture_s has exact 9 decimal digits after '.'
+        const size_t dot = c[2].find('.');
+        CHECK(dot != std::string::npos && (c[2].size() - dot - 1) == 9);
+
+        if (is_loss) {
+            CHECK(c[3] == "0" && c[4] == "0");
+            CHECK(c[18] == "-1" && c[19] == "-1");
+            CHECK(std::isnan(parse_csv_num(c[5])) && std::isnan(parse_csv_num(c[14])) && std::isnan(parse_csv_num(c[20])));
+        } else if (i < 30) {
+            // Calibration frames 0..29
+            CHECK(c[3] == "0" && c[4] == "-1");
+            CHECK(c[18] == "-1" && c[19] == "-1");
+            CHECK(std::isnan(parse_csv_num(c[14])) && std::isnan(parse_csv_num(c[15])) &&
+                  std::isnan(parse_csv_num(c[16])) && std::isnan(parse_csv_num(c[17])));
+        } else {
+            // Active tracked frame: reconstruct all 12 derived columns from the CSV text alone
+            CHECK(c[3] == "1");
+            const double l_ix_csv = parse_csv_num(c[5]);
+            const double r_ix_csv = parse_csv_num(c[6]);
+            const double sx_csv   = parse_csv_num(c[7]);
+            const double l_iy_csv = parse_csv_num(c[8]);
+            const double r_iy_csv = parse_csv_num(c[9]);
+            const double sy_csv   = parse_csv_num(c[10]);
+            const double hp_csv   = parse_csv_num(c[11]);
+            const double hy_csv   = parse_csv_num(c[12]);
+            const double hr_csv   = parse_csv_num(c[13]);
+            const double rp_csv   = parse_csv_num(c[14]);
+            const double ry_csv   = parse_csv_num(c[15]);
+            const double ap_csv   = parse_csv_num(c[16]);
+            const double ay_csv   = parse_csv_num(c[17]);
+            const double nx_csv   = parse_csv_num(c[18]);
+            const double ny_csv   = parse_csv_num(c[19]);
+
+            const double lm33_x  = parse_csv_num(c[20]), lm33_y  = parse_csv_num(c[21]);
+            const double lm133_x = parse_csv_num(c[22]), lm133_y = parse_csv_num(c[23]);
+            const double lm468_x = parse_csv_num(c[24]), lm468_y = parse_csv_num(c[25]);
+            const double lm362_x = parse_csv_num(c[26]), lm362_y = parse_csv_num(c[27]);
+            const double lm263_x = parse_csv_num(c[28]), lm263_y = parse_csv_num(c[29]);
+            const double lm473_x = parse_csv_num(c[30]), lm473_y = parse_csv_num(c[31]);
+
+            const double rec_l_ix = reconstruct_iris_ratio(lm33_x, lm33_y, lm133_x, lm133_y, lm468_x, lm468_y, true);
+            const double rec_r_ix = reconstruct_iris_ratio(lm362_x, lm362_y, lm263_x, lm263_y, lm473_x, lm473_y, true);
+            const double rec_sx   = 0.5 * (rec_l_ix + rec_r_ix);
+            const double rec_l_iy = reconstruct_iris_ratio(lm33_x, lm33_y, lm133_x, lm133_y, lm468_x, lm468_y, false);
+            const double rec_r_iy = reconstruct_iris_ratio(lm362_x, lm362_y, lm263_x, lm263_y, lm473_x, lm473_y, false);
+            const double rec_sy   = 0.5 * (rec_l_iy + rec_r_iy);
+
+            const float gf[kPoseFeatures] = { float(rec_sx), float(rec_sy), float(hp_csv), float(hy_csv), float(hr_csv) };
+            const double rec_rp = pitch_owned->predict(gf);
+            const double rec_ry = yaw_owned->predict(gf);
+            const double rec_ap = rec_rp + hp_csv;
+            const double rec_ay = rec_ry + hy_csv;
+            const double rec_nx = double(float(std::max(0.0, std::min(1.0, 0.5 + rec_ay / GazeNative::kSpanDeg))));
+            const double rec_ny = double(float(std::max(0.0, std::min(1.0, 0.5 + rec_ap / GazeNative::kSpanDeg))));
+
+            const double errs[12] = {
+                std::fabs(l_ix_csv - rec_l_ix), std::fabs(r_ix_csv - rec_r_ix), std::fabs(sx_csv - rec_sx),
+                std::fabs(l_iy_csv - rec_l_iy), std::fabs(r_iy_csv - rec_r_iy), std::fabs(sy_csv - rec_sy),
+                std::fabs(rp_csv - rec_rp),     std::fabs(ry_csv - rec_ry),
+                std::fabs(ap_csv - rec_ap),     std::fabs(ay_csv - rec_ay),
+                std::fabs(nx_csv - rec_nx),     std::fabs(ny_csv - rec_ny)
+            };
+            for (int k = 0; k < 12; ++k) {
+                if (errs[k] > max_err[k]) max_err[k] = errs[k];
+                CHECK(errs[k] <= 1e-6);
+            }
+        }
+    }
+    CHECK(bit_mismatches == 0);
+    std::printf("    diag OFF vs ON: 100 frames, %d bit mismatches (real_dlls=%s)\n",
+                bit_mismatches, using_real_dlls ? "yes" : "no");
+}
+
 // ======================================================================= freshness gate (Core -> DSP)
 // A filter that records every call, so "HELD never updates the DSP" is provable. Output = 0.5 * input + 0.25 (never equal to the raw value).
 struct SpyFilter : IPointFilter {
@@ -668,6 +876,7 @@ int main() {
         { "gaze: ratio follows the iris", t_gaze_ratio_follows_iris },
         { "gaze: head pose angles", t_head_pose_angles },
         { "gaze: head pose added, raw absolute", t_gaze_adds_head_pose_and_outputs_raw },
+        { "gaze: diag OFF vs ON bit-identity + 32-col CSV reconstruction", t_gaze_diag_off_vs_on_and_csv_reconstruction },
     };
     int failed_tests = 0;
     for (const T& t : tests) {

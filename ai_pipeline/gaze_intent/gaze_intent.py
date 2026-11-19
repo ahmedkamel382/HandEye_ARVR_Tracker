@@ -1,7 +1,9 @@
+import csv
 import math
 import os
 import warnings
 from collections import deque
+from dataclasses import dataclass, fields
 from typing import Tuple, Optional, Any
 
 import mediapipe as mp
@@ -29,10 +31,67 @@ EAR_DIST_EPS = 1e-12       # horizontal eye distance below this -> EAR = 0
 CALIB_EAR_EPS = 1e-6       # calibration ignores frames whose raw EAR is not above this
 IRIS_BASELINE_EPS = 1e-12  # squared eye-corner baseline below this -> neutral iris ratio
 
+# --- Pointer span (mirrored in GazeNative::kSpanDeg = 60.0) ---
+SPAN_DEG = 60.0
+
 # --- Output sentinel ---
 # NaN, not -1.0: -1.0 deg is a physically valid gaze/head angle and cannot signal "invalid".
 # Non-finite values are rejected by the downstream DSP stage, so NaN can never seed filter history.
 INVALID_ANGLE = float("nan")
+
+
+@dataclass
+class GazeDiagnosticPayload:
+    """
+    Opt-in per-frame diagnostic telemetry row (--diag-log <csv_path>).
+    Unified 32-column schema matching C++ GazeDiagRow / kGazeDiagCsvHeader 1:1.
+    Captures timing/validity (frame_id, ts_ms, capture_s, detected, state), the 5-D regressor
+    features, bilateral iris ratios, relative/head/absolute angles, normalized X/Y, and the 12 raw
+    normalized 2D MediaPipe eye-corner/iris landmark coordinates (33, 133, 468, 362, 263, 473).
+    """
+    frame_id: int
+    ts_ms: int
+    capture_s: float
+    detected: int
+    state: int
+    left_iris_x: float
+    right_iris_x: float
+    sx: float
+    left_iris_y: float
+    right_iris_y: float
+    sy: float
+    head_pitch_deg: float
+    head_yaw_deg: float
+    head_roll_deg: float
+    rel_pitch_deg: float
+    rel_yaw_deg: float
+    abs_pitch_deg: float
+    abs_yaw_deg: float
+    norm_x: float
+    norm_y: float
+    # Raw normalized 2D MediaPipe landmark coordinates used to compute left_iris_x/y and right_iris_x/y
+    lm33_x: float
+    lm33_y: float
+    lm133_x: float
+    lm133_y: float
+    lm468_x: float
+    lm468_y: float
+    lm362_x: float
+    lm362_y: float
+    lm263_x: float
+    lm263_y: float
+    lm473_x: float
+    lm473_y: float
+
+
+_DIAG_FIELD_NAMES = tuple(f.name for f in fields(GazeDiagnosticPayload))
+
+
+def angle_to_norm_coord(angle_deg: float) -> float:
+    """Mirrors GazeNative::setPointer: clamp01(0.5 + angle_deg / 60.0), or -1.0 when non-finite."""
+    if not math.isfinite(angle_deg):
+        return -1.0
+    return max(0.0, min(1.0, 0.5 + angle_deg / SPAN_DEG))
 
 
 def is_valid_output(abs_yaw: float, abs_pitch: float) -> bool:
@@ -193,7 +252,7 @@ class EarFeatureState:
 
 
 class GazeIntent:
-    def __init__(self):
+    def __init__(self, diag_log_path: Optional[str] = None):
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.environ.get(
             'AI_PIPELINE_ROOT',
@@ -231,6 +290,18 @@ class GazeIntent:
         # --- 3. TEMPORAL STATE & CALIBRATION ---
         self.ear_state = EarFeatureState()
 
+        # --- 4. OPT-IN DIAGNOSTIC TELEMETRY LOGGER (ZERO OVERHEAD WHEN DISABLED) ---
+        self._frame_id = 0
+        self._diag_file = None
+        self._diag_writer = None
+        resolved_log = diag_log_path or os.environ.get("GAZE_DIAG_LOG")
+        if resolved_log:
+            log_abs = os.path.abspath(resolved_log)
+            os.makedirs(os.path.dirname(log_abs), exist_ok=True)
+            self._diag_file = open(log_abs, mode="w", newline="", encoding="utf-8")
+            self._diag_writer = csv.writer(self._diag_file)
+            self._diag_writer.writerow(_DIAG_FIELD_NAMES)
+
     @property
     def is_calibrated(self) -> bool:
         return self.ear_state.is_calibrated
@@ -238,7 +309,25 @@ class GazeIntent:
     def reset_tracking_state(self) -> None:
         self.ear_state.reset_tracking_state()
 
+    def _write_diag_row(self, payload: GazeDiagnosticPayload) -> None:
+        if self._diag_writer is not None:
+            row = []
+            for name in _DIAG_FIELD_NAMES:
+                val = getattr(payload, name)
+                if name == "capture_s":
+                    row.append("nan" if math.isnan(val) else f"{val:.9f}")
+                else:
+                    row.append(val)
+            self._diag_writer.writerow(row)
+
     def shutdown(self):
+        if getattr(self, '_diag_file', None) is not None:
+            try:
+                self._diag_file.flush()
+                self._diag_file.close()
+            finally:
+                self._diag_file = None
+                self._diag_writer = None
         if hasattr(self, 'detector') and self.detector is not None:
             self.detector.close()
             self.detector = None
@@ -255,6 +344,8 @@ class GazeIntent:
         all four angles are NaN (INVALID_ANGLE) so invalid coordinates never enter downstream DSP
         filters. Use is_valid_output(abs_yaw, abs_pitch) to test validity.
         """
+        frame_id = self._frame_id
+        self._frame_id += 1
         frame_h, frame_w, _ = rgb_frame_array.shape
 
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame_array)
@@ -270,6 +361,28 @@ class GazeIntent:
 
             wink_features = self.ear_state.update(raw_left_ear, raw_right_ear)
             if wink_features is None:
+                if self._diag_writer is not None:
+                    l_x = get_iris_ratio(landmarks, L_CORNERS, LEFT_IRIS, "x")
+                    r_x = get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "x")
+                    l_y = get_iris_ratio(landmarks, L_CORNERS, LEFT_IRIS, "y")
+                    r_y = get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "y")
+                    hp, hy, hr = get_head_pose_angles(pose_matrix)
+                    self._write_diag_row(GazeDiagnosticPayload(
+                        frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                        detected=0, state=-1,
+                        left_iris_x=l_x, right_iris_x=r_x, sx=(l_x + r_x) / 2.0,
+                        left_iris_y=l_y, right_iris_y=r_y, sy=(l_y + r_y) / 2.0,
+                        head_pitch_deg=hp, head_yaw_deg=hy, head_roll_deg=hr,
+                        rel_pitch_deg=INVALID_ANGLE, rel_yaw_deg=INVALID_ANGLE,
+                        abs_pitch_deg=INVALID_ANGLE, abs_yaw_deg=INVALID_ANGLE,
+                        norm_x=-1.0, norm_y=-1.0,
+                        lm33_x=float(landmarks[33].x), lm33_y=float(landmarks[33].y),
+                        lm133_x=float(landmarks[133].x), lm133_y=float(landmarks[133].y),
+                        lm468_x=float(landmarks[468].x), lm468_y=float(landmarks[468].y),
+                        lm362_x=float(landmarks[362].x), lm362_y=float(landmarks[362].y),
+                        lm263_x=float(landmarks[263].x), lm263_y=float(landmarks[263].y),
+                        lm473_x=float(landmarks[473].x), lm473_y=float(landmarks[473].y),
+                    ))
                 # Issue #3 Fix: NaN sentinel angles during calibration
                 return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, -1, landmarks
 
@@ -277,7 +390,15 @@ class GazeIntent:
             state = int(self.wink_model.predict(wink_batch)[0].argmax())
 
             # 2. Extract MPIIGaze Features
-            student_x, student_y, head_pitch, head_yaw, head_roll = extract_gaze_features(landmarks, pose_matrix)
+            l_x = get_iris_ratio(landmarks, L_CORNERS, LEFT_IRIS, "x")
+            r_x = get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "x")
+            student_x = (l_x + r_x) / 2.0
+
+            l_y = get_iris_ratio(landmarks, L_CORNERS, LEFT_IRIS, "y")
+            r_y = get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "y")
+            student_y = (l_y + r_y) / 2.0
+
+            head_pitch, head_yaw, head_roll = get_head_pose_angles(pose_matrix)
 
             # 3. Predict Screen Gaze (Pitch & Yaw)
             gaze_features = np.array(
@@ -293,8 +414,45 @@ class GazeIntent:
             abs_pitch = rel_pitch + head_pitch
             abs_yaw = rel_yaw + head_yaw
 
+            if self._diag_writer is not None:
+                nx = angle_to_norm_coord(abs_yaw)
+                ny = angle_to_norm_coord(abs_pitch)
+                self._write_diag_row(GazeDiagnosticPayload(
+                    frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                    detected=1 if (nx >= 0.0 and ny >= 0.0) else 0, state=state,
+                    left_iris_x=l_x, right_iris_x=r_x, sx=student_x,
+                    left_iris_y=l_y, right_iris_y=r_y, sy=student_y,
+                    head_pitch_deg=head_pitch, head_yaw_deg=head_yaw, head_roll_deg=head_roll,
+                    rel_pitch_deg=rel_pitch, rel_yaw_deg=rel_yaw,
+                    abs_pitch_deg=abs_pitch, abs_yaw_deg=abs_yaw,
+                    norm_x=nx, norm_y=ny,
+                    lm33_x=float(landmarks[33].x), lm33_y=float(landmarks[33].y),
+                    lm133_x=float(landmarks[133].x), lm133_y=float(landmarks[133].y),
+                    lm468_x=float(landmarks[468].x), lm468_y=float(landmarks[468].y),
+                    lm362_x=float(landmarks[362].x), lm362_y=float(landmarks[362].y),
+                    lm263_x=float(landmarks[263].x), lm263_y=float(landmarks[263].y),
+                    lm473_x=float(landmarks[473].x), lm473_y=float(landmarks[473].y),
+                ))
+
             return abs_yaw, abs_pitch, head_yaw, head_pitch, state, landmarks
 
         # Issue #4 Fix: Face lost -> clear temporal EAR window & return NaN sentinel angles
         self.ear_state.reset_tracking_state()
+        if self._diag_writer is not None:
+            self._write_diag_row(GazeDiagnosticPayload(
+                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                detected=0, state=0,
+                left_iris_x=INVALID_ANGLE, right_iris_x=INVALID_ANGLE, sx=INVALID_ANGLE,
+                left_iris_y=INVALID_ANGLE, right_iris_y=INVALID_ANGLE, sy=INVALID_ANGLE,
+                head_pitch_deg=INVALID_ANGLE, head_yaw_deg=INVALID_ANGLE, head_roll_deg=INVALID_ANGLE,
+                rel_pitch_deg=INVALID_ANGLE, rel_yaw_deg=INVALID_ANGLE,
+                abs_pitch_deg=INVALID_ANGLE, abs_yaw_deg=INVALID_ANGLE,
+                norm_x=-1.0, norm_y=-1.0,
+                lm33_x=INVALID_ANGLE, lm33_y=INVALID_ANGLE,
+                lm133_x=INVALID_ANGLE, lm133_y=INVALID_ANGLE,
+                lm468_x=INVALID_ANGLE, lm468_y=INVALID_ANGLE,
+                lm362_x=INVALID_ANGLE, lm362_y=INVALID_ANGLE,
+                lm263_x=INVALID_ANGLE, lm263_y=INVALID_ANGLE,
+                lm473_x=INVALID_ANGLE, lm473_y=INVALID_ANGLE,
+            ))
         return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None

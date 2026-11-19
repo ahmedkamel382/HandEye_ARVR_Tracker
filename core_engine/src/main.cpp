@@ -553,7 +553,7 @@ void usage() {
 // default backend. Prints what to try when nothing works.
 bool openSource(const Config& cfg, cv::VideoCapture& cap) {
     if (!cfg.video_path.empty()) {
-        cap.open(cfg.video_path);
+        if (!cap.open(cfg.video_path, cv::CAP_OPENCV_MJPEG)) cap.open(cfg.video_path);
         if (!cap.isOpened()) std::fprintf(stderr, "Could not open the video file: %s\n", cfg.video_path.c_str());
         return cap.isOpened();
     }
@@ -922,7 +922,7 @@ int main(int argc, char** argv) {
         if (f9 && !f9_prev) g_run.store(false);
         f9_prev = f9;
 #endif
-        if (os->exited()) break;                                           // Exit chosen in the tray menu
+        if (cfg.os == "win32" && os->exited()) break;                      // Exit chosen in the tray menu
 
         if (Clock::now() >= next_report) {
             next_report += 1s;

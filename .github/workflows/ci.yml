@@ -19,6 +19,9 @@ jobs:
     name: Python Suites & Asset Checks (Eng 2, 3, 4)
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
 
     steps:
       - name: Checkout Code
@@ -72,13 +75,21 @@ jobs:
           python ai_pipeline/hand_kinematics/tests/check_tracking_observability.py
 
       - name: Engineer 4 — DSP Evaluation Unit Tests (138 Tests)
+        shell: pwsh
         run: |
+          $env:TEMP = (Resolve-Path -LiteralPath $env:TEMP).Path
+          $env:TMP = $env:TEMP
           python -m unittest discover -s dsp_filter/evaluation -p "test_*.py" -v
+          if ($LASTEXITCODE -ne 0) { throw "DSP evaluation unit tests failed with exit code $LASTEXITCODE" }
 
   cpp-engine-and-e2e:
     name: C++ Engine, Parity & E2E Pipeline (Eng 1-5)
     runs-on: windows-latest
     timeout-minutes: 35
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}\vcpkg-archives
 
     steps:
       - name: Checkout Code
@@ -98,36 +109,65 @@ jobs:
           pip install -r requirements.txt
           pip install pybind11
 
-      - name: Fix tl2cgen Windows DLL Path Issue
+      - name: Fix tl2cgen Windows DLL Path Issue & Prepare vcpkg Cache Dir
         shell: pwsh
         run: |
           $pythonDir = Split-Path (Get-Command python).Source
           $libBinPath = Join-Path $pythonDir "Library\bin"
           New-Item -ItemType Directory -Force -Path $libBinPath | Out-Null
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          "LOCALAPPDATA_PATH=$env:LOCALAPPDATA" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Cache vcpkg Binary Archives
         uses: actions/cache@v5
         with:
-          path: ${{ env.LOCALAPPDATA }}\vcpkg\archives
-          key: ${{ runner.os }}-vcpkg-archives-v1-${{ hashFiles('vcpkg.json') }}
+          path: ${{ runner.temp }}\vcpkg-archives
+          key: ${{ runner.os }}-vcpkg-rel-v1-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            ${{ runner.os }}-vcpkg-archives-v1-
+            ${{ runner.os }}-vcpkg-rel-v1-
+          save-always: true
 
       - name: Setup MSVC Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1.13.0
 
-      - name: Configure CMake (with Benchmarks Enabled)
+      - name: Configure Release-Only vcpkg Overlay Triplet & CMake (with Retry)
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $tripletDir = Join-Path $env:RUNNER_TEMP "vcpkg-triplets"
+          New-Item -ItemType Directory -Force -Path $tripletDir | Out-Null
+          @(
+            "set(VCPKG_TARGET_ARCHITECTURE x64)"
+            "set(VCPKG_CRT_LINKAGE dynamic)"
+            "set(VCPKG_LIBRARY_LINKAGE dynamic)"
+            "set(VCPKG_BUILD_TYPE release)"
+          ) | Set-Content -Path (Join-Path $tripletDir "x64-windows.cmake") -Encoding utf8
+
           $pythonPath = (Get-Command python).Source
-          cmake -B build `
-            -G "Ninja" `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET="x64-windows" `
-            -DPython3_EXECUTABLE="$pythonPath" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DDSP_BUILD_BENCHMARKS=ON `
-            -DOSI_BUILD_BENCHMARKS=ON
+          $ninjaPath = (Get-Command ninja).Source
+          $configured = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "CMake configure attempt $attempt of 3..."
+            cmake -B build `
+              -G "Ninja" `
+              -DCMAKE_MAKE_PROGRAM="$ninjaPath" `
+              -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+              -DVCPKG_TARGET_TRIPLET="x64-windows" `
+              -DVCPKG_OVERLAY_TRIPLETS="$tripletDir" `
+              -DPython3_EXECUTABLE="$pythonPath" `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DDSP_BUILD_BENCHMARKS=ON `
+              -DOSI_BUILD_BENCHMARKS=ON
+            if ($LASTEXITCODE -eq 0) {
+              $configured = $true
+              break
+            }
+            if ($attempt -lt 3) {
+              Write-Warning "CMake configure attempt $attempt failed (exit $LASTEXITCODE); retrying in 15s..."
+              Start-Sleep -Seconds 15
+            }
+          }
+          if (-not $configured) { throw "CMake configure failed after 3 attempts" }
 
       - name: Build Core Engine, Tests & Benchmarks
         run: cmake --build build --parallel
@@ -162,6 +202,8 @@ jobs:
       - name: Execute Engineer 4 DSP Recorder E2E Integration Check
         shell: pwsh
         run: |
+          $env:TEMP = (Resolve-Path -LiteralPath $env:TEMP).Path
+          $env:TMP = $env:TEMP
           $pythonDir = Split-Path (Get-Command python).Source
           $env:PATH = "$PWD\build;$PWD\build\vcpkg_installed\x64-windows\bin;$pythonDir;$env:PATH"
           python dsp_filter/evaluation/check_recorder_pipeline.py --exe build/core_engine.exe
@@ -175,4 +217,5 @@ jobs:
           if-no-files-found: ignore
           path: |
             build/Testing/Temporary/LastTest.log
-            ${{ env.LOCALAPPDATA }}/HandEyeTracker/handeye_tray.log
+            build/vcpkg-manifest-install.log
+            ${{ env.LOCALAPPDATA_PATH }}/HandEyeTracker/handeye_tray.log

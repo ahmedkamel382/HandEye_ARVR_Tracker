@@ -63,6 +63,14 @@ jobs:
         run: |
           python ai_pipeline/hand_kinematics/tests/check_index_tracker.py
 
+      - name: Engineer 2 — Hand Tracker Logic Unit Tests
+        run: |
+          python ai_pipeline/hand_kinematics/tests/check_tracker_logic.py
+
+      - name: Engineer 2 — Hand Tracking Observability Unit Tests
+        run: |
+          python ai_pipeline/hand_kinematics/tests/check_tracking_observability.py
+
       - name: Engineer 4 — DSP Evaluation Unit Tests (138 Tests)
         run: |
           python -m unittest discover -s dsp_filter/evaluation -p "test_*.py" -v

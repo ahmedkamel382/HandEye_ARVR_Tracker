@@ -57,11 +57,15 @@ OsController::OsController(const Settings& settings, const ScreenGeometry& geome
       gaze_lock_(gaze_lock_params(settings)) {}
 
 OsController::~OsController() {
-    release_all_buttons();
+    // Best effort: a refused release gets a few more chances before we go.
+    for (int attempt = 0; attempt < 3 && !release_all_buttons(); ++attempt) {
+    }
 }
 
 FrameReport OsController::update(const FramePayload& frame) noexcept {
     FrameReport report;
+    // Releasing a stuck button is always allowed, even while paused or inhibited.
+    retry_pending_releases();
     const double t = frame.timestamp_seconds;
     if (!std::isfinite(t) || (has_timestamp_ && t <= last_timestamp_)) {
         report.status = FrameStatus::RejectedTimestamp;
@@ -69,6 +73,7 @@ FrameReport OsController::update(const FramePayload& frame) noexcept {
         report.cursor = last_cursor_;
         report.active = active_;
         report.inhibited = inhibited_;
+        report.release_pending = release_pending();
         return report;
     }
     has_timestamp_ = true;
@@ -169,6 +174,7 @@ FrameReport OsController::update(const FramePayload& frame) noexcept {
     }
     report.active = active_;
     report.inhibited = inhibited_;
+    report.release_pending = release_pending();
     return report;
 }
 
@@ -188,13 +194,23 @@ OsController::Outcome OsController::execute(const Action& action) noexcept {
         if (!held) {
             return Outcome::Skipped;
         }
-        held = false;
-        return sink_.button(action.button, ButtonAction::Up) ? Outcome::Sent : Outcome::Failed;
+        return release(action.button) ? Outcome::Sent : Outcome::Failed;
     case ActionType::Click:
         if (held) {
             return Outcome::Skipped;
         }
-        return sink_.click(action.button) ? Outcome::Sent : Outcome::Failed;
+        switch (sink_.click(action.button)) {
+        case ClickResult::Clicked:
+            return Outcome::Sent;
+        case ClickResult::PressedOnly:
+            // The press reached Windows, the release did not: the button is down.
+            held = true;
+            release_pending_[index(action.button)] = true;
+            return Outcome::Failed;
+        case ClickResult::Refused:
+            break;
+        }
+        return Outcome::Failed;
     case ActionType::TogglePause:
         break;
     }
@@ -223,13 +239,46 @@ void OsController::set_inhibited(bool inhibited) noexcept {
     last_sent_.reset();
 }
 
-void OsController::release_all_buttons() noexcept {
+// The button counts as released only once Windows accepts the button-up.
+// Until then it stays held (so no new press is sent) and is retried.
+bool OsController::release(MouseButton button) noexcept {
+    const std::size_t i = index(button);
+    if (sink_.button(button, ButtonAction::Up)) {
+        held_[i] = false;
+        release_pending_[i] = false;
+        return true;
+    }
+    release_pending_[i] = true;
+    return false;
+}
+
+bool OsController::release_all_buttons() noexcept {
+    bool all_released = true;
     for (std::size_t i = 0; i < held_.size(); ++i) {
-        if (held_[i]) {
-            held_[i] = false;
-            sink_.button(static_cast<MouseButton>(i), ButtonAction::Up);
+        if (held_[i] && !release(static_cast<MouseButton>(i))) {
+            all_released = false;
         }
     }
+    return all_released;
+}
+
+bool OsController::retry_pending_releases() noexcept {
+    bool none_left = true;
+    for (std::size_t i = 0; i < held_.size(); ++i) {
+        if (release_pending_[i] && held_[i] && !release(static_cast<MouseButton>(i))) {
+            none_left = false;
+        }
+    }
+    return none_left;
+}
+
+bool OsController::release_pending() const noexcept {
+    for (std::size_t i = 0; i < held_.size(); ++i) {
+        if (release_pending_[i] && held_[i]) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool OsController::button_held(MouseButton button) const noexcept {

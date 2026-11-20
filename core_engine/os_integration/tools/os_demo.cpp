@@ -343,17 +343,17 @@ int selftest() {
         bool ok = false;
         switch (step.kind) {
         case Step::LeftClick:
-            sent &= injector.click(MouseButton::Left);
+            sent &= injector.click(MouseButton::Left) == ClickResult::Clicked;
             pump(80);
             ok = received(WM_LBUTTONDOWN, step.client) && received(WM_LBUTTONUP, step.client);
             break;
         case Step::RightClick:
-            sent &= injector.click(MouseButton::Right);
+            sent &= injector.click(MouseButton::Right) == ClickResult::Clicked;
             pump(80);
             ok = received(WM_RBUTTONDOWN, step.client) && received(WM_RBUTTONUP, step.client);
             break;
         case Step::MiddleClick:
-            sent &= injector.click(MouseButton::Middle);
+            sent &= injector.click(MouseButton::Middle) == ClickResult::Clicked;
             pump(80);
             ok = received(WM_MBUTTONDOWN, step.client) && received(WM_MBUTTONUP, step.client);
             break;

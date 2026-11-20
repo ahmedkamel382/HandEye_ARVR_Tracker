@@ -11,6 +11,7 @@ endif()
 
 option(OSI_BUILD_APPS "Build the tray app and os_demo (Windows only)" ON)
 option(OSI_BUILD_BENCHMARKS "Build the per-frame latency benchmark" OFF)
+option(OSI_BUILD_TESTER "Build HandEyeTester.exe and its C interface DLL (Windows only)" ON)
 
 # ---------------------------------------------------------------- portable core
 add_library(os_integration STATIC
@@ -73,6 +74,38 @@ if(WIN32 AND OSI_BUILD_APPS)
     target_link_libraries(handeye_tray PRIVATE os_integration_tray)
     list(APPEND osi_local_targets os_integration_tray)
     list(APPEND osi_local_targets handeye_tray)
+
+    if(OSI_BUILD_TESTER)
+        # HandEye tester: a C interface around OsController (loaded by the
+        # Python tester UI with ctypes) and a double-click launcher.
+        add_library(os_integration_capi SHARED capi/osi_capi.cpp)
+        target_include_directories(os_integration_capi PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/capi")
+        target_compile_features(os_integration_capi PUBLIC cxx_std_17)
+        target_link_libraries(os_integration_capi PRIVATE os_integration_win32)
+        # Optional smoothing with Engineer 4's dsp_filter, used read-only. The
+        # root build already defines the target; a standalone build adds it.
+        if(NOT TARGET dsp_filter AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../dsp_filter/CMakeLists.txt")
+            add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../dsp_filter"
+                             "${CMAKE_CURRENT_BINARY_DIR}/dsp_filter")
+        endif()
+        if(TARGET dsp_filter)
+            target_link_libraries(os_integration_capi PRIVATE dsp_filter)
+            target_compile_definitions(os_integration_capi PRIVATE OSI_CAPI_WITH_DSP=1)
+        endif()
+
+        add_executable(HandEyeTester WIN32 tester/launcher/tester_launcher.cpp)
+        target_compile_definitions(HandEyeTester PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+        target_compile_features(HandEyeTester PRIVATE cxx_std_17)
+        add_dependencies(HandEyeTester os_integration_capi)
+        list(APPEND osi_local_targets os_integration_capi HandEyeTester)
+
+        if(BUILD_TESTING)
+            add_executable(os_integration_capi_tests tests/test_capi.cpp)
+            target_link_libraries(os_integration_capi_tests PRIVATE os_integration_capi)
+            add_test(NAME os_integration_capi_tests COMMAND os_integration_capi_tests)
+            list(APPEND osi_local_targets os_integration_capi_tests)
+        endif()
+    endif()
 endif()
 
 # Warnings apply to Engineer 5 targets only, never to teammates' targets.

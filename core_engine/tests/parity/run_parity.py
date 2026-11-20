@@ -53,7 +53,9 @@ class _Detector:
             hand_world_landmarks=[self.next_world] if self.next_world else [])
 
     def detect(self, image):
-        return types.SimpleNamespace(hand_landmarks=[self.next_hand] if self.next_hand else [])
+        return types.SimpleNamespace(
+            hand_landmarks=[self.next_hand] if self.next_hand else [],
+            hand_world_landmarks=[self.next_world] if self.next_world else [])
 
     def close(self):
         pass
@@ -221,7 +223,9 @@ def main():
             gi.shutdown()
 
     # ---- hand ----
-    ht = hand_mod.HandTracker()
+    # HandNative (the C++ side under test) does not run Python ROI recovery,
+    # so the Python reference must use the same full-frame-only configuration.
+    ht = hand_mod.HandTracker(enable_roi_recovery=False)
     for (w, h) in ((W, H), (W2, H2)):
         blank = np.zeros((h, w, 3), dtype=np.uint8)
         for lm in gen_hand_frames(rng, a.frames // 2):

@@ -102,8 +102,9 @@ OSI_API void* osi_create(const char* settings_ini, int32_t screen_target, int32_
 OSI_API void osi_destroy(void* handle);
 
 /* Replaces the settings (INI text). Returns 1 on success; on failure the
- * controller is unchanged and the reason goes to `error`. Unknown keys and
- * bad values are reported as errors so the tester can show them. */
+ * controller is unchanged and the reason goes to `error`. Malformed lines
+ * and bad values are reported as errors so the tester can show them; keys
+ * this version does not know are skipped, so files from other versions load. */
 OSI_API int32_t osi_apply_settings_ini(void* handle, const char* settings_ini, char* error,
                                        int32_t error_capacity);
 

@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   python-fast-checks:
-    name: Python Suites & Asset Checks (Eng 2, 3, 4)
+    name: Python Suites & Asset Checks
     runs-on: windows-latest
     timeout-minutes: 15
 
@@ -38,7 +38,7 @@ jobs:
 
       - name: Bytecode Compilation Check (All Python Modules)
         run: |
-          python -m compileall -q ai_pipeline core_engine/tests core_engine/tools dsp_filter/evaluation
+          python -m compileall -q ai_pipeline core_engine/tests core_engine/tools core_engine/os_integration/tester dsp_filter/evaluation
 
       - name: Verify Required Model Assets & Non-Zero Sizes
         shell: pwsh
@@ -59,19 +59,19 @@ jobs:
           }
           Write-Host "All required model assets verified."
 
-      - name: Engineer 2 — Hand Kinematics Index Tracker Unit Tests
+      - name: Hand Kinematics Index Tracker Unit Tests
         run: |
           python ai_pipeline/hand_kinematics/tests/check_index_tracker.py
 
-      - name: Engineer 2 — Hand Tracker Logic Unit Tests
+      - name: Hand Tracker Logic Unit Tests
         run: |
           python ai_pipeline/hand_kinematics/tests/check_tracker_logic.py
 
-      - name: Engineer 2 — Hand Tracking Observability Unit Tests
+      - name: Hand Tracking Observability Unit Tests
         run: |
           python ai_pipeline/hand_kinematics/tests/check_tracking_observability.py
 
-      - name: Engineer 4 — DSP Evaluation Unit Tests (138 Tests)
+      - name: DSP Evaluation Unit Tests (138 Tests)
         shell: pwsh
         run: |
           $baseTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
@@ -82,7 +82,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "DSP evaluation unit tests failed with exit code $LASTEXITCODE" }
 
   cpp-engine-and-e2e:
-    name: C++ Engine, Parity & E2E Pipeline (Eng 1-5)
+    name: C++ Engine, Parity & E2E Pipeline
     runs-on: windows-latest
     timeout-minutes: 35
 
@@ -199,11 +199,20 @@ jobs:
             Remove-Item -Force $tmpAvi -ErrorAction SilentlyContinue
           }
 
-      - name: Execute CTest Suite (7/7 Unit, Parity & E2E Tests)
+      - name: Execute CTest Suite (8/8 Unit, C API, Parity & E2E Tests)
         working-directory: build
         run: ctest --output-on-failure --timeout 180
 
-      - name: Execute Engineer 4 DSP Recorder E2E Integration Check
+      - name: Execute HandEye Tester Unit Tests (12 Tests)
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path "$PWD\build" -Recurse -Filter "os_integration_capi.dll" | Select-Object -First 1
+          if (-not $dll) { throw "os_integration_capi.dll not found under build/" }
+          $env:OSI_CAPI_DLL = $dll.FullName
+          python -m pytest core_engine/os_integration/tester/tests -v
+          if ($LASTEXITCODE -ne 0) { throw "HandEye Tester pytest suite failed with exit code $LASTEXITCODE" }
+
+      - name: Execute DSP Recorder E2E Integration Check
         shell: pwsh
         run: |
           $baseTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }

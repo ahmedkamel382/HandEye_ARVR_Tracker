@@ -301,6 +301,12 @@ const std::vector<Field>& fields() {
     return table;
 }
 
+// Keys written by earlier versions that no longer mean anything. They are
+// skipped silently so old settings files load without warnings.
+bool retired_key(std::string_view section, std::string_view key) {
+    return section == "app" && key == "udp_port"; // development UDP bridge, removed
+}
+
 const Field* find_field(std::string_view section, std::string_view key) {
     for (const Field& field : fields()) {
         if (section == field.section && key == field.key) {
@@ -371,6 +377,9 @@ SettingsLoadResult parse_settings(std::string_view text) {
         const std::string_view value = trim(line.substr(equals + 1));
         const Field* field = find_field(section, key);
         if (field == nullptr) {
+            if (retired_key(section, key)) {
+                continue;
+            }
             result.warnings.push_back(where + "unknown setting [" + section + "] " +
                                       std::string(key));
             continue;

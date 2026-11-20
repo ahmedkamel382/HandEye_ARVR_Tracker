@@ -21,7 +21,7 @@ constexpr UINT_PTR kStatusTimer = 1;
 constexpr int kToggleHotkey = 1;
 constexpr UINT kTrayIconId = 1;
 
-enum Event : WPARAM { FirstFrame = 1, GesturePause, GestureResume, InjectionBlocked };
+enum Event : WPARAM { FirstFrame = 1, GesturePause, GestureResume, InjectionBlocked, ReleaseBlocked };
 
 enum MenuId : UINT {
     IdStatus = 1,
@@ -133,9 +133,9 @@ public:
         log(std::string(name(which)) + (action == ButtonAction::Down ? " down" : " up"));
         return true;
     }
-    bool click(MouseButton which) noexcept override {
+    ClickResult click(MouseButton which) noexcept override {
         log(std::string(name(which)) + " click");
-        return true;
+        return ClickResult::Clicked;
     }
 
 private:
@@ -286,7 +286,12 @@ void TrayApp::shutdown() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (controller_) {
-            controller_->release_all_buttons();
+            for (int attempt = 0; attempt < 10 && !controller_->release_all_buttons(); ++attempt) {
+                Sleep(20);
+            }
+            if (controller_->release_pending()) {
+                AppLog::error("exiting with a mouse button still down: Windows refused every release");
+            }
         }
     }
     if (hook_ != nullptr) {
@@ -352,6 +357,9 @@ void TrayApp::submit_frame(const FramePayload& frame) noexcept {
     if (report.pause_toggled) {
         post_event(report.active ? GestureResume : GesturePause);
     }
+    if (report.release_pending && !release_event_posted_.exchange(true)) {
+        post_event(ReleaseBlocked); // once per stuck episode; the UI timer keeps retrying
+    }
     if (report.injection_failed && now - last_block_notice_.load() > 10.0) {
         last_block_notice_.store(now);
         post_event(InjectionBlocked);
@@ -389,6 +397,39 @@ void TrayApp::check_stale_input() {
         controller_->release_all_buttons();
     }
     AppLog::warn("tracking frames stopped; any held button was released");
+}
+
+// Safety (team tracker item #8): a refused button-up leaves the button down
+// in Windows. Keep retrying until Windows accepts it, and tell the user once.
+void TrayApp::retry_stuck_buttons() {
+    bool still_stuck = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!controller_ || !controller_->release_pending()) {
+            release_event_posted_ = false;
+            if (stuck_button_notified_) {
+                stuck_button_notified_ = false;
+                AppLog::info("stuck mouse button released");
+            }
+            return;
+        }
+        still_stuck = !controller_->retry_pending_releases();
+    }
+    if (!still_stuck) {
+        release_event_posted_ = false;
+    }
+    if (still_stuck && !stuck_button_notified_) {
+        stuck_button_notified_ = true;
+        AppLog::error("Windows refused to release a mouse button; retrying every 250 ms");
+        notify(L"Mouse button stuck",
+               L"Windows refused to release the virtual mouse button (an administrator window "
+               L"probably has focus). Retrying automatically; clicking the physical mouse also "
+               L"releases it.",
+               true);
+    } else if (!still_stuck && stuck_button_notified_) {
+        stuck_button_notified_ = false;
+        AppLog::info("stuck mouse button released");
+    }
 }
 
 // ---------------------------------------------------------------- window
@@ -450,6 +491,7 @@ LRESULT TrayApp::handle(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_TIMER:
         if (wparam == kStatusTimer) {
             check_stale_input();
+            retry_stuck_buttons();
             refresh_status();
         }
         return 0;
@@ -466,6 +508,9 @@ LRESULT TrayApp::handle(UINT message, WPARAM wparam, LPARAM lparam) {
         case GestureResume:
             AppLog::info("control resumed by sustained eye closure");
             notify(L"Control resumed", L"Eyes closed. Close them again for a second to pause.");
+            break;
+        case ReleaseBlocked:
+            retry_stuck_buttons();
             break;
         case InjectionBlocked:
             AppLog::warn("Windows refused injected input (UIPI: an elevated window has focus?)");

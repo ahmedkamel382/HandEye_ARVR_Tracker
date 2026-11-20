@@ -17,9 +17,14 @@ C++ core (Eng 1) grabs frame
   -> the mouse moves / clicks
 ```
 
-Everything lives in `core_engine/os_integration/`. Nothing outside this folder
-was modified: not the teammates' Python, not `dsp_filter/`, not
-`core_engine/src/main.cpp`, and not the root `CMakeLists.txt`.
+Everything lives in `core_engine/os_integration/`. Engineer 5 changes only this
+folder; the teammates' code is used, never edited.
+
+**In the engine today.** On `first-full-working-demo` the root `CMakeLists.txt`
+adds this folder and links `os_integration_tray` into `core_engine.exe`.
+`core_engine/include/os_bridge.hpp` (Engineer 1) hosts the `TrayApp`, submits
+one `FramePayload` per frame with `TrayApp::submit_frame()` and rebuilds the DSP
+filters when the tray's Smoothing menu changes (`TrayOptions::on_settings_changed`).
 
 ## What is in the folder
 
@@ -28,7 +33,9 @@ was modified: not the teammates' Python, not `dsp_filter/`, not
 | `include/os_integration/`, `src/` | The library. Portable C++17 core plus a small Win32 layer. |
 | `tools/os_demo.cpp` | Phase 1 deliverable: proves the program controls the Windows cursor. |
 | `app/` | `handeye_tray.exe`: system-tray app, settings, and calibration wizard. |
-| `tests/` | 71 self-contained tests and a latency benchmark (no GoogleTest needed). |
+| `capi/` | `os_integration_capi.dll`: a plain-C interface to `OsController` (used by the tester). |
+| `tester/` | **HandEye Tester**: `HandEyeTester.exe` + a test-bench UI for every part of the system. |
+| `tests/` | 81 library tests, 7 C-interface tests and a latency benchmark (no GoogleTest needed). |
 
 ### Library files
 
@@ -50,10 +57,19 @@ was modified: not the teammates' Python, not `dsp_filter/`, not
 ```cpp
 struct FramePayload {
     double timestamp_seconds;   // monotonic, the same clock the DSP filters use
-    TrackerSample hand;         // { optional<NormalizedPoint> point; int state; }
+    TrackerSample hand;         // { optional<NormalizedPoint> point; int state; TrackerState tracking; }
     TrackerSample gaze;
 };
 ```
+
+* `tracking` says how fresh the sample is (added with the engine's freshness
+  work; it defaults to `Tracked`, so `{point, state}` still compiles):
+  * `Tracked`: observed this frame.
+  * `Held`: a short dropout; `point` is the last smoothed point, replayed so the
+    cursor does not stutter. A Held frame keeps the cursor and keeps a gesture
+    that is already confirmed (a drag survives), but it can never start or
+    confirm a gesture, and calibration ignores it (`fresh_point()`).
+  * `Lost`: no usable position; any point is ignored.
 
 * `point` is the **stabilized** DSP output. Leave it empty when the tracker lost
   its target or DSP returned no value. Python's `(-1, -1)` sentinel, NaN and
@@ -149,7 +165,7 @@ available.
 | Risk | Protection |
 | --- | --- |
 | The program takes over the mouse unexpectedly | It starts **paused**. Ctrl+Alt+P, the tray menu or a 1 s eye closure toggles control. |
-| A button stays stuck down | Buttons are released on pause, inhibit, settings change, stale input (0.5 s without frames), controller destruction and app exit. |
+| A button stays stuck down | Buttons are released on pause, inhibit, settings change, stale input (0.5 s without frames), controller destruction and app exit. A release Windows **refuses** keeps the button tracked as held and is retried every frame and every 250 ms by the tray, with a warning, until Windows accepts it; a click whose release was dropped is detected (`ClickResult::PressedOnly`) and released the same way (team tracker item #8). |
 | Fighting the user's real mouse | A low-level hook detects **physical** mouse input (not injected input) and yields control for 1.5 s. |
 | Clicks during calibration | The controller is inhibited while the wizard runs. |
 | Windows blocks the input | `SendInput` refusals are detected and reported (UIPI: an admin window has focus). |
@@ -205,6 +221,7 @@ cmake --build out/build/os-release
 | CMake option | Default | Meaning |
 | --- | --- | --- |
 | `OSI_BUILD_APPS` | ON | Build `os_demo` and `handeye_tray` (Windows only). |
+| `OSI_BUILD_TESTER` | ON | Build `HandEyeTester.exe` and `os_integration_capi.dll` (Windows only). |
 | `OSI_BUILD_BENCHMARKS` | OFF | Per-frame latency benchmark. |
 
 Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
@@ -213,12 +230,14 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 
 | Check | Result |
 | --- | --- |
-| Debug and Release builds, MSVC 19.44 `/W4` | 0 warnings |
-| `os_integration_tests` | 71 / 71 passed (Debug and Release, clean build folders) |
-| `os_integration_benchmark` (Release, 1M frames) | 64 ns per frame p50, 69 ns p99 |
-| `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error over 179 frames; about 0.2 ms per frame including SendInput (Debug) |
+| Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
+| `os_integration_tests` | 81 / 81 passed |
+| `os_integration_capi_tests` | 7 / 7 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 12 / 12 passed |
+| `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
+| `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |
-| Tray app with `--simulate --dry-run` | Frames → controller → mouse events logged; clean exit verified |
+| HandEye Tester, live camera | Index finger, hand and full-system modes ran at 30 fps with the teammates' trackers |
 
 ## Running it
 
@@ -252,73 +271,60 @@ Settings live in `%APPDATA%\HandEyeTracker\os_integration.ini`, which can be
 opened and reloaded from the menu. The log is at
 `%LOCALAPPDATA%\HandEyeTracker\handeye_tray.log`.
 
-## Integration guide for Engineer 1 (Phases 3–4)
+### HandEye Tester
 
-The core loop owns frames, timestamps, Pybind11 and the DSP filters. It hands
-this module one `FramePayload` per new observation:
+A test bench for every part of the system, one part at a time. **Double-click
+`HandEyeTester.exe`** (built next to `os_integration_capi.dll`, for example in
+`out\build\windows-release\core_engine\os_integration\`). It needs the
+project's `.venv` (`setup.bat`).
 
-```cpp
-#include "os_integration/os_controller.hpp"
-#include "os_integration/win32_input.hpp"
+| Test | What runs |
+| --- | --- |
+| Camera check | Only the webcam: picture, frame rate, brightness |
+| Index finger only | Engineer 2's `IndexFingerTracker`: the cursor follows the fingertip, no clicks |
+| Hand + gestures | Engineer 2's `HandTracker`: cursor, pinch (left button / drag), fist (right click) |
+| Gaze pointer | Engineer 3's `GazeIntent`: cursor from yaw/pitch (same mapping as the engine), wink clicks |
+| Blinks & winks only | Engineer 3's eye states only; the cursor does not move |
+| Full system | Hand and gaze together, like the engine |
 
-osi::win32::enable_per_monitor_dpi_awareness();            // once, at startup
-const osi::Settings settings = osi::load_settings_file(path).settings;
-osi::win32::InputInjector injector;
-osi::OsController os(settings, osi::win32::query_screen_geometry(settings.mapping.screen_target), injector);
-os.set_active(true);                                        // or leave paused for the user
+* The trackers run **unchanged**; their output goes through Engineer 4's 1-Euro
+  filter (optional) into **Engineer 5's real `OsController`** via
+  `os_integration_capi.dll`.
+* **Simulation** (default) never touches the mouse: a map shows where the
+  cursor would go. **Real mouse** starts paused; Esc pauses instantly and
+  moving the real mouse takes over for 1.5 s.
+* Live camera overlays (pointer, trail, hand box, active zone, eye and iris
+  points, gaze arrow), a Live data tab (every tracker and controller value and
+  counter), live **Tuning** sliders (zones, gesture times, smoothing; saving to
+  your settings is optional), a 10-target **accuracy test**, **CSV recording**
+  (Documents\HandEyeTests) and a **Run checks** button.
+* Run it without the launcher: `.venv\Scripts\python.exe core_engine\os_integration\tester\handeye_tester.py`.
+  Log: `%LOCALAPPDATA%\HandEyeTracker\tester.log`.
 
-// per frame, after Python + DSP:
-osi::FramePayload frame;
-frame.timestamp_seconds = t;
-if (filtered_hand.point) frame.hand.point = osi::NormalizedPoint{filtered_hand.point->x, filtered_hand.point->y};
-frame.hand.state = hand_state;          // raw Python integer
-if (filtered_gaze.point) frame.gaze.point = osi::NormalizedPoint{filtered_gaze.point->x, filtered_gaze.point->y};
-frame.gaze.state = gaze_state;
-const osi::FrameReport report = os.update(frame);   // ~64 ns + SendInput
-```
+## Integration with the engine
 
-**To keep the tray app, settings and wizard as well,** the core hosts a
-`TrayApp` instead of a bare `OsController`. It runs the tray on its own thread
-and submits each frame; `app/tray_main.cpp` (`--simulate`) shows exactly this:
+Already done by Engineer 1 on `first-full-working-demo` (`core_engine/include/os_bridge.hpp`):
+the engine hosts a `TrayApp`, calls `submit_frame()` once per processed frame,
+`request_exit()` at shutdown, and rebuilds its DSP filters from
+`TrayOptions::on_settings_changed`. Anything that changes `FramePayload` or the
+`TrayApp` API must be agreed with Engineer 1, because `os_bridge.hpp` is the
+only file that knows both sides.
 
-```cpp
-#include "tray_app.hpp"
-
-osi::app::TrayOptions options;               // settings/log paths, dry run, ...
-options.on_settings_changed = [](const osi::Settings& s) {
-    // rebuild dsp::TrackingFilter2D from s.hand_filter / s.gaze_filter
-};
-osi::app::TrayApp tray(GetModuleHandleW(nullptr), options);
-std::thread ui([&] { tray.run(); });           // tray icon, menu, wizard
-
-// per frame, from the core loop thread (thread-safe):
-tray.submit_frame(frame);
-
-// on shutdown:
-tray.request_exit();
-ui.join();
-```
-
-To add this module to the root build, one line goes in the root
-`CMakeLists.txt` after `add_subdirectory(dsp_filter)`, then link
-`os_integration_win32` (controller only) or `os_integration_tray` (with the
-tray app). That file belongs to Engineer 1, so this line was not added here:
-
-```cmake
-add_subdirectory(core_engine/os_integration)
-```
+Other tools can drive the controller without C++ through `capi/osi_capi.h`
+(create, update, apply settings, drain recorded events, smoothing filter); see
+`tester/osi_capi.py` for a complete ctypes binding.
 
 ## Known limitations and next steps
 
 * **Gaze accuracy:** the iris ratio from `gaze_intent.py` is coarse, so gaze
   pointing is best for large targets. Hand pointing is the precise mode.
-* **Hand model:** `assets/hand_landmarker.task` must be added to the repo (or
-  downloaded) before hand tracking runs.
 * **Elevated windows:** Windows blocks injected input into apps running as
   administrator unless the tray app is also elevated. This is reported, not
   bypassed.
-* **Live tracking:** real camera frames reach this module only once the core
-  loop (Phases 2 and 3) is connected. Until then, `os_demo` and `--simulate`
-  demonstrate the OS side.
+* **Live tuning still to do:** gaze range and direction and the wink timing
+  must be checked with a person in front of the camera (the tester's Gaze and
+  Winks modes, then the tray wizard). The defaults are starting values.
+* **Calibration ownership:** Engineer 3's `run_gaze.py` has its own 9-dot
+  calibration; the engine guide assigns calibration to this module. Agree on one.
 * **Scrolling:** there is no scroll gesture yet. Adding one means a new
   `ActionType` plus a `MOUSEEVENTF_WHEEL` input.

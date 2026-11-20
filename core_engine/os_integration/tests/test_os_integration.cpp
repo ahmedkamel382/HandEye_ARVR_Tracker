@@ -371,9 +371,13 @@ int main() {
         GestureInterpreter g(GestureSettings{});
         double t = 0.0;
         std::vector<Action> all;
-        for (auto [gesture, frames] : {std::pair{HandGesture::Neutral, 5}, std::pair{HandGesture::Pinch, 10},
-                                       std::pair{HandGesture::Neutral, 10}}) {
-            const auto actions = feed(g, gesture, EyeState::Neutral, t, frames);
+        struct Phase {
+            HandGesture gesture;
+            int frames;
+        };
+        const Phase phases[] = {{HandGesture::Neutral, 5}, {HandGesture::Pinch, 10}, {HandGesture::Neutral, 10}};
+        for (const Phase& phase : phases) {
+            const auto actions = feed(g, phase.gesture, EyeState::Neutral, t, phase.frames);
             all.insert(all.end(), actions.begin(), actions.end());
         }
         require(same_actions(all, {{ActionType::ButtonDown, MouseButton::Left},
@@ -859,6 +863,81 @@ int main() {
         require(failed, "failure not reported");
         require(!c.button_held(MouseButton::Left), "refused press recorded as held");
     });
+    // ---- team tracker item #8: a refused button-up must never leave a button stuck ----
+    run_test("controller_refused_release_is_retried_until_accepted", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 6; ++i, t += kDt) {
+            c.update(hand_frame(t, kCentre, HandGesture::Pinch));
+        }
+        require(c.button_held(MouseButton::Left), "setup: pinch not pressed");
+        sink.fail_releases = true; // e.g. an elevated window took focus mid-drag
+        FrameReport report;
+        for (int i = 0; i < 12; ++i, t += kDt) {
+            report = c.update(hand_frame(t, kCentre));
+        }
+        require(c.button_held(MouseButton::Left), "a refused release was forgotten");
+        require(report.release_pending && c.release_pending(), "stuck button not reported");
+        const std::size_t attempts = count(sink, SinkEvent::Kind::Up);
+        require(attempts >= 2, "release not retried (attempts: " + std::to_string(attempts) + ")");
+        for (int i = 0; i < 10; ++i, t += kDt) { // a new pinch while stuck must not press again
+            c.update(hand_frame(t, kCentre, HandGesture::Pinch));
+        }
+        require(count(sink, SinkEvent::Kind::Down) == 1, "pressed again while the button was stuck");
+        sink.fail_releases = false;
+        report = c.update(hand_frame(t, kCentre));
+        require(!c.button_held(MouseButton::Left) && !report.release_pending && !c.release_pending(),
+                "release not completed once Windows accepted it");
+    });
+    run_test("controller_release_all_keeps_refused_buttons", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 6; ++i, t += kDt) {
+            c.update(hand_frame(t, kCentre, HandGesture::Pinch));
+        }
+        sink.fail_releases = true;
+        c.set_active(false); // pausing releases held buttons
+        require(c.button_held(MouseButton::Left) && c.release_pending(),
+                "pause forgot a button Windows refused to release");
+        require(!c.retry_pending_releases(), "retry reported success while Windows still refuses");
+        sink.fail_releases = false;
+        require(c.retry_pending_releases() && !c.button_held(MouseButton::Left),
+                "retry did not release the button");
+        require(c.release_all_buttons(), "nothing left to release");
+    });
+    run_test("controller_click_with_dropped_release_is_released_later", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        sink.fail_releases = true; // the click's press lands, its release does not
+        double t = 0.0;
+        for (int i = 0; i < 30; ++i, t += kDt) {
+            c.update(hand_frame(t, kCentre, HandGesture::Fist));
+        }
+        require(count(sink, SinkEvent::Kind::Click) == 1, "fist did not right-click");
+        require(c.button_held(MouseButton::Right) && c.release_pending(),
+                "half-sent click not tracked as a held button");
+        sink.fail_releases = false;
+        c.update(hand_frame(t, kCentre));
+        require(!c.button_held(MouseButton::Right) && !c.release_pending(),
+                "right button not released after the dropped release");
+    });
+    run_test("controller_destructor_retries_refused_release", [] {
+        RecordingInputSink sink;
+        {
+            OsController c(unit_regions(), kFullHd, sink);
+            c.set_active(true);
+            for (int i = 0; i < 6; ++i) {
+                c.update(hand_frame(i * kDt, kCentre, HandGesture::Pinch));
+            }
+            sink.fail_releases = true;
+        }
+        require(count(sink, SinkEvent::Kind::Up) >= 2, "destructor gave up after one refused release");
+    });
     run_test("controller_gaze_holds_while_calibrating", [] {
         Settings settings = unit_regions();
         settings.mapping.cursor_source = CursorSourceMode::GazeOnly;
@@ -992,6 +1071,12 @@ int main() {
                     r.gaze_filter.derivative_cutoff_hz == 2.0,
                 "gaze filter");
         require(r.app.start_active && r.app.stale_input_seconds == 0.75, "app");
+    });
+    run_test("settings_retired_keys_load_silently", [] {
+        // Files written by the old development bridge carry [app] udp_port.
+        const auto loaded = parse_settings("[app]\nudp_port = 50505\nstart_active = true\n");
+        require(loaded.warnings.empty(), loaded.warnings.empty() ? "" : loaded.warnings.front());
+        require(loaded.settings.app.start_active, "keys after the retired one were not read");
     });
     run_test("settings_bad_values_keep_defaults", [] {
         const auto loaded = parse_settings(

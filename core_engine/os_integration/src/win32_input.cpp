@@ -63,10 +63,14 @@ bool InputInjector::button(MouseButton which, ButtonAction action) noexcept {
     return SendInput(1, &input, sizeof(INPUT)) == 1;
 }
 
-bool InputInjector::click(MouseButton which) noexcept {
+ClickResult InputInjector::click(MouseButton which) noexcept {
     std::array<INPUT, 2> inputs{make_button_input(which, ButtonAction::Down),
                                 make_button_input(which, ButtonAction::Up)};
-    return SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT)) == inputs.size();
+    const UINT inserted = SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+    if (inserted == inputs.size()) {
+        return ClickResult::Clicked;
+    }
+    return inserted == 0 ? ClickResult::Refused : ClickResult::PressedOnly;
 }
 
 void enable_per_monitor_dpi_awareness() noexcept {

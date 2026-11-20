@@ -72,6 +72,7 @@ private:
     void set_active(bool active, const char* reason);
     void refresh_status();
     void check_stale_input();
+    void retry_stuck_buttons();
     void post_event(WPARAM event) noexcept;
     Status current_status();
     void notify(const std::wstring& title, const std::wstring& text, bool warning = false);
@@ -108,6 +109,8 @@ private:
     std::atomic<double> last_frame_at_{-1.0}; // steady seconds; -1 = never
     std::atomic<bool> first_frame_seen_{false};
     std::atomic<double> last_block_notice_{-100.0};
+    bool stuck_button_notified_ = false; // UI thread only
+    std::atomic<bool> release_event_posted_{false};
     std::atomic<bool> unknown_state_logged_{false};
 
     std::unique_ptr<CalibrationWizard> wizard_;

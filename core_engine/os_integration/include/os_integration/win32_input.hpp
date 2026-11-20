@@ -30,7 +30,9 @@ public:
     bool move_to(PixelPoint pixel, AbsolutePoint absolute) noexcept override;
     bool button(MouseButton button, ButtonAction action) noexcept override;
     // Down and up in a single SendInput call so no other input interleaves.
-    bool click(MouseButton button) noexcept override;
+    // SendInput reports how many events it inserted, so a click whose release
+    // was dropped is reported as PressedOnly and the controller releases it later.
+    ClickResult click(MouseButton button) noexcept override;
 };
 
 // ------------------------------------------------------------ displays

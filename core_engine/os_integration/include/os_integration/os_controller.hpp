@@ -26,6 +26,7 @@ struct FrameReport {
     bool active = false;              // state after this frame
     bool inhibited = false;
     bool injection_failed = false;    // Windows refused at least one event
+    bool release_pending = false;     // a button is still down in Windows because its release was refused
     bool gaze_calibrating = false;
     bool hand_held = false;           // the hand point used this frame is a cached HELD point, not a new observation
     std::uint32_t unknown_states = 0; // state integers outside the contract, treated as neutral
@@ -63,8 +64,15 @@ public:
     void set_inhibited(bool inhibited) noexcept;
     [[nodiscard]] bool inhibited() const noexcept { return inhibited_; }
 
-    // Sends button-up for every button this controller is holding.
-    void release_all_buttons() noexcept;
+    // Sends button-up for every button this controller is holding. A button
+    // stays tracked as held until Windows accepts its release; refused
+    // releases are retried by retry_pending_releases() and on every update().
+    // Returns true when no button is left down.
+    bool release_all_buttons() noexcept;
+    // Retries refused releases. Call it periodically even when no frames
+    // arrive (the tray app does, every 250 ms). Returns true when none remain.
+    bool retry_pending_releases() noexcept;
+    [[nodiscard]] bool release_pending() const noexcept;
     [[nodiscard]] bool button_held(MouseButton button) const noexcept;
 
     // Both throw std::invalid_argument and leave the controller unchanged on
@@ -73,6 +81,9 @@ public:
     void set_screen_geometry(const ScreenGeometry& geometry);
 
     [[nodiscard]] const Settings& settings() const noexcept { return settings_; }
+    // Debounced gesture state after the last update (for testers and diagnostics).
+    [[nodiscard]] HandGesture confirmed_hand() const noexcept { return gestures_.confirmed_hand(); }
+    [[nodiscard]] EyeState confirmed_eye() const noexcept { return gestures_.confirmed_eye(); }
     [[nodiscard]] const ScreenMapper& mapper() const noexcept { return mapper_; }
 
 private:
@@ -80,6 +91,7 @@ private:
 
     bool can_output() const noexcept { return active_ && !inhibited_; }
     Outcome execute(const Action& action) noexcept;
+    bool release(MouseButton button) noexcept;
     void reset_tracking_state() noexcept;
 
     Settings settings_;
@@ -89,7 +101,8 @@ private:
     SourceSelector selector_;
     CursorLock hand_lock_;
     CursorLock gaze_lock_;
-    std::array<bool, kMouseButtonCount> held_{};
+    std::array<bool, kMouseButtonCount> held_{};            // down in Windows, as far as we know
+    std::array<bool, kMouseButtonCount> release_pending_{}; // held, and a release was refused
     std::optional<PixelPoint> last_sent_;
     std::optional<PixelPoint> last_cursor_;
     double last_timestamp_ = 0.0;

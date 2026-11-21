@@ -36,6 +36,13 @@ jobs:
           pip install -r requirements.txt
           pip install pybind11
 
+      - name: Fix tl2cgen Windows DLL Path Issue
+        shell: pwsh
+        run: |
+          $pythonDir = Split-Path (Get-Command python).Source
+          $libBinPath = Join-Path $pythonDir "Library\bin"
+          New-Item -ItemType Directory -Force -Path $libBinPath | Out-Null
+
       - name: Bytecode Compilation Check (All Python Modules)
         run: |
           python -m compileall -q ai_pipeline core_engine/tests core_engine/tools core_engine/os_integration/tester dsp_filter/evaluation
@@ -70,6 +77,10 @@ jobs:
       - name: Hand Tracking Observability Unit Tests
         run: |
           python ai_pipeline/hand_kinematics/tests/check_tracking_observability.py
+
+      - name: Engineer 3 — Gaze Intent Unit Tests
+        run: |
+          python -m pytest ai_pipeline/gaze_intent/tests -v
 
       - name: DSP Evaluation Unit Tests (138 Tests)
         shell: pwsh

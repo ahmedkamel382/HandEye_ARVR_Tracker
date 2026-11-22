@@ -108,7 +108,7 @@ namespace core {
         static constexpr int kFacePoints = 478;
         static constexpr int kPoseRows = 6;                // the 4x4 matrix rides behind the landmarks: 16 floats, row-major,
         static constexpr int kPacked = kFacePoints + kPoseRows;  // padded with zeros to 6 rows of 3 (see landmark_extractors.py)
-        static constexpr double kSpanDeg = 60.0;                 // x, y = 0.5 + angle / kSpanDeg  (+-30 deg covers the unit square)
+        static constexpr double kSpanDeg = 60.0;                 // x = 0.5 + yaw / kSpanDeg, y = 0.5 - pitch / kSpanDeg  (+-30 deg covers the unit square; +pitch UP -> y toward 0)
 
         GazeNative(IForest* wink, IRegressor* pitch, IRegressor* yaw, int calibration_frames = 30, int window = 10)
             : wink_(wink), pitch_(pitch), yaw_(yaw), calib_target_(calibration_frames),
@@ -294,7 +294,7 @@ namespace core {
             o.yaw_deg = yaw_deg;
             o.pitch_deg = pitch_deg;
             o.x = float(clamp01(0.5 + yaw_deg / kSpanDeg));
-            o.y = float(clamp01(0.5 + pitch_deg / kSpanDeg));
+            o.y = float(clamp01(0.5 - pitch_deg / kSpanDeg));
         }
 
         // True 3D distance in pixels (same as Python's _get_3d_dist): MediaPipe's z is scaled like x, i.e. by the frame WIDTH.

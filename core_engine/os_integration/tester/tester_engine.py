@@ -331,8 +331,11 @@ class GazeSource:
         obs = GazeObs(state=int(state), yaw=yaw, pitch=pitch, head_yaw=head_yaw, head_pitch=head_pitch,
                       landmarks=landmarks, face=landmarks is not None)
         if self.module.is_valid_output(yaw, pitch):
-            # Same mapping as the engine (GazeNative::setPointer): 0.5 + angle / 60, clamped.
-            obs.point = (self.module.angle_to_norm_coord(yaw), self.module.angle_to_norm_coord(pitch))
+            # Same mapping as the engine (GazeNative::setPointer): X = 0.5 + yaw / 60, Y = 0.5 - pitch / 60, clamped.
+            obs.point = (
+                self.module.angle_to_norm_coord(yaw),
+                self.module.angle_to_norm_coord(pitch, invert=True),
+            )
         obs.ms = (time.perf_counter() - start) * 1000.0
         return obs
 

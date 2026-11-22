@@ -333,16 +333,14 @@ Other tools can drive the controller without C++ through `capi/osi_capi.h`
 
 ## Known limitations and next steps
 
-* **Uncalibrated gaze is wrong (audit finding #1, open):** run the tray's
-  Calibrate > Gaze range first. With the shipped models and a synthetic
-  straight-ahead input, pitch is -17.72 degrees (y = 0.205), above the top of the
-  default `gaze_region` (0.30), so the cursor sits on the top edge. The same
-  synthetic probe indicates that both axes run opposite to the screen (looking
-  right lowers x, looking up raises y). The default stays a placeholder until
-  neutral pitch and all four directions are measured on a real camera; the
-  wizard fits offset and inverted axes, but in the same synthetic probe eyes-only
-  vertical movement was not monotonic in the pitch model and the wizard rejected
-  the fit. Check that live; if it happens, it is a model question for Engineer 3.
+* **Uncalibrated gaze defaults & live verification (audit finding #1):** on
+  `exp/gaze-e3-e5-joint-candidate`, the stabilized ExtraTrees gaze models,
+  fixed vertical Y sign (`0.5 - |pitch|/60.0`), and centered default
+  `gaze_region` (`[0.25, 0.60, 0.75, 0.80]`) align all four gaze directions
+  with screen axes and place neutral pitch (`y ≈ 0.68–0.72`) inside the active
+  region instead of clamping to the top edge. Run the tray's
+  Calibrate > Gaze range wizard for per-user fit; live cued fixation and
+  wizard verification remain pending before merge to `first-full-working-demo`.
 * **Gaze accuracy:** the estimate from `gaze_intent.py` is coarse, so gaze
   pointing is best for large targets. Hand pointing is the precise mode.
 * **Elevated windows:** Windows blocks injected input into apps running as

@@ -237,9 +237,9 @@ class TestTreeliteModelDlls:
             assert float(pitch_pred.predict(dmat).item()) == pitch_val_1
             assert float(yaw_pred.predict(dmat).item()) == yaw_val_1
 
-        # Golden regression values for deployed models on first-full-working-demo
-        assert math.isclose(pitch_val_1, -17.71785574, rel_tol=1e-5, abs_tol=1e-5)
-        assert math.isclose(yaw_val_1, 0.00726980, rel_tol=1e-5, abs_tol=1e-5)
+        # Golden regression values for integrated Candidate gaze models (cd6c0db)
+        assert math.isclose(pitch_val_1, -13.1737435620, rel_tol=1e-5, abs_tol=1e-5)
+        assert math.isclose(yaw_val_1, 0.8371970249, rel_tol=1e-5, abs_tol=1e-5)
 
         # Batch of realistic feature vectors stays finite and within plausible angular bounds
         rng = np.random.default_rng(42)
@@ -376,9 +376,52 @@ class TestFeatureExtractionAndGeometry:
         assert math.isclose(r_ear, 1.0, abs_tol=1e-9)
 
     def test_mpii_processor_shared_feature_extraction_and_vector_to_pitch_yaw(self):
+        import builtins
+        import importlib.util
+
         stub_detector = StubFaceDetector()
-        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector):
-            import mpii_processor as mp_proc
+        real_import = builtins.__import__
+
+        def import_without_dataset_deps(name, globals=None, locals=None, fromlist=(), level=0):
+            if name in ("pandas", "tqdm"):
+                if name in sys.modules:
+                    return sys.modules[name]
+                raise ModuleNotFoundError(f"Simulated missing optional dataset package: {name}")
+            return real_import(name, globals, locals, fromlist, level)
+
+        stub_pandas = types.ModuleType("pandas")
+        stub_tqdm = types.ModuleType("tqdm")
+        stub_tqdm.tqdm = lambda iterable, *a, **kw: iterable
+
+        # Load mpii_processor under simulated absence of pandas/tqdm (matching minimal runtime envs)
+        mpii_path = GAZE_DIR / "mpii_processor.py"
+        spec = importlib.util.spec_from_file_location("mpii_processor_no_pandas", str(mpii_path))
+        assert spec is not None and spec.loader is not None
+        mp_proc = importlib.util.module_from_spec(spec)
+        with (
+            patch.dict(sys.modules, {"pandas": stub_pandas, "tqdm": stub_tqdm}),
+            patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector),
+        ):
+            spec.loader.exec_module(mp_proc)
+
+        # Also prove import mpii_processor itself works when pandas/tqdm are not installed in the host Python
+        saved_modules = {k: sys.modules.get(k) for k in ("mpii_processor", "pandas", "tqdm")}
+        try:
+            for k in ("mpii_processor", "pandas", "tqdm"):
+                sys.modules.pop(k, None)
+            with (
+                patch.object(builtins, "__import__", side_effect=import_without_dataset_deps),
+                patch.dict(sys.modules, {"pandas": stub_pandas, "tqdm": stub_tqdm}),
+                patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector),
+            ):
+                import mpii_processor as imported_mp_proc
+                assert imported_mp_proc.extract_gaze_features is gi.extract_gaze_features
+        finally:
+            for k, orig in saved_modules.items():
+                if orig is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = orig
 
         # Verify mpii_processor reuses the exact same extract_gaze_features function from gaze_intent
         assert mp_proc.extract_gaze_features is gi.extract_gaze_features
@@ -550,13 +593,15 @@ class TestMockedGazeIntentPipeline:
         assert r_calib["state"] == "-1"
         assert float(r_calib["norm_x"]) == -1.0
 
-        # Frame 2 (active): detected=1, state=0, finite norm_x/norm_y in [0, 1]
+        # Frame 2 (active): detected=1, state=0, finite norm_x/norm_y in [0, 1] with vertical sign inversion
         r_active = dict(zip(_DIAG_FIELD_NAMES, rows[3]))
         assert r_active["frame_id"] == "2"
         assert r_active["detected"] == "1"
         assert r_active["state"] == "0"
         assert 0.0 <= float(r_active["norm_x"]) <= 1.0
         assert 0.0 <= float(r_active["norm_y"]) <= 1.0
+        assert math.isclose(float(r_active["norm_x"]), angle_to_norm_coord(float(r_active["abs_yaw_deg"])), abs_tol=1e-9)
+        assert math.isclose(float(r_active["norm_y"]), angle_to_norm_coord(float(r_active["abs_pitch_deg"]), invert=True), abs_tol=1e-9)
 
         # Frame 3 (dropout): detected=0, state=0, norm_x=-1.0
         r_lost = dict(zip(_DIAG_FIELD_NAMES, rows[4]))
@@ -578,14 +623,24 @@ class TestCoordinateMappingAndCalibrationMath:
         assert math.isclose(angle_to_norm_coord(-30.0), 0.0, abs_tol=1e-9)
         assert math.isclose(angle_to_norm_coord(30.0), 1.0, abs_tol=1e-9)
 
+        # Inverted vertical axis (+pitch UP -> smaller y toward 0.0, -pitch DOWN -> larger y toward 1.0)
+        assert math.isclose(angle_to_norm_coord(0.0, invert=True), 0.5, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(15.0, invert=True), 0.25, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(-15.0, invert=True), 0.75, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(30.0, invert=True), 0.0, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(-30.0, invert=True), 1.0, abs_tol=1e-9)
+
         # Out-of-span angles clamp cleanly to [0.0, 1.0]
         assert angle_to_norm_coord(-75.0) == 0.0
         assert angle_to_norm_coord(75.0) == 1.0
+        assert angle_to_norm_coord(75.0, invert=True) == 0.0
+        assert angle_to_norm_coord(-75.0, invert=True) == 1.0
 
         # Non-finite angles return sentinel -1.0 (matches C++ GazeNative::setPointer)
         assert angle_to_norm_coord(float("nan")) == -1.0
         assert angle_to_norm_coord(float("inf")) == -1.0
         assert angle_to_norm_coord(float("-inf")) == -1.0
+        assert angle_to_norm_coord(float("nan"), invert=True) == -1.0
 
     def test_is_valid_output_sentinel_guard(self):
         assert is_valid_output(0.0, 0.0)
@@ -626,9 +681,9 @@ class TestTimestampMonotonicityAndFixationStability:
     @pytest.mark.parametrize(
         "fixation_name,iris_xy,head_yaw_deg,expected_side",
         [
-            ("left_screen_fixation", (0.62, 0.0), -14.0, "left"),
+            ("left_screen_fixation", (0.38, 0.0), -10.0, "left"),
             ("center_screen_fixation", (0.50, 0.0), 0.0, "center"),
-            ("right_screen_fixation", (0.38, 0.0), 14.0, "right"),
+            ("right_screen_fixation", (0.62, 0.0), 10.0, "right"),
         ],
     )
     def test_300_frame_sustained_fixation_stability_no_dropouts_or_collapse(

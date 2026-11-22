@@ -87,11 +87,16 @@ class GazeDiagnosticPayload:
 _DIAG_FIELD_NAMES = tuple(f.name for f in fields(GazeDiagnosticPayload))
 
 
-def angle_to_norm_coord(angle_deg: float) -> float:
-    """Mirrors GazeNative::setPointer: clamp01(0.5 + angle_deg / 60.0), or -1.0 when non-finite."""
+def angle_to_norm_coord(angle_deg: float, invert: bool = False) -> float:
+    """Mirrors GazeNative::setPointer: clamp01(0.5 +- angle_deg / 60.0), or -1.0 when non-finite.
+
+    Horizontal yaw uses invert=False (0.5 + yaw / 60.0: left -> 0, right -> 1).
+    Vertical pitch uses invert=True (0.5 - pitch / 60.0: up (+pitch) -> 0, down (-pitch) -> 1).
+    """
     if not math.isfinite(angle_deg):
         return -1.0
-    return max(0.0, min(1.0, 0.5 + angle_deg / SPAN_DEG))
+    signed_deg = -angle_deg if invert else angle_deg
+    return max(0.0, min(1.0, 0.5 + signed_deg / SPAN_DEG))
 
 
 def is_valid_output(abs_yaw: float, abs_pitch: float) -> bool:
@@ -416,7 +421,7 @@ class GazeIntent:
 
             if self._diag_writer is not None:
                 nx = angle_to_norm_coord(abs_yaw)
-                ny = angle_to_norm_coord(abs_pitch)
+                ny = angle_to_norm_coord(abs_pitch, invert=True)
                 self._write_diag_row(GazeDiagnosticPayload(
                     frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
                     detected=1 if (nx >= 0.0 and ny >= 0.0) else 0, state=state,

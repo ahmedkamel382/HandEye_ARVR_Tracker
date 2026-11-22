@@ -1519,6 +1519,74 @@ int main() {
     run_test("tray_invalid_reload_keeps_running_settings", osi_tray_tests::invalid_reload_keeps_running_settings);
 #endif
 
+    // ================================================================ E3 + E5 joint gaze contract
+    run_test("joint_default_gaze_region_avoids_edge_pinning_and_preserves_directions", [] {
+        const Settings defaults;
+        const ScreenMapper mapper(kFullHd);
+
+        // Candidate golden neutral: rel_yaw=+0.837 deg -> norm_x=0.514, rel_pitch=-13.174 deg -> norm_y=0.720
+        const PixelPoint neutral = mapper.map(defaults.mapping.gaze_region, {0.514, 0.720});
+        require(neutral.x > 400 && neutral.x < 1520, "uncalibrated neutral X pinned near horizontal edge");
+        require(neutral.y > 100 && neutral.y < 980, "uncalibrated neutral Y pinned near vertical edge");
+
+        // Real live Candidate directional sweeps (LEFT->RIGHT x: 0.207->0.787, UP->DOWN y: 0.697->0.722)
+        const PixelPoint left = mapper.map(defaults.mapping.gaze_region, {0.207, 0.697});
+        const PixelPoint right = mapper.map(defaults.mapping.gaze_region, {0.787, 0.697});
+        const PixelPoint up = mapper.map(defaults.mapping.gaze_region, {0.514, 0.697});
+        const PixelPoint down = mapper.map(defaults.mapping.gaze_region, {0.514, 0.722});
+        require(left.x == 0 && right.x == 1919 && left.x < right.x, "LEFT->RIGHT X direction failed");
+        require(up.y > 0 && down.y < 1079 && up.y < down.y, "UP->DOWN Y direction failed or pinned to edge");
+    });
+    run_test("joint_calibration_fits_candidate_live_gaze_range_non_inverted", [] {
+        // Real live Candidate range observed at 12%/88% targets:
+        // X: ~0.24..0.76 (full-screen 0.16..0.84), Y: ~0.697..0.722 (slope_y ~ 0.0322 >= kMinRegionSpan=0.02)
+        const InputRegion live_truth{0.16, 0.693, 0.84, 0.725};
+        const auto obs = synthetic_observations(live_truth, 42, 0.0018);
+        const auto result = fit_input_region(obs);
+        require(result.fit.has_value(), "Candidate live vertical range rejected: " + result.error);
+        require(result.fit->region.x_min < result.fit->region.x_max, "fitted X should not be inverted");
+        require(result.fit->region.y_min < result.fit->region.y_max, "fitted Y should not be inverted");
+        require(result.fit->rms_error <= 0.12, "RMS error exceeded calibration threshold");
+
+        const ScreenMapper mapper(kFullHd);
+        const PixelPoint top_left = mapper.map(result.fit->region, {0.16, 0.693});
+        const PixelPoint bottom_right = mapper.map(result.fit->region, {0.84, 0.725});
+        require(top_left.x < 100 && top_left.y < 150, "fitted top-left failed");
+        require(bottom_right.x > 1820 && bottom_right.y > 930, "fitted bottom-right failed");
+
+        // Flat / saturated vertical span (< kMinRegionSpan = 0.02) must still be rejected cleanly
+        const auto flat_v = fit_input_region(synthetic_observations({0.20, 0.710, 0.80, 0.722}, 7, 0.0));
+        require(!flat_v.fit && flat_v.error.find("up-down") != std::string::npos,
+                "flat vertical span should be rejected with up-down guidance");
+    });
+    run_test("joint_gaze_safety_calibrating_and_pause_never_click_or_stick", [] {
+        Settings s;
+        s.mapping.cursor_source = CursorSourceMode::GazeOnly;
+        RecordingInputSink sink;
+        OsController c(s, kFullHd, sink);
+        c.set_active(true);
+
+        double t = 0.0;
+        // Calibrating / invalid frames never move cursor or click
+        c.update(gaze_frame(t, std::nullopt, EyeState::Calibrating));
+        t += kDt;
+        require(sink.events.empty(), "calibrating frame sent mouse output");
+
+        // Neutral active frames map inside screen, never pin or false-click
+        for (int i = 0; i < 6; ++i, t += kDt) {
+            c.update(gaze_frame(t, NormalizedPoint{0.514, 0.720}, EyeState::Neutral));
+        }
+        require(count(sink, SinkEvent::Kind::Move) >= 1 && count(sink, SinkEvent::Kind::Click) == 0,
+                "neutral gaze failed to move safely");
+        const auto last_move = last_move_before(sink, sink.events.size());
+        require(last_move && last_move->y > 100 && last_move->y < 980, "neutral gaze stuck to edge");
+
+        // Pause immediately keeps held buttons released
+        c.set_active(false);
+        require(!c.button_held(MouseButton::Left) && !c.button_held(MouseButton::Right),
+                "button stayed held after pause");
+    });
+
     std::cout << "SUMMARY passed=" << passes << " failed=" << failures << '\n';
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

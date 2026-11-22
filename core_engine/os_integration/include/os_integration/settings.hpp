@@ -26,8 +26,9 @@ struct FilterSettings {
 struct MappingSettings {
     // Hand: the central 70% of the frame covers the whole screen.
     InputRegion hand_region{0.15, 0.15, 0.85, 0.85};
-    // Gaze: placeholder band until the calibration wizard measures the user.
-    InputRegion gaze_region{0.30, 0.30, 0.70, 0.70};
+    // Gaze: centered around the webcam-above-screen pitch offset (~-12 deg -> norm_y ~0.70)
+    // until the calibration wizard measures the individual user.
+    InputRegion gaze_region{0.25, 0.60, 0.75, 0.80};
     CursorSourceMode cursor_source = CursorSourceMode::HandPreferred;
     ScreenTarget screen_target = ScreenTarget::PrimaryMonitor;
     double source_switch_seconds = 0.20;

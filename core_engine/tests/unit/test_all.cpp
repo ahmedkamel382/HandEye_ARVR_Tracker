@@ -410,8 +410,18 @@ static void t_gaze_adds_head_pose_and_outputs_raw() {
     CHECK_NEAR(o.yaw_deg, 20.0, 1e-4);                                     // -10.0 (eye) + 30.0 (head)
     CHECK_NEAR(o.pitch_deg, 5.0, 1e-4);                                    // 5.0 (eye) + 0.0 (head)
     CHECK_NEAR(o.x, 0.5 + o.yaw_deg / GazeNative::kSpanDeg, 1e-6);         // the 0..1 pointer for the OS stage
+    CHECK_NEAR(o.y, 0.5 - o.pitch_deg / GazeNative::kSpanDeg, 1e-6);       // +pitch (UP) maps toward 0.0
     for (int i = 0; i < 80; ++i) o = r.run(f);
     CHECK_NEAR(o.yaw_deg, 20.0, 0.01);                                     // remains exactly rel + head
+
+    // Directional contract: LEFT->RIGHT increases x, UP->DOWN increases y
+    FacePts f0(0.3, 0.3);
+    r.pitch_out = 10.0; r.yaw_out = -12.0;                                 // UP-LEFT
+    const ModuleOut up_left = r.run(f0);
+    r.pitch_out = -10.0; r.yaw_out = 12.0;                                 // DOWN-RIGHT
+    const ModuleOut down_right = r.run(f0);
+    CHECK(up_left.x < 0.5f && down_right.x > 0.5f && up_left.x < down_right.x);
+    CHECK(up_left.y < 0.5f && down_right.y > 0.5f && up_left.y < down_right.y);
 }
 
 static bool double_bits_eq(double a, double b) {
@@ -598,7 +608,7 @@ static void run_gaze_diag_off_vs_on_and_csv_reconstruction(
             const double rec_ap = rec_rp + hp_csv;
             const double rec_ay = rec_ry + hy_csv;
             const double rec_nx = double(float(std::max(0.0, std::min(1.0, 0.5 + rec_ay / GazeNative::kSpanDeg))));
-            const double rec_ny = double(float(std::max(0.0, std::min(1.0, 0.5 + rec_ap / GazeNative::kSpanDeg))));
+            const double rec_ny = double(float(std::max(0.0, std::min(1.0, 0.5 - rec_ap / GazeNative::kSpanDeg))));
 
             const double errs[12] = {
                 std::fabs(l_ix_csv - rec_l_ix), std::fabs(r_ix_csv - rec_r_ix), std::fabs(sx_csv - rec_sx),

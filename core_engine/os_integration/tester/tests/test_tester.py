@@ -1050,3 +1050,54 @@ def test_middle_click_counts_in_the_accuracy_test(make_app, monkeypatch):
                    counters=tester_engine.Counters(middle_click=1))
     app._update_screen(snap)
     assert seen == [True]
+
+
+def test_gaze_source_matches_engine_vertical_sign_and_directions(monkeypatch):
+    tester_engine.prepare_ai_imports()
+    import gaze_intent as gi
+
+    class FakeTracker:
+        def __init__(self):
+            self.outputs = iter([
+                (-12.0, 10.0, 0.0, 0.0, 0, [object()]),   # UP-LEFT: negative yaw, positive pitch
+                (12.0, -10.0, 0.0, 0.0, 0, [object()]),   # DOWN-RIGHT: positive yaw, negative pitch
+            ])
+
+        def process_frame(self, rgb, ts):
+            return next(self.outputs)
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(gi, "GazeIntent", FakeTracker)
+    src = tester_engine.GazeSource()
+    blank = np.zeros((16, 16, 3), dtype=np.uint8)
+    try:
+        up_left = src.process(blank)
+        down_right = src.process(blank)
+    finally:
+        src.close()
+
+    assert up_left.point is not None and down_right.point is not None
+    assert up_left.point[0] == pytest.approx(0.3, abs=1e-9)
+    assert up_left.point[1] == pytest.approx(0.5 - 10.0 / 60.0, abs=1e-9)
+    assert down_right.point[0] == pytest.approx(0.7, abs=1e-9)
+    assert down_right.point[1] == pytest.approx(0.5 + 10.0 / 60.0, abs=1e-9)
+    assert up_left.point[0] < down_right.point[0] and up_left.point[1] < down_right.point[1]
+
+
+def test_uncalibrated_default_gaze_region_keeps_candidate_neutral_inside_screen(lib):
+    defaults = IniDoc(lib.default_settings_ini())
+    defaults.set("mapping", "cursor_source", "gaze_only")
+    c = lib.controller(defaults.text(), all_monitors=False, real_mouse=False)
+    try:
+        target, _ = c.geometry()
+        # Candidate golden neutral: yaw=+0.837 deg -> 0.514, pitch=-13.174 deg -> 0.720
+        r = c.update(0.0, None, osi_capi.TrackerInput((0.514, 0.720), 0))
+        assert r.cursor is not None
+        cx, cy = r.cursor
+        assert target[0] + 50 < cx < target[0] + target[2] - 50
+        assert target[1] + 50 < cy < target[1] + target[3] - 50
+    finally:
+        c.close()
+

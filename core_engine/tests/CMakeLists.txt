@@ -3,13 +3,17 @@
 #   gaze_hand_parity  Windows + the compiled hand forest: the C++ ports versus the REAL gaze_intent.py / hand_tracker.py
 #   core_e2e          Windows: whole engine on a synthetic video with stand-in extractors (real gaze .dll models)
 add_executable(core_unit_tests unit/test_all.cpp)
-target_include_directories(core_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}/core_engine/include")
+target_include_directories(core_unit_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/core_engine/include"
+    "${CMAKE_BINARY_DIR}/generated")
 if(MSVC)
     target_compile_options(core_unit_tests PRIVATE /W4 /permissive-)
 else()
     target_compile_options(core_unit_tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME core_unit_tests COMMAND core_unit_tests)
+set_tests_properties(core_unit_tests PROPERTIES
+    ENVIRONMENT "CORE_GAZE_MODELS_DIR=${CMAKE_SOURCE_DIR}/ai_pipeline/gaze_intent/models")
 
 # parity: the C++ gaze + hand ports versus the REAL Python files (needs the compiled hand forest; the gaze
 # models are Windows .dll files, and the Python reference needs the tl2cgen package to load them)

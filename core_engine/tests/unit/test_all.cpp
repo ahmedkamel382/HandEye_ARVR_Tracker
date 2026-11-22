@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -13,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "build_paths.hpp"
 #include "forest.hpp"
 #include "frame_clock.hpp"
 #include "gaze_math.hpp"
@@ -458,43 +460,44 @@ static double parse_csv_num(const std::string& s) {
     return std::strtod(s.c_str(), nullptr);
 }
 
-// Engineer 4 Requirement #9:
-//   (a) Bit-identical ModuleOut predictions across 100 frames (calibration, tracking, face loss, reacquisition)
-//       when diagnostic logging is OFF (diag = nullptr) vs ON (diag = &row).
-//   (b) Exact 32-column CSV formatting (capture_s formatted to 9 decimal places) and offline reconstruction
-//       of all 12 derived columns from the 12 logged landmarks + head pose + 6354a14 models within <= 1e-6.
-static void t_gaze_diag_off_vs_on_and_csv_reconstruction() {
-    std::unique_ptr<IForest> wink_owned;
-    std::unique_ptr<IRegressor> pitch_owned, yaw_owned;
-    bool using_real_dlls = false;
-
+static std::optional<std::string> env_var_opt(const char* name) {
 #ifdef _WIN32
-    const char* candidates[] = {
-        "ai_pipeline/gaze_intent/models",
-        "../ai_pipeline/gaze_intent/models",
-        "../../ai_pipeline/gaze_intent/models",
-        "../../../ai_pipeline/gaze_intent/models",
-        "../../../../ai_pipeline/gaze_intent/models"
-    };
-    for (const char* dir : candidates) {
-        const std::string p_wink = std::string(dir) + "/gesture_model.dll";
-        if (std::ifstream(p_wink).good()) {
-            wink_owned.reset(new TlForest(p_wink));
-            pitch_owned.reset(new TlRegressor(std::string(dir) + "/gaze_pitch.dll"));
-            yaw_owned.reset(new TlRegressor(std::string(dir) + "/gaze_yaw.dll"));
-            using_real_dlls = true;
-            break;
-        }
+    char buf[4096];
+    SetLastError(0);
+    const DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (n == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) return std::nullopt;
+    if (n >= sizeof(buf)) {
+        std::string big(n, '\0');
+        const DWORD n2 = GetEnvironmentVariableA(name, &big[0], n);
+        big.resize(n2);
+        return big;
     }
+    return std::string(buf, n);
+#else
+    const char* v = std::getenv(name);
+    if (!v) return std::nullopt;
+    return std::string(v);
 #endif
-    if (!using_real_dlls) {
-        wink_owned.reset(new LambdaForest([](const float* f) { return (f[0] < 0.5f && f[3] > 0.7f) ? 1 : 0; }));
-        pitch_owned.reset(new LambdaRegressor([](const float* f) { return -15.0 * double(f[1]) - 0.35 * double(f[2]); }));
-        yaw_owned.reset(new LambdaRegressor([](const float* f) { return 40.0 * (double(f[0]) - 0.5) - 0.50 * double(f[3]); }));
-    }
+}
 
-    GazeNative g_off(wink_owned.get(), pitch_owned.get(), yaw_owned.get());
-    GazeNative g_on(wink_owned.get(), pitch_owned.get(), yaw_owned.get());
+static std::string resolve_gaze_models_dir() {
+    std::string dir;
+    if (const auto env_dir = env_var_opt("CORE_GAZE_MODELS_DIR")) {
+        dir = *env_dir;
+    } else if (core::paths::kAiPipelineDir[0] != '\0') {
+        dir = std::string(core::paths::kAiPipelineDir) + "/gaze_intent/models";
+    }
+    if (dir.empty()) return dir;
+    std::error_code ec;
+    const std::filesystem::path abs_p = std::filesystem::absolute(std::filesystem::u8path(dir), ec);
+    return ec ? dir : abs_p.generic_string();
+}
+
+static void run_gaze_diag_off_vs_on_and_csv_reconstruction(
+    IForest* wink, IRegressor* pitch, IRegressor* yaw,
+    int& out_bit_mismatches, double& out_max_err) {
+    GazeNative g_off(wink, pitch, yaw);
+    GazeNative g_on(wink, pitch, yaw);
 
     const auto hdr_cols = split_csv(kGazeDiagCsvHeader);
     CHECK(hdr_cols.size() == 32);
@@ -503,7 +506,7 @@ static void t_gaze_diag_off_vs_on_and_csv_reconstruction() {
           hdr_cols[19] == "norm_y" && hdr_cols[31] == "lm473_y");
 
     int bit_mismatches = 0;
-    double max_err[12] = {}; // l_ix, r_ix, sx, l_iy, r_iy, sy, rel_p, rel_y, abs_p, abs_y, nx, ny
+    double overall_max_err = 0.0;
 
     for (int i = 0; i < 100; ++i) {
         const bool is_loss = (i >= 80 && i < 90);
@@ -589,8 +592,8 @@ static void t_gaze_diag_off_vs_on_and_csv_reconstruction() {
             const double rec_sy   = 0.5 * (rec_l_iy + rec_r_iy);
 
             const float gf[kPoseFeatures] = { float(rec_sx), float(rec_sy), float(hp_csv), float(hy_csv), float(hr_csv) };
-            const double rec_rp = pitch_owned->predict(gf);
-            const double rec_ry = yaw_owned->predict(gf);
+            const double rec_rp = pitch->predict(gf);
+            const double rec_ry = yaw->predict(gf);
             const double rec_ap = rec_rp + hp_csv;
             const double rec_ay = rec_ry + hy_csv;
             const double rec_nx = double(float(std::max(0.0, std::min(1.0, 0.5 + rec_ay / GazeNative::kSpanDeg))));
@@ -604,14 +607,80 @@ static void t_gaze_diag_off_vs_on_and_csv_reconstruction() {
                 std::fabs(nx_csv - rec_nx),     std::fabs(ny_csv - rec_ny)
             };
             for (int k = 0; k < 12; ++k) {
-                if (errs[k] > max_err[k]) max_err[k] = errs[k];
+                if (errs[k] > overall_max_err) overall_max_err = errs[k];
                 CHECK(errs[k] <= 1e-6);
             }
         }
     }
     CHECK(bit_mismatches == 0);
-    std::printf("    diag OFF vs ON: 100 frames, %d bit mismatches (real_dlls=%s)\n",
-                bit_mismatches, using_real_dlls ? "yes" : "no");
+    out_bit_mismatches = bit_mismatches;
+    out_max_err = overall_max_err;
+}
+
+// Engineer 4 Requirement #9 (Shipped Treelite DLLs):
+//   Requires real gesture_model.dll, gaze_pitch.dll, and gaze_yaw.dll from CORE_GAZE_MODELS_DIR (or
+//   configured kAiPipelineDir/gaze_intent/models); never silently falls back to stub lambdas.
+static void t_gaze_diag_shipped_dlls() {
+#ifdef _WIN32
+    const std::string dir = resolve_gaze_models_dir();
+    CHECK(!dir.empty());
+
+    std::unique_ptr<IForest> wink_owned;
+    std::unique_ptr<IRegressor> pitch_owned, yaw_owned;
+    bool loaded_real_dlls = false;
+    try {
+        wink_owned.reset(new TlForest(dir + "/gesture_model.dll"));
+        pitch_owned.reset(new TlRegressor(dir + "/gaze_pitch.dll"));
+        yaw_owned.reset(new TlRegressor(dir + "/gaze_yaw.dll"));
+        loaded_real_dlls = true;
+    } catch (const std::exception& e) {
+        std::printf("    shipped gaze DLL load failed (dir='%s'): %s\n", dir.c_str(), e.what());
+    }
+    CHECK(loaded_real_dlls);
+    if (!loaded_real_dlls) return;
+
+    int bit_mismatches = 0;
+    double max_err = 0.0;
+    run_gaze_diag_off_vs_on_and_csv_reconstruction(
+        wink_owned.get(), pitch_owned.get(), yaw_owned.get(), bit_mismatches, max_err);
+    std::printf("    diag OFF vs ON (shipped DLLs): 100 frames, %d bit mismatches, max_csv_err=%.3g\n",
+                bit_mismatches, max_err);
+#else
+    bool threw = false;
+    try {
+        TlForest missing("__nonexistent_gaze_models__/gesture_model.dll");
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+#endif
+}
+
+// Deliberate absent-DLL diagnostic + explicit synthetic fallback verification:
+//   (a) Verifies TlForest/TlRegressor throw explicit errors when model DLLs are absent.
+//   (b) Exercises synthetic LambdaForest/LambdaRegressor fallback separately without masking shipped DLLs.
+static void t_gaze_absent_dll_and_fallback_diag() {
+    auto expect_missing_throws = [](auto&& fn) {
+        try {
+            fn();
+            return false;
+        } catch (const std::runtime_error& e) {
+            return e.what()[0] != '\0';
+        }
+    };
+    CHECK(expect_missing_throws([] { TlForest("__nonexistent_gaze_models__/gesture_model.dll"); }));
+    CHECK(expect_missing_throws([] { TlRegressor("__nonexistent_gaze_models__/gaze_pitch.dll"); }));
+    CHECK(expect_missing_throws([] { TlRegressor("__nonexistent_gaze_models__/gaze_yaw.dll"); }));
+
+    LambdaForest wink_fb([](const float* f) { return (f[0] < 0.5f && f[3] > 0.7f) ? 1 : 0; });
+    LambdaRegressor pitch_fb([](const float* f) { return -10.0 * double(f[1]) - 0.35 * double(f[2]); });
+    LambdaRegressor yaw_fb([](const float* f) { return 8.0 * (double(f[0]) - 0.5) - 0.50 * double(f[3]); });
+
+    int bit_mismatches = 0;
+    double max_err = 0.0;
+    run_gaze_diag_off_vs_on_and_csv_reconstruction(&wink_fb, &pitch_fb, &yaw_fb, bit_mismatches, max_err);
+    std::printf("    diag OFF vs ON (explicit fallback): 100 frames, %d bit mismatches, max_csv_err=%.3g\n",
+                bit_mismatches, max_err);
 }
 
 // ======================================================================= freshness gate (Core -> DSP)
@@ -876,7 +945,8 @@ int main() {
         { "gaze: ratio follows the iris", t_gaze_ratio_follows_iris },
         { "gaze: head pose angles", t_head_pose_angles },
         { "gaze: head pose added, raw absolute", t_gaze_adds_head_pose_and_outputs_raw },
-        { "gaze: diag OFF vs ON bit-identity + 32-col CSV reconstruction", t_gaze_diag_off_vs_on_and_csv_reconstruction },
+        { "gaze: diag OFF vs ON + 32-col CSV reconstruction (shipped DLLs)", t_gaze_diag_shipped_dlls },
+        { "gaze: absent DLL error + fallback diag OFF vs ON + CSV reconstruction", t_gaze_absent_dll_and_fallback_diag },
     };
     int failed_tests = 0;
     for (const T& t : tests) {

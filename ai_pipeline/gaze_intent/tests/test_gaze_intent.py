@@ -700,3 +700,74 @@ class TestTimestampMonotonicityAndFixationStability:
             assert np.all(norm_x_arr > 0.60)
         else:
             assert np.all((norm_x_arr > 0.40) & (norm_x_arr < 0.60))
+
+
+# ===========================================================================
+# Pillar 6: Real-Asset Offline Smoke & Negative Asset Regressions (#9 - P2)
+# ===========================================================================
+class TestRealAssetSmokeAndNegativeRegressions:
+    def test_real_face_landmarker_and_dlls_blank_frame_smoke(self):
+        """Instantiate real GazeIntent (no MediaPipe mock) with shipped assets and process blank RGB frames."""
+        task_path = REPO_ROOT / "assets" / "face_landmarker.task"
+        assert task_path.is_file(), f"Missing deployed MediaPipe task asset: {task_path}"
+        for dll_name in ("gesture_model.dll", "gaze_pitch.dll", "gaze_yaw.dll"):
+            assert (MODELS_DIR / dll_name).is_file(), f"Missing deployed DLL: {dll_name}"
+
+        tracker = GazeIntent()
+        try:
+            assert tracker.detector is not None
+            blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            for ts_ms in (33, 66):
+                ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts_ms)
+                assert math.isnan(ay) and math.isnan(ap)
+                assert math.isnan(hy) and math.isnan(hp)
+                assert state == 0
+                assert lms is None
+                assert not is_valid_output(ay, ap)
+            assert not tracker.is_calibrated
+        finally:
+            tracker.shutdown()
+        assert tracker.detector is None
+
+    def test_missing_face_landmarker_task_raises_explicit_error(self, tmp_path, monkeypatch):
+        """Missing assets/face_landmarker.task must raise an explicit error rather than succeeding silently."""
+        fake_ai_root = tmp_path / "ai_pipeline"
+        fake_ai_root.mkdir()
+        (tmp_path / "assets").mkdir()
+        monkeypatch.setenv("AI_PIPELINE_ROOT", str(fake_ai_root))
+
+        with pytest.raises((FileNotFoundError, RuntimeError, ValueError, OSError)):
+            GazeIntent()
+
+    def test_corrupt_face_landmarker_task_raises_explicit_error(self, tmp_path, monkeypatch):
+        """Corrupt/invalid assets/face_landmarker.task must raise an explicit error."""
+        fake_ai_root = tmp_path / "ai_pipeline"
+        fake_ai_root.mkdir()
+        assets_dir = tmp_path / "assets"
+        assets_dir.mkdir()
+        (assets_dir / "face_landmarker.task").write_bytes(b"corrupt-mediapipe-task-archive")
+        monkeypatch.setenv("AI_PIPELINE_ROOT", str(fake_ai_root))
+
+        with pytest.raises((RuntimeError, ValueError, OSError)):
+            GazeIntent()
+
+    def test_missing_treelite_dll_raises_explicit_error(self, tmp_path):
+        """Missing production Treelite DLL under gaze_intent/models must raise FileNotFoundError."""
+        import importlib.util
+
+        isolated_gaze_dir = tmp_path / "ai_pipeline" / "gaze_intent"
+        isolated_gaze_dir.mkdir(parents=True)
+        isolated_py = isolated_gaze_dir / "gaze_intent.py"
+        isolated_py.write_text(
+            (GAZE_DIR / "gaze_intent.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        spec = importlib.util.spec_from_file_location("isolated_gaze_intent_missing_dll", str(isolated_py))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        with pytest.raises(FileNotFoundError, match="Production DLL missing"):
+            mod.GazeIntent()
+

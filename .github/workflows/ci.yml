@@ -78,7 +78,7 @@ jobs:
         run: |
           python ai_pipeline/hand_kinematics/tests/check_tracking_observability.py
 
-      - name: Engineer 3 — Gaze Intent Unit Tests
+      - name: Gaze Intent Unit Tests
         run: |
           python -m pytest ai_pipeline/gaze_intent/tests -v
 

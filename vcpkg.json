@@ -4,6 +4,18 @@
   "version": "1.0.0",
   "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e",
   "dependencies": [
-    "opencv4"
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": [
+        "highgui",
+        "win32ui",
+        "msmf",
+        "dshow",
+        "thread",
+        "fs",
+        "jpeg"
+      ]
+    }
   ]
 }

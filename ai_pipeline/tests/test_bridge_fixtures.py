@@ -39,3 +39,28 @@ def test_exception_path_propagates():   # C++ PyLandmarker counts exceptions and
     class Boom: pass
     try: le.pack_hand([Boom()] * 21, lms(21)); assert False
     except AttributeError: pass
+
+
+class R:   # fake MediaPipe result
+    def __init__(s, i, w): s.hand_landmarks = [i] if i is not None else []; s.hand_world_landmarks = [w] if w is not None else []
+
+def _fixtures():
+    nan = float("nan")
+    return [(lms(21), lms(21)), (lms(20), lms(22)), (lms(21), None), (None, lms(21)), (None, None),
+            (bad(21, "x", nan), lms(21)), (lms(21), bad(21, "z", float("inf")))]
+
+def test_pack_hand_result_and_diag_reason():
+    assert le._pack_hand(R(lms(21), lms(21))).shape == (42, 3)
+    for i, w in _fixtures()[1:]:
+        assert le._pack_hand(R(i, w)).shape == (0, 3)
+    assert le._describe_hand(R(lms(20), lms(22)), 0, 0, "VIDEO")["n"] == 0
+    assert le._describe_hand(R(bad(21, "x", float("inf")), lms(21)), 0, 0, "VIDEO")["reason"] == "NONFINITE"
+
+def test_diag_on_off_equivalence():   # HAND_LANDMARK_DIAG writer must not change the returned array
+    import tempfile
+    path = os.path.join(tempfile.mkdtemp(), "d.csv")
+    w = le._HandDiagWriter(path)
+    for i, wl in _fixtures():
+        a = le._pack_hand(R(i, wl)); b = le._pack_hand(R(i, wl), w, 1, 1, "VIDEO")
+        assert a.shape == b.shape and np.array_equal(a, b, equal_nan=True)
+    w.close(); assert os.path.getsize(path) > 0

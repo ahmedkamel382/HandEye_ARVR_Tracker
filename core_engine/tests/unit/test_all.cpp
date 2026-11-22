@@ -3,14 +3,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-<<<<<<< HEAD
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-=======
 #include <limits>
->>>>>>> 2e9bb97 (Core/bridge: validate 21+21 hand payload, reject non-finite landmarks, fix C4244)
 #include <memory>
 #include <optional>
 #include <random>

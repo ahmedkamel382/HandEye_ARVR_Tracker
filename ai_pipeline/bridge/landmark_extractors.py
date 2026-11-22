@@ -31,7 +31,11 @@ Environment:
                        This is observation only: it does not change the returned array or the tracking path.
     HAND_LANDMARK_DIAG_FILE  optional CSV path (default: hand_landmark_diag_<pid>.csv in the current folder)
 """
+<<<<<<< HEAD
 import csv
+=======
+import math
+>>>>>>> 2e9bb97 (Core/bridge: validate 21+21 hand payload, reject non-finite landmarks, fix C4244)
 import os
 import sys
 
@@ -62,6 +66,7 @@ def _to_array(landmarks) -> np.ndarray:
     return out
 
 
+<<<<<<< HEAD
 # One row per processed hand frame. ts_ms is the same integer the engine passes to
 # process_frame (TrackingResult::ts_ms / "observation_ms" in the E4DSP trace), so the
 # diagnostic joins the trial log exactly. "seq" is a per-extractor counter, not frame_id.
@@ -193,6 +198,28 @@ def _pack_hand(result, diag=None, seq: int = 0, ts_ms: int = 0, mode: str = "") 
     if not result.hand_landmarks or not result.hand_world_landmarks:
         return _EMPTY
     return np.concatenate([_to_array(result.hand_landmarks[0]), _to_array(result.hand_world_landmarks[0])])
+=======
+_HAND_N = 21            # landmarks per list (image list, world list)
+
+
+def pack_hand(image_lms, world_lms):
+    """Validate and pack one hand. Returns (packed (42,3) float32 or _EMPTY, diag dict).
+    Rejects (returns _EMPTY) unless there are EXACTLY 21 image and 21 world landmarks and every x/y/z is finite."""
+    n_img = len(image_lms) if image_lms else 0
+    n_wld = len(world_lms) if world_lms else 0
+    diag = {"has_image": n_img > 0, "has_world": n_wld > 0, "n_image": n_img, "n_world": n_wld,
+            "packed_n": 0, "valid": False, "reason": ""}
+    if n_img != _HAND_N or n_wld != _HAND_N:
+        diag["reason"] = "count"
+        return _EMPTY, diag
+    packed = np.concatenate([_to_array(image_lms), _to_array(world_lms)])
+    if not np.isfinite(packed).all():
+        diag["reason"] = "nonfinite"
+        return _EMPTY, diag
+    diag["packed_n"] = 2 * _HAND_N
+    diag["valid"] = True
+    return packed, diag
+>>>>>>> 2e9bb97 (Core/bridge: validate 21+21 hand payload, reject non-finite landmarks, fix C4244)
 
 
 class FaceLandmarkExtractor:
@@ -252,8 +279,12 @@ class HandLandmarkExtractor:
             min_tracking_confidence=0.3,
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
+<<<<<<< HEAD
         if _diag_enabled():
             self._diag = _HandDiagWriter()
+=======
+        self.last_diag = {}      # per-frame: has_image, has_world, n_image, n_world, packed_n, valid, reason
+>>>>>>> 2e9bb97 (Core/bridge: validate 21+21 hand payload, reject non-finite landmarks, fix C4244)
 
     def process_frame(self, rgb: np.ndarray, timestamp_ms: int) -> np.ndarray:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -261,9 +292,18 @@ class HandLandmarkExtractor:
             result = self.detector.detect_for_video(mp_image, int(timestamp_ms))
         else:
             result = self.detector.detect(mp_image)
+<<<<<<< HEAD
         self._frame += 1
         return _pack_hand(result, self._diag, self._frame, int(timestamp_ms),
                           "VIDEO" if self._video else "IMAGE")
+=======
+        # hand_tracker.py: "no hand" = no world landmarks OR no image landmarks.
+        # Exact 21 + 21 and finite values are required BEFORE packing; anything else is "nothing detected".
+        img = result.hand_landmarks[0] if result.hand_landmarks else None
+        wld = result.hand_world_landmarks[0] if result.hand_world_landmarks else None
+        packed, self.last_diag = pack_hand(img, wld)
+        return packed
+>>>>>>> 2e9bb97 (Core/bridge: validate 21+21 hand payload, reject non-finite landmarks, fix C4244)
 
     def shutdown(self):
         if getattr(self, "_diag", None) is not None:

@@ -176,7 +176,10 @@ public:
     // exactly what the tracker returned before this contract existed; HELD repeats the last TRACKED x, y, state.
     ModuleOut process(const float* pts, int n) {
         using namespace hand_idx;
-        if (n != 0 && (n != kHandPacked || !pts)) {            // bridge error: no output, tracker state untouched
+        bool finite = true;                                    // NaN / +-Inf anywhere: reject before any cursor maths or clamping
+        if (n == kHandPacked && pts)
+            for (int i = 0; i < 3 * kHandPacked; ++i) if (!std::isfinite(pts[i])) { finite = false; break; }
+        if (n != 0 && (n != kHandPacked || !pts || !finite)) { // bridge error: no output, tracker state untouched
             ModuleOut e;                                       // ok = false, x = y = -1, state 0
             e.tracking_state = TrackingState::Lost;
             e.missed_frames = missed_;

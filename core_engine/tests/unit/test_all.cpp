@@ -3,10 +3,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+<<<<<<< HEAD
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+=======
+#include <limits>
+>>>>>>> 2e9bb97 (Core/bridge: validate 21+21 hand payload, reject non-finite landmarks, fix C4244)
 #include <memory>
 #include <optional>
 #include <random>
@@ -706,6 +710,33 @@ static bool same_point(const std::optional<GatedPoint>& p, double x, double y) {
     return p && std::fabs(p->x - x) < 1e-12 && std::fabs(p->y - y) < 1e-12;
 }
 
+// NEW B: NaN / +-Inf in any packed landmark never becomes a fresh finite pointer (hand tracker + gate + filter).
+static void t_nonfinite_never_fresh() {
+    LambdaHandModel model([&](const double*, int& c, double& p) { c = 1; p = 1.0; });
+    HandNative h(&model);
+    SpyFilter spy;
+    FreshnessGate gate;
+    Packed pk;
+    const float bad[3] = { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                           -std::numeric_limits<float>::infinity() };
+    double t = 1.0;
+    for (float b : bad) {
+        for (int idx : { 3 * 8, 3 * 8 + 1, 3 * 21 + 5, 3 * 41 + 2 }) {          // index tip x/y, a world point, last z
+            Packed q = pk; q.p[idx] = b;
+            ModuleOut o = h.process(q.p, kHandPacked);
+            CHECK(!o.ok && !o.detected() && o.tracking_state && *o.tracking_state == TrackingState::Lost);
+            CHECK(!gate.update(o, spy, true, t += 0.02));
+        }
+    }
+    CHECK(spy.calls.empty());                                                     // DSP never saw an update
+    ModuleOut bad_out = hand_result(TrackingState::Tracked, 1.0, 0.4);            // gate guard: non-finite result itself
+    bad_out.x = bad[0];
+    CHECK(!gate.update(bad_out, spy, false, t += 0.02) && spy.calls.empty());   // no-filter path: gate refuses it
+    CHECK(h.process(pk.p, kHandPacked).detected());                               // valid frame still accepted afterwards
+    CHECK(h.process(pk.p, 40).ok == false);                                       // NEW A (native side): 40 / 43 rows rejected
+    CHECK(h.process(pk.p, 43).ok == false);
+}
+
 static void t_gate_tracked_held_lost() {
     SpyFilter spy;
     FreshnessGate gate;
@@ -932,6 +963,7 @@ int main() {
         { "hand: gate, vote, grace period", t_hand_vote_gate_grace },
         { "hand: TRACKED / HELD / LOST transitions", t_hand_tracking_state_transitions },
         { "hand: anchors, clamp, geometric fallback", t_hand_anchor_clamp_and_fallback },
+        { "NEW B: non-finite landmark never fresh", t_nonfinite_never_fresh },
         { "gaze: calibration + feature vector", t_gaze_calibration_and_features },
         { "gaze: no face + recalibrate", t_gaze_no_face_and_recalibrate },
         { "gaze: calibration ignores zero EAR", t_gaze_calibration_ignores_zero_ear },

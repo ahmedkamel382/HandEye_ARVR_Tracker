@@ -20,6 +20,7 @@
 // used by one thread (the engine's main loop).
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 
@@ -75,6 +76,9 @@ public:
 private:
     std::optional<GatedPoint> fresh(const ModuleOut& m, IPointFilter& flt, bool use_filter, double t_sec) {
         double x = m.x, y = m.y;
+        // With the DSP filter, a non-finite input is reported by the filter itself (FilterOutcome::Invalid, counted below).
+        // Without a filter nothing else would catch it, so it is never published.
+        if (!use_filter && (!std::isfinite(x) || !std::isfinite(y))) return lose(flt);
         if (use_filter) {
             ++c_.filter_updates;
             switch (flt.update(x, y, t_sec)) {

@@ -99,7 +99,7 @@ private:
             if (thr64_) { const double d = f[i]; std::memcpy(&entry_[size_t(i) * 8], &d, 8); }
             else        { std::memcpy(&entry_[size_t(i) * 4], &f[i], 4); }
         }
-        std::fill(res_.begin(), res_.end(), 0);
+        std::fill(res_.begin(), res_.end(), decltype(res_)::value_type{});  // value-initialised element type: no int->byte narrowing (C4244)
         predict_(entry_.data(), 0, res_.data());
     }
     double value(int k) const {

@@ -318,6 +318,7 @@ void TrayApp::submit_frame(const FramePayload& frame) noexcept {
     }
     const double now = now_seconds();
     FrameReport report;
+    bool post_release_blocked = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!ready_.load()) {
@@ -335,6 +336,8 @@ void TrayApp::submit_frame(const FramePayload& frame) noexcept {
 
         controller_->set_inhibited(wizard_running_.load() || guard_.yielding(now));
         report = controller_->update(frame);
+        // Set and cleared only under mutex_, so the flag matches the controller state it was read from.
+        post_release_blocked = report.release_pending && !release_event_posted_.exchange(true);
 
         if (wizard_running_.load()) {
             WizardSample sample;
@@ -357,7 +360,7 @@ void TrayApp::submit_frame(const FramePayload& frame) noexcept {
     if (report.pause_toggled) {
         post_event(report.active ? GestureResume : GesturePause);
     }
-    if (report.release_pending && !release_event_posted_.exchange(true)) {
+    if (post_release_blocked) {
         post_event(ReleaseBlocked); // once per stuck episode; the UI timer keeps retrying
     }
     if (report.injection_failed && now - last_block_notice_.load() > 10.0) {
@@ -392,11 +395,22 @@ void TrayApp::check_stale_input() {
         stale_reported_.exchange(true)) {
         return;
     }
+    bool was_held = false;
+    bool released = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        controller_->release_all_buttons();
+        for (std::size_t i = 0; i < kMouseButtonCount; ++i) {
+            was_held = was_held || controller_->button_held(static_cast<MouseButton>(i));
+        }
+        released = controller_->release_all_buttons();
     }
-    AppLog::warn("tracking frames stopped; any held button was released");
+    if (!released) {
+        AppLog::warn("tracking frames stopped; Windows refused to release a held button, retrying");
+    } else if (was_held) {
+        AppLog::warn("tracking frames stopped; the held button was released");
+    } else {
+        AppLog::warn("tracking frames stopped; no button was held");
+    }
 }
 
 // Safety (team tracker item #8): a refused button-up leaves the button down
@@ -414,9 +428,9 @@ void TrayApp::retry_stuck_buttons() {
             return;
         }
         still_stuck = !controller_->retry_pending_releases();
-    }
-    if (!still_stuck) {
-        release_event_posted_ = false;
+        if (!still_stuck) {
+            release_event_posted_ = false;
+        }
     }
     if (still_stuck && !stuck_button_notified_) {
         stuck_button_notified_ = true;
@@ -778,18 +792,29 @@ void TrayApp::on_command(UINT id) {
 
 // ---------------------------------------------------------------- settings
 
-void TrayApp::change_settings(const std::function<void(Settings&)>& edit, const char* what) {
+bool TrayApp::change_settings(const std::function<void(Settings&)>& edit, const char* what) {
     Settings next;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         next = settings_;
+    }
+    // Edit the file as it is now, so a change saved by the tester meanwhile
+    // survives. A file with errors is left exactly as it is.
+    std::string file_error;
+    std::error_code ec;
+    if (std::filesystem::exists(options_.settings_path, ec)) {
+        const auto on_disk = load_settings_file(options_.settings_path);
+        file_error = on_disk.error;
+        if (file_error.empty()) {
+            next = on_disk.settings;
+        }
     }
     edit(next);
     const auto problems = validate(next);
     if (!problems.empty()) {
         AppLog::error(std::string("rejected ") + what + " change: " + problems.front());
         notify(L"Setting not applied", to_wide(problems.front()), true);
-        return;
+        return false;
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -801,22 +826,32 @@ void TrayApp::change_settings(const std::function<void(Settings&)>& edit, const 
         } catch (const std::exception& error) {
             AppLog::error(std::string("applying ") + what + ": " + error.what());
             notify(L"Setting not applied", to_wide(error.what()), true);
-            return;
+            return false;
         }
         guard_.set_yield_seconds(next.app.physical_mouse_yield_seconds);
         settings_ = next;
     }
+    if (hwnd_ != nullptr && hook_ == nullptr && next.app.physical_mouse_yield_seconds > 0.0) {
+        hook_ = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook, instance_, 0); // it was off when the app started
+    }
     if (options_.on_settings_changed) {
         options_.on_settings_changed(next);
     }
+    bool saved = false;
     std::string error;
-    if (save_settings_file(options_.settings_path, next, &error)) {
+    if (!file_error.empty()) {
+        AppLog::error(std::string(what) + " applied but not saved, the settings file has an error: " + file_error);
+        notify(L"Applied, but not saved",
+               L"Your settings file has an error, so it was left unchanged: " + to_wide(file_error), true);
+    } else if (save_settings_file(options_.settings_path, next, &error)) {
         AppLog::info(std::string("settings changed: ") + what);
+        saved = true;
     } else {
         AppLog::error("saving settings: " + error);
         notify(L"Settings could not be saved", to_wide(error), true);
     }
     refresh_status();
+    return saved;
 }
 
 void TrayApp::reload_settings() {
@@ -824,11 +859,16 @@ void TrayApp::reload_settings() {
     for (const auto& warning : loaded.warnings) {
         AppLog::warn("settings: " + warning);
     }
-    change_settings([&loaded](Settings& s) { s = loaded.settings; }, "reload");
-    notify(L"Settings reloaded",
-           loaded.warnings.empty() ? L"All values applied."
-                                   : L"Some values were invalid and kept their defaults; see the log.",
-           !loaded.warnings.empty());
+    if (!loaded.error.empty()) {
+        notify(L"Settings not reloaded",
+               L"The file has an error, so the current settings stay: " + to_wide(loaded.error), true);
+        return;
+    }
+    if (change_settings([&loaded](Settings& s) { s = loaded.settings; }, "reload")) {
+        notify(L"Settings reloaded",
+               loaded.warnings.empty() ? L"All values applied." : L"Unknown settings were skipped; see the log.",
+               !loaded.warnings.empty());
+    }
 }
 
 // ---------------------------------------------------------------- wizard
@@ -872,7 +912,7 @@ void TrayApp::on_wizard_done() {
     wizard_outcome_.reset();
     if (outcome.saved) {
         const WizardKind kind = wizard_kind_;
-        change_settings([&outcome, kind](Settings& s) {
+        const bool saved = change_settings([&outcome, kind](Settings& s) {
             switch (kind) {
             case WizardKind::HandRange:
                 s.mapping.hand_region = outcome.settings.mapping.hand_region;
@@ -886,7 +926,9 @@ void TrayApp::on_wizard_done() {
                 break;
             }
         }, "calibration");
-        notify(L"Calibration saved", outcome.message);
+        if (saved) {
+            notify(L"Calibration saved", outcome.message);
+        }
     } else {
         AppLog::info("calibration closed without saving");
     }

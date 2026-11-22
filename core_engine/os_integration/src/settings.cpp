@@ -346,6 +346,16 @@ std::vector<std::string> validate(const Settings& settings) {
 
 SettingsLoadResult parse_settings(std::string_view text) {
     SettingsLoadResult result;
+    const auto reject = [&result](std::string message) {
+        if (result.error.empty()) {
+            result.error = message;
+        }
+        result.warnings.push_back(std::move(message));
+    };
+    constexpr std::string_view kByteOrderMark = "\xEF\xBB\xBF"; // Notepad's "UTF-8 with BOM"
+    if (text.substr(0, kByteOrderMark.size()) == kByteOrderMark) {
+        text.remove_prefix(kByteOrderMark.size());
+    }
     std::string section;
     std::size_t line_number = 0;
     while (!text.empty()) {
@@ -362,7 +372,7 @@ SettingsLoadResult parse_settings(std::string_view text) {
         const std::string where = "line " + std::to_string(line_number) + ": ";
         if (line.front() == '[') {
             if (line.back() != ']') {
-                result.warnings.push_back(where + "malformed section header");
+                reject(where + "malformed section header");
                 continue;
             }
             section = std::string(trim(line.substr(1, line.size() - 2)));
@@ -370,7 +380,7 @@ SettingsLoadResult parse_settings(std::string_view text) {
         }
         const auto equals = line.find('=');
         if (equals == std::string_view::npos) {
-            result.warnings.push_back(where + "expected key = value");
+            reject(where + "expected key = value");
             continue;
         }
         const std::string_view key = trim(line.substr(0, equals));
@@ -390,8 +400,8 @@ SettingsLoadResult parse_settings(std::string_view text) {
             problem = field->check(candidate);
         }
         if (!problem.empty()) {
-            result.warnings.push_back(where + std::string(key) + ": " + problem +
-                                      " (keeping " + field->format(result.settings) + ")");
+            reject(where + std::string(key) + ": " + problem + " (keeping " +
+                   field->format(result.settings) + ")");
             continue;
         }
         result.settings = candidate;
@@ -418,7 +428,13 @@ std::string serialize_settings(const Settings& settings) {
 SettingsLoadResult load_settings_file(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        return {};
+        SettingsLoadResult result;
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) { // there, but locked or unreadable: not the same as missing
+            result.error = "the settings file cannot be read";
+            result.warnings.push_back(result.error);
+        }
+        return result;
     }
     std::ostringstream buffer;
     buffer << in.rdbuf();
@@ -442,6 +458,14 @@ bool save_settings_file(const std::filesystem::path& path, const Settings& setti
         std::filesystem::create_directories(path.parent_path(), ec);
         if (ec) {
             return fail("cannot create " + path.parent_path().string() + ": " + ec.message());
+        }
+    }
+    if (std::filesystem::exists(path, ec)) {
+        std::filesystem::path backup = path;
+        backup += ".bak";
+        std::filesystem::copy_file(path, backup, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            return fail("cannot back up " + path.string() + ": " + ec.message());
         }
     }
     std::filesystem::path temporary = path;

@@ -57,6 +57,8 @@ public:
     void request_exit() noexcept;
 
 private:
+    friend struct TrayAppTestAccess; // tests/test_tray_app.cpp
+
     enum class Status : int { Waiting, Paused, Active, Yielding, Calibrating, Count };
 
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
@@ -77,7 +79,7 @@ private:
     Status current_status();
     void notify(const std::wstring& title, const std::wstring& text, bool warning = false);
     bool add_tray_icon();
-    void change_settings(const std::function<void(Settings&)>& edit, const char* what);
+    bool change_settings(const std::function<void(Settings&)>& edit, const char* what); // true = saved
     void reload_settings();
     void start_wizard(WizardKind kind);
     void on_wizard_done();

@@ -22,6 +22,18 @@
 #include <string>
 #include <vector>
 
+#if defined(OSI_HAVE_TRAY)
+namespace osi_tray_tests { // tests/test_tray_app.cpp
+void stale_log_reports_refused_release();
+void stale_log_reports_successful_release();
+void stale_log_reports_nothing_held();
+void release_event_rearms_for_each_stuck_episode();
+void menu_change_keeps_external_edits();
+void invalid_file_is_never_overwritten();
+void invalid_reload_keeps_running_settings();
+} // namespace osi_tray_tests
+#endif
+
 namespace {
 
 using namespace osi;
@@ -139,6 +151,32 @@ std::optional<PixelPoint> last_move_before(const RecordingInputSink& sink, std::
     }
     return std::nullopt;
 }
+
+// Refuses moves but accepts buttons: the case that clicked at the wrong place.
+struct MoveRefusingSink final : IInputSink {
+    bool refuse = false;
+    int downs = 0, ups = 0, clicks = 0;
+    std::optional<PixelPoint> at, released_at, clicked_at;
+    bool move_to(PixelPoint pixel, AbsolutePoint) noexcept override {
+        if (refuse) {
+            return false;
+        }
+        at = pixel;
+        return true;
+    }
+    bool button(MouseButton, ButtonAction action) noexcept override {
+        if (action == ButtonAction::Up) {
+            released_at = at;
+        }
+        ++(action == ButtonAction::Down ? downs : ups);
+        return true;
+    }
+    ClickResult click(MouseButton) noexcept override {
+        clicked_at = at;
+        ++clicks;
+        return ClickResult::Clicked;
+    }
+};
 
 // ------------------------------------------------------------ calibration helpers
 
@@ -863,6 +901,193 @@ int main() {
         require(failed, "failure not reported");
         require(!c.button_held(MouseButton::Left), "refused press recorded as held");
     });
+    // ---- audit #6: a refused move is not a sent move ----
+    run_test("controller_refused_move_retries_same_target", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        sink.fail = true;
+        FrameReport report = c.update(hand_frame(0.0, kCentre));
+        require(!report.moved && report.injection_failed, "refused move reported as moved");
+        const std::size_t attempts = sink.events.size();
+        sink.fail = false;
+        report = c.update(hand_frame(kDt, kCentre));
+        require(sink.events.size() == attempts + 1 && report.moved, "same target not retried");
+        report = c.update(hand_frame(2.0 * kDt, kCentre));
+        require(sink.events.size() == attempts + 1 && !report.moved, "accepted move sent again");
+    });
+    run_test("controller_refused_move_is_retried_every_frame", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        sink.fail = true;
+        int refusals = 0;
+        for (int i = 0; i < 5; ++i) {
+            refusals += c.update(hand_frame(i * kDt, kCentre)).injection_failed ? 1 : 0;
+        }
+        require(refusals == 5, "stationary target gave up after " + std::to_string(refusals) + " attempts");
+    });
+    run_test("controller_never_presses_where_a_refused_move_left_the_cursor", [] {
+        const HandGesture gestures[] = {HandGesture::Pinch, HandGesture::Fist};
+        for (const HandGesture gesture : gestures) {
+            MoveRefusingSink sink;
+            OsController c(unit_regions(), kFullHd, sink);
+            c.set_active(true);
+            double t = 0.0;
+            for (int i = 0; i < 10; ++i, t += kDt) {
+                c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}));
+            }
+            sink.refuse = true;
+            for (int i = 0; i < 15; ++i, t += kDt) {
+                c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+            }
+            for (int i = 0; i < 16; ++i, t += kDt) {
+                c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}, gesture));
+            }
+            require(sink.downs == 0 && sink.clicks == 0, "pressed at the old cursor position");
+        }
+    });
+    run_test("controller_refused_move_does_not_block_a_release", [] {
+        MoveRefusingSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 8; ++i, t += kDt) {
+            c.update(hand_frame(t, kCentre, HandGesture::Pinch));
+        }
+        sink.refuse = true;
+        for (int i = 0; i < 20; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.8, 0.5}));
+        }
+        require(sink.ups == 1 && !c.button_held(MouseButton::Left), "release blocked by a refused move");
+    });
+    run_test("controller_reports_only_accepted_actions", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 8; ++i, t += kDt) {
+            c.update(hand_frame(t, kCentre, HandGesture::Pinch));
+        }
+        sink.fail_releases = true;
+        std::size_t reported = 0;
+        for (int i = 0; i < 12; ++i, t += kDt) {
+            reported += c.update(hand_frame(t, kCentre)).executed.size();
+        }
+        require(reported == 0, "a refused release was reported as executed");
+    });
+    // ---- R3: off target lasts until a move is accepted ----
+    run_test("controller_stays_off_target_after_the_point_is_lost", [] {
+        MoveRefusingSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 10; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}));
+        }
+        sink.refuse = true;
+        for (int i = 0; i < 15; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+        }
+        for (int i = 0; i < 4; ++i, t += kDt) {
+            c.update(hand_frame(t, std::nullopt));
+        }
+        for (int i = 0; i < 16; ++i, t += kDt) {
+            c.update(gaze_frame(t, std::nullopt, EyeState::LeftWink));
+        }
+        require(sink.clicks == 0, "clicked at the old position after the point was lost");
+    });
+    run_test("controller_retries_the_refused_target_before_clicking", [] {
+        MoveRefusingSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 10; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}));
+        }
+        sink.refuse = true;
+        FrameReport report;
+        for (int i = 0; i < 15; ++i, t += kDt) {
+            report = c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+        }
+        const PixelPoint intended = *report.cursor;
+        c.update(hand_frame(t, std::nullopt));
+        t += kDt;
+        sink.refuse = false;
+        for (int i = 0; i < 16; ++i, t += kDt) {
+            c.update(gaze_frame(t, std::nullopt, EyeState::LeftWink));
+        }
+        require(sink.clicks == 1 && sink.clicked_at && *sink.clicked_at == intended, "click not at the intended point");
+    });
+    // ---- R5: a drop waits briefly for its move ----
+    run_test("controller_drop_waits_for_a_briefly_refused_move", [] {
+        MoveRefusingSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 8; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}, HandGesture::Pinch));
+        }
+        sink.refuse = true;
+        FrameReport report;
+        for (int i = 0; i < 6; ++i, t += kDt) {
+            report = c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}, HandGesture::Pinch));
+        }
+        const PixelPoint intended = *report.cursor;
+        for (int i = 0; i < 5; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+        }
+        require(sink.ups == 0, "dropped at the old position");
+        sink.refuse = false;
+        c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+        require(sink.ups == 1 && sink.released_at && *sink.released_at == intended, "drop not at the intended point");
+    });
+    run_test("controller_waiting_drop_is_released_by_pause", [] {
+        MoveRefusingSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int i = 0; i < 8; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}, HandGesture::Pinch));
+        }
+        sink.refuse = true;
+        for (int i = 0; i < 6; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}, HandGesture::Pinch));
+        }
+        for (int i = 0; i < 5; ++i, t += kDt) {
+            c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+        }
+        c.set_active(false);
+        require(sink.ups == 1 && !c.button_held(MouseButton::Left), "pause left a waiting drop held");
+    });
+    // ---- R1: settings files ----
+    run_test("settings_accept_utf8_bom", [] {
+        const auto loaded = parse_settings("\xEF\xBB\xBF[mapping]\ngaze_region = 0.71 0.33 0.29 0.08\n");
+        require(loaded.warnings.empty(), "byte-order mark rejected");
+        require_region(loaded.settings.mapping.gaze_region, {0.71, 0.33, 0.29, 0.08}, 1e-12);
+    });
+    run_test("settings_unreadable_file_is_reported", [] {
+        const auto path = std::filesystem::temp_directory_path() / "handeye_settings_is_a_folder.ini";
+        std::filesystem::create_directories(path);
+        const auto loaded = load_settings_file(path);
+        std::filesystem::remove(path);
+        require(!loaded.warnings.empty(), "unreadable file looked like a missing one");
+    });
+    run_test("settings_save_keeps_a_backup", [] {
+        const auto path = std::filesystem::temp_directory_path() / "handeye_settings_backup_test.ini";
+        auto backup = path;
+        backup += ".bak";
+        std::filesystem::remove(path);
+        std::filesystem::remove(backup);
+        Settings first;
+        first.gestures.wink_onset_seconds = 0.41;
+        require(save_settings_file(path, first) && save_settings_file(path, Settings{}), "save failed");
+        const bool kept = std::filesystem::exists(backup);
+        const double old = load_settings_file(backup).settings.gestures.wink_onset_seconds;
+        std::filesystem::remove(path);
+        std::filesystem::remove(backup);
+        require(kept && old == 0.41, "no backup of the replaced file");
+    });
     // ---- team tracker item #8: a refused button-up must never leave a button stuck ----
     run_test("controller_refused_release_is_retried_until_accepted", [] {
         RecordingInputSink sink;
@@ -1281,6 +1506,17 @@ int main() {
         std::cout << "DISPLAY monitors=" << monitors.size() << " desktop=" << desk.width << 'x'
                   << desk.height << " primary=" << primary.width << 'x' << primary.height << '\n';
     });
+#endif
+
+#if defined(OSI_HAVE_TRAY)
+    run_test("tray_stale_log_reports_refused_release", osi_tray_tests::stale_log_reports_refused_release);
+    run_test("tray_stale_log_reports_successful_release", osi_tray_tests::stale_log_reports_successful_release);
+    run_test("tray_stale_log_reports_nothing_held", osi_tray_tests::stale_log_reports_nothing_held);
+    run_test("tray_release_event_rearms_for_each_stuck_episode",
+             osi_tray_tests::release_event_rearms_for_each_stuck_episode);
+    run_test("tray_menu_change_keeps_external_edits", osi_tray_tests::menu_change_keeps_external_edits);
+    run_test("tray_invalid_file_is_never_overwritten", osi_tray_tests::invalid_file_is_never_overwritten);
+    run_test("tray_invalid_reload_keeps_running_settings", osi_tray_tests::invalid_reload_keeps_running_settings);
 #endif
 
     std::cout << "SUMMARY passed=" << passes << " failed=" << failures << '\n';

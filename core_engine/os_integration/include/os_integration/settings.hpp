@@ -60,16 +60,20 @@ std::vector<std::string> validate(const Settings& settings);
 struct SettingsLoadResult {
     Settings settings;
     std::vector<std::string> warnings; // unknown keys, malformed or out-of-range values
+    // The first warning other than an unknown key, or why the file could not be
+    // read. When set, `settings` is incomplete: never save it over that file.
+    std::string error;
 };
 
-// INI-style "key = value" lines grouped in [sections]; '#' and ';' start
+// INI-style "key = value" lines grouped in [sections] (a UTF-8 byte-order mark is accepted); '#' and ';' start
 // comments. Never throws: a bad value keeps its default and adds a warning.
 SettingsLoadResult parse_settings(std::string_view text);
 std::string serialize_settings(const Settings& settings);
 
 // A missing file yields defaults and no warnings.
 SettingsLoadResult load_settings_file(const std::filesystem::path& path);
-// Writes to a temporary file first, then replaces the target.
+// Copies an existing file to "<path>.bak", writes to a temporary file, then
+// replaces the target.
 bool save_settings_file(const std::filesystem::path& path, const Settings& settings,
                         std::string* error = nullptr);
 

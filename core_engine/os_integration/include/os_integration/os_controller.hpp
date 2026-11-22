@@ -20,8 +20,8 @@ struct FrameReport {
     FrameStatus status = FrameStatus::Processed;
     CursorSource source = CursorSource::None;
     std::optional<PixelPoint> cursor; // where the cursor is (or would be, when paused)
-    bool moved = false;               // a move was sent this frame
-    ActionList executed;              // button actions actually sent this frame
+    bool moved = false;               // Windows accepted a cursor move this frame
+    ActionList executed;              // button actions Windows accepted this frame
     bool pause_toggled = false;       // a gesture toggled pause this frame
     bool active = false;              // state after this frame
     bool inhibited = false;
@@ -103,8 +103,16 @@ private:
     CursorLock gaze_lock_;
     std::array<bool, kMouseButtonCount> held_{};            // down in Windows, as far as we know
     std::array<bool, kMouseButtonCount> release_pending_{}; // held, and a release was refused
+    // A button-up waiting a moment for the move to where the drag ended.
+    struct PendingDrop {
+        MouseButton button;
+        PixelPoint target;
+        double deadline;
+    };
     std::optional<PixelPoint> last_sent_;
     std::optional<PixelPoint> last_cursor_;
+    std::optional<PixelPoint> refused_target_; // set while the real cursor is not where the user aimed
+    std::optional<PendingDrop> drop_;
     double last_timestamp_ = 0.0;
     bool has_timestamp_ = false;
     bool active_ = false;

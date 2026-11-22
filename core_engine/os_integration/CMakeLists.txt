@@ -75,6 +75,13 @@ if(WIN32 AND OSI_BUILD_APPS)
     list(APPEND osi_local_targets os_integration_tray)
     list(APPEND osi_local_targets handeye_tray)
 
+    if(BUILD_TESTING)
+        # Tray tests run inside os_integration_tests, so the number of ctest entries is unchanged.
+        target_sources(os_integration_tests PRIVATE tests/test_tray_app.cpp)
+        target_link_libraries(os_integration_tests PRIVATE os_integration_tray)
+        target_compile_definitions(os_integration_tests PRIVATE OSI_HAVE_TRAY=1)
+    endif()
+
     if(OSI_BUILD_TESTER)
         # HandEye tester: a C interface around OsController (loaded by the
         # Python tester UI with ctypes) and a double-click launcher.

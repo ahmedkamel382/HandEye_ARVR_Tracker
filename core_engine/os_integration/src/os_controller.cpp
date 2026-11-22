@@ -6,6 +6,10 @@
 namespace osi {
 namespace {
 
+// How long a drop may wait for a refused move. Short, because the button
+// stays down meanwhile; after it, the button is released where the cursor is.
+constexpr double kDropWaitSeconds = 0.30;
+
 const Settings& checked(const Settings& settings) {
     const auto problems = validate(settings);
     if (!problems.empty()) {
@@ -148,29 +152,69 @@ FrameReport OsController::update(const FramePayload& frame) noexcept {
     }
 
     if (can_output()) {
-        if (cursor && cursor != last_sent_) {
-            report.moved = true;
-            last_sent_ = cursor;
-            if (!sink_.move_to(*cursor, mapper_.to_absolute(*cursor))) {
+        // A refused move stays owed until Windows accepts it, also after the
+        // tracking point is lost.
+        const std::optional<PixelPoint> target =
+            drop_ ? std::optional<PixelPoint>(drop_->target) : (cursor ? cursor : refused_target_);
+        bool on_target = true;
+        if (target && target != last_sent_) {
+            // Only an accepted move counts as sent: a refused one is retried on
+            // the next frame, also when the target pixel has not changed.
+            if (sink_.move_to(*target, mapper_.to_absolute(*target))) {
+                report.moved = true;
+                last_sent_ = target;
+            } else {
+                report.injection_failed = true;
+                on_target = false;
+            }
+        }
+        if (on_target) {
+            refused_target_.reset();
+        } else {
+            refused_target_ = target;
+        }
+        if (drop_ && (on_target || t >= drop_->deadline)) {
+            const MouseButton button = drop_->button;
+            if (release(button)) { // also clears drop_
+                report.executed.push({ActionType::ButtonUp, button});
+            } else {
                 report.injection_failed = true;
             }
+        }
+        if (cursor && cursor != target) {
+            on_target = false; // this frame's move went to the drop, not to where the user aims now
         }
         for (const Action& action : actions) {
             if (action.type == ActionType::TogglePause) {
                 continue;
+            }
+            // The cursor is not where the user aimed: a press would land on
+            // whatever is under its old position, and so would a drop.
+            if (!on_target) {
+                if (action.type != ActionType::ButtonUp) {
+                    continue;
+                }
+                const std::size_t i = index(action.button);
+                if (target && held_[i] && !release_pending_[i]) {
+                    if (!drop_) {
+                        drop_ = PendingDrop{action.button, *target, t + kDropWaitSeconds};
+                    }
+                    continue;
+                }
             }
             switch (execute(action)) {
             case Outcome::Sent:
                 report.executed.push(action);
                 break;
             case Outcome::Failed:
-                report.executed.push(action);
                 report.injection_failed = true;
                 break;
             case Outcome::Skipped:
                 break;
             }
         }
+    } else if (refused_target_ && cursor) {
+        refused_target_ = cursor; // still owed, at the newest aim
     }
     report.active = active_;
     report.inhibited = inhibited_;
@@ -233,6 +277,9 @@ void OsController::set_inhibited(bool inhibited) noexcept {
         return;
     }
     inhibited_ = inhibited;
+    if (inhibited) {
+        refused_target_.reset(); // the real mouse or the wizard took over: nothing is owed
+    }
     if (!can_output()) {
         release_all_buttons();
     }
@@ -243,6 +290,9 @@ void OsController::set_inhibited(bool inhibited) noexcept {
 // Until then it stays held (so no new press is sent) and is retried.
 bool OsController::release(MouseButton button) noexcept {
     const std::size_t i = index(button);
+    if (drop_ && drop_->button == button) {
+        drop_.reset(); // whoever releases the button ends the wait
+    }
     if (sink_.button(button, ButtonAction::Up)) {
         held_[i] = false;
         release_pending_[i] = false;
@@ -300,6 +350,9 @@ void OsController::set_screen_geometry(const ScreenGeometry& geometry) {
     ScreenMapper mapper(geometry);
     release_all_buttons();
     mapper_ = mapper;
+    if (refused_target_) {
+        refused_target_ = mapper_.clamp(*refused_target_);
+    }
     reset_tracking_state();
 }
 

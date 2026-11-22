@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -90,11 +91,9 @@ bool parse_strict(const char* text, Settings& out, std::string& error) {
         return true;
     }
     SettingsLoadResult loaded = parse_settings(text);
-    for (const std::string& warning : loaded.warnings) {
-        if (warning.find("unknown setting") == std::string::npos) {
-            error = warning;
-            return false;
-        }
+    if (!loaded.error.empty()) {
+        error = loaded.error;
+        return false;
     }
     out = loaded.settings;
     return true;
@@ -332,28 +331,50 @@ void osi_filter_destroy(void* filter) {
 #endif
 }
 
-int32_t osi_filter_apply(void* filter, double* x, double* y, double timestamp_seconds, int32_t valid) {
+int32_t osi_filter_update(void* filter, double* x, double* y, double timestamp_seconds) {
 #if defined(OSI_CAPI_WITH_DSP)
     auto* f = static_cast<Filter*>(filter);
     if (f == nullptr || x == nullptr || y == nullptr) {
-        return 0;
+        return OSI_FILTER_INVALID;
+    }
+    // Check before clamping: std::clamp would turn infinity into a screen edge.
+    if (!std::isfinite(*x) || !std::isfinite(*y)) {
+        f->filter.reset();
+        return OSI_FILTER_INVALID;
     }
     const auto result = f->filter.update(dsp::Point2D{std::clamp(*x, 0.0, 1.0), std::clamp(*y, 0.0, 1.0)},
-                                         timestamp_seconds, valid != 0);
-    if (!result.point) {
-        return 0;
+                                         timestamp_seconds, true);
+    if (result.point) {
+        *x = result.point->x;
+        *y = result.point->y;
+        return OSI_FILTER_OK;
     }
-    *x = result.point->x;
-    *y = result.point->y;
-    return 1;
+    return result.status == dsp::FilterStatus::RejectedTimestamp ? OSI_FILTER_REJECTED : OSI_FILTER_INVALID;
 #else
     (void)filter;
     (void)x;
     (void)y;
     (void)timestamp_seconds;
-    (void)valid;
-    return 0;
+    return OSI_FILTER_INVALID;
 #endif
+}
+
+void osi_filter_reset(void* filter) {
+#if defined(OSI_CAPI_WITH_DSP)
+    if (auto* f = static_cast<Filter*>(filter)) {
+        f->filter.reset();
+    }
+#else
+    (void)filter;
+#endif
+}
+
+int32_t osi_filter_apply(void* filter, double* x, double* y, double timestamp_seconds, int32_t valid) {
+    if (valid == 0) {
+        osi_filter_reset(filter);
+        return 0;
+    }
+    return osi_filter_update(filter, x, y, timestamp_seconds) == OSI_FILTER_OK ? 1 : 0;
 }
 
 } // extern "C"

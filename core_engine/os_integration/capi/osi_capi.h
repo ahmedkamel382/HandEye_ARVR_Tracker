@@ -5,7 +5,8 @@
  * It wraps the same osi::OsController the engine uses, so a test drives the
  * real mapping, gesture, click-stabilisation and SendInput code.
  * Plain C types only; every function is safe to call with a null handle.
- * One handle per thread (the controller is not thread-safe).
+ * A handle must not be used by two threads at the same time (the controller
+ * is not thread-safe): share one only behind a lock, as tester/osi_capi.py does.
  */
 #ifndef OSI_CAPI_H
 #define OSI_CAPI_H
@@ -22,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OSI_CAPI_VERSION 1
+#define OSI_CAPI_VERSION 2 /* 2: osi_filter_update, osi_filter_reset */
 #define OSI_MAX_ACTIONS 8
 #define OSI_MAX_EVENTS 256
 
@@ -34,6 +35,11 @@ extern "C" {
 #define OSI_TRACKED 0
 #define OSI_HELD 1
 #define OSI_LOST 2
+
+/* Results of osi_filter_update, same meaning as core::FilterOutcome. */
+#define OSI_FILTER_INVALID 0  /* no valid output, and the filter was reset */
+#define OSI_FILTER_OK 1       /* (x, y) holds the smoothed point */
+#define OSI_FILTER_REJECTED 2 /* timestamp not newer: history intact, (x, y) untouched */
 
 /* Action types in osi_report.actions (osi::ActionType). */
 #define OSI_ACTION_BUTTON_DOWN 0
@@ -130,6 +136,11 @@ OSI_API int32_t osi_cursor_position(int32_t* x, int32_t* y);
  * engine. Returns NULL when the library was built without dsp_filter. */
 OSI_API void* osi_filter_create(double min_cutoff_hz, double beta, double derivative_cutoff_hz);
 OSI_API void osi_filter_destroy(void* filter);
+/* Filters one observation in place and says what happened (OSI_FILTER_*).
+ * NaN and infinity are invalid; finite values are clamped to 0..1, as the
+ * engine's DSP adapter does. (x, y) changes only for OSI_FILTER_OK. */
+OSI_API int32_t osi_filter_update(void* filter, double* x, double* y, double timestamp_seconds);
+OSI_API void osi_filter_reset(void* filter);
 /* Filters one point in place. `valid` = 0 resets the filter (target lost).
  * Returns 1 when (x, y) holds a smoothed point, 0 when there is no output. */
 OSI_API int32_t osi_filter_apply(void* filter, double* x, double* y, double timestamp_seconds,

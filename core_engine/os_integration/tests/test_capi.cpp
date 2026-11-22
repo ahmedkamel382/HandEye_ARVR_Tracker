@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -156,6 +157,51 @@ int main() {
         y = 0.3;
         require(osi_filter_apply(f, &x, &y, 0.02, 1) == 1 && x > 0.2 && x < 0.8, "second sample not smoothed");
         require(osi_filter_apply(f, &x, &y, 0.04, 0) == 0, "lost target produced output");
+        osi_filter_destroy(f);
+    });
+
+    run_test("smoothing_filter_rejects_non_finite", [] {
+        void* f = osi_filter_create(1.2, 4.0, 1.0);
+        if (f == nullptr) {
+            std::printf("SKIP built without dsp_filter\n");
+            return;
+        }
+        const double inf = std::numeric_limits<double>::infinity();
+        const double bad[] = {inf, -inf, std::numeric_limits<double>::quiet_NaN()};
+        double t = 0.0;
+        for (const double value : bad) {
+            double x = value;
+            double y = 0.4;
+            require(osi_filter_update(f, &x, &y, t += kDt) == OSI_FILTER_INVALID, "non-finite x accepted");
+            x = 0.4;
+            y = value;
+            require(osi_filter_update(f, &x, &y, t += kDt) == OSI_FILTER_INVALID, "non-finite y accepted");
+            x = value;
+            y = 0.4;
+            require(osi_filter_apply(f, &x, &y, t += kDt, 1) == 0, "osi_filter_apply accepted non-finite x");
+        }
+        osi_filter_destroy(f);
+    });
+    run_test("smoothing_filter_reports_rejected_timestamp", [] {
+        void* f = osi_filter_create(1.2, 4.0, 1.0);
+        if (f == nullptr) {
+            std::printf("SKIP built without dsp_filter\n");
+            return;
+        }
+        double x = 0.2, y = 0.3;
+        require(osi_filter_update(f, &x, &y, 1.0) == OSI_FILTER_OK, "first sample refused");
+        const double stale_times[] = {1.0, 0.5};
+        for (const double t : stale_times) {
+            x = 0.9;
+            y = 0.8;
+            require(osi_filter_update(f, &x, &y, t) == OSI_FILTER_REJECTED, "stale timestamp not rejected");
+            require(x == 0.9 && y == 0.8, "rejected update changed its arguments");
+        }
+        require(osi_filter_update(f, &x, &y, 1.02) == OSI_FILTER_OK && x < 0.9, "history lost after a rejection");
+        osi_filter_reset(f);
+        x = 0.7;
+        y = 0.6;
+        require(osi_filter_update(f, &x, &y, 1.04) == OSI_FILTER_OK && x == 0.7 && y == 0.6, "reset kept history");
         osi_filter_destroy(f);
     });
 

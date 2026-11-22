@@ -35,7 +35,7 @@ filters when the tray's Smoothing menu changes (`TrayOptions::on_settings_change
 | `app/` | `handeye_tray.exe`: system-tray app, settings, and calibration wizard. |
 | `capi/` | `os_integration_capi.dll`: a plain-C interface to `OsController` (used by the tester). |
 | `tester/` | **HandEye Tester**: `HandEyeTester.exe` + a test-bench UI for every part of the system. |
-| `tests/` | 81 library tests, 7 C-interface tests and a latency benchmark (no GoogleTest needed). |
+| `tests/` | 100 library and tray tests, 9 C-interface tests and a latency benchmark (no GoogleTest needed). |
 
 ### Library files
 
@@ -102,8 +102,8 @@ struct FramePayload {
    to [0, 1].
    * The default hand region is the central 70% of the frame. Small, relaxed
      hand movements then reach every screen edge, which counters "gorilla arm".
-   * For gaze, the calibration wizard measures the narrow band the iris ratio
-     actually moves in.
+   * For gaze, the calibration wizard measures the band of the yaw/pitch
+     coordinates (`0.5 + degrees / 60`) the user actually moves in.
    * `x_min > x_max` is allowed and flips that axis. Calibration produces this
      automatically when an input runs opposite to the screen.
 2. **Unit → pixel:** `px = left + round(u · (width − 1))` inside the target
@@ -165,6 +165,10 @@ available.
 | Risk | Protection |
 | --- | --- |
 | The program takes over the mouse unexpectedly | It starts **paused**. Ctrl+Alt+P, the tray menu or a 1 s eye closure toggles control. |
+| A cursor move is refused | It is not counted as sent. The target stays owed, also if tracking is lost: it is retried, and no press or click is sent until Windows accepts it. A drop waits up to 0.3 s for its move, then releases where the cursor is. |
+| The tester changes mode or output | It releases held buttons before loading anything, keeps retrying refused releases (camera mode included) and releases after 0.5 s without camera frames. A watchdog thread does this, and handles Esc and Stop, even while a camera read is blocked. |
+| A saved Activate turns the real mouse on | The tester accepts Activate only for the configuration that is already running; Start, Stop and any option change cancel it. |
+| A broken settings file loses calibration | A file with errors is never saved over (tester and tray) or reloaded. Saves edit the file as it is at that moment and keep `<file>.bak`. A UTF-8 byte-order mark is accepted. |
 | A button stays stuck down | Buttons are released on pause, inhibit, settings change, stale input (0.5 s without frames), controller destruction and app exit. A release Windows **refuses** keeps the button tracked as held and is retried every frame and every 250 ms by the tray, with a warning, until Windows accepts it; a click whose release was dropped is detected (`ClickResult::PressedOnly`) and released the same way (team tracker item #8). |
 | Fighting the user's real mouse | A low-level hook detects **physical** mouse input (not injected input) and yields control for 1.5 s. |
 | Clicks during calibration | The controller is inhibited while the wizard runs. |
@@ -231,9 +235,9 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Check | Result |
 | --- | --- |
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
-| `os_integration_tests` | 81 / 81 passed |
-| `os_integration_capi_tests` | 7 / 7 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 12 / 12 passed |
+| `os_integration_tests` | 100 / 100 passed |
+| `os_integration_capi_tests` | 9 / 9 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 114 / 114 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |
@@ -285,7 +289,7 @@ project's `.venv` (`setup.bat`).
 | Hand + gestures | Engineer 2's `HandTracker`: cursor, pinch (left button / drag), fist (right click) |
 | Gaze pointer | Engineer 3's `GazeIntent`: cursor from yaw/pitch (same mapping as the engine), wink clicks |
 | Blinks & winks only | Engineer 3's eye states only; the cursor does not move |
-| Full system | Hand and gaze together, like the engine |
+| Full system | Hand and gaze together, with the engine's rules |
 
 * The trackers run **unchanged**; their output goes through Engineer 4's 1-Euro
   filter (optional) into **Engineer 5's real `OsController`** via
@@ -298,6 +302,19 @@ project's `.venv` (`setup.bat`).
   counter), live **Tuning** sliders (zones, gesture times, smoothing; saving to
   your settings is optional), a 10-target **accuracy test**, **CSV recording**
   (Documents\HandEyeTests) and a **Run checks** button.
+* **Calibration is preserved.** Start never rewrites settings. A slider edits
+  only its own value (a range slider: one axis, about its own centre and in its
+  own direction). Save applies just the edited values to the file as it is at
+  that moment, so a calibration saved by the tray meanwhile survives. A file with
+  errors is left untouched: correct it, or use Reset and then Save.
+* **Comparing with core_engine.** Low-light enhancement, lost-hand recovery and
+  IndexFingerTracker's own smoothing default to off, because the engine has no
+  such stages. The screen starts from `screen_target` and the camera is asked
+  for MJPG like the engine. A label lists any option that differs, unsaved
+  tuning included. The tester runs the
+  Python trackers, so its timings are **not** core_engine's latency.
+* **Smoothing** follows `freshness_gate.hpp`: a rejected timestamp replays the
+  last filtered point as Held, an invalid input publishes nothing.
 * Run it without the launcher: `.venv\Scripts\python.exe core_engine\os_integration\tester\handeye_tester.py`.
   Log: `%LOCALAPPDATA%\HandEyeTracker\tester.log`.
 
@@ -316,7 +333,17 @@ Other tools can drive the controller without C++ through `capi/osi_capi.h`
 
 ## Known limitations and next steps
 
-* **Gaze accuracy:** the iris ratio from `gaze_intent.py` is coarse, so gaze
+* **Uncalibrated gaze is wrong (audit finding #1, open):** run the tray's
+  Calibrate > Gaze range first. With the shipped models and a synthetic
+  straight-ahead input, pitch is -17.72 degrees (y = 0.205), above the top of the
+  default `gaze_region` (0.30), so the cursor sits on the top edge. The same
+  synthetic probe indicates that both axes run opposite to the screen (looking
+  right lowers x, looking up raises y). The default stays a placeholder until
+  neutral pitch and all four directions are measured on a real camera; the
+  wizard fits offset and inverted axes, but in the same synthetic probe eyes-only
+  vertical movement was not monotonic in the pitch model and the wizard rejected
+  the fit. Check that live; if it happens, it is a model question for Engineer 3.
+* **Gaze accuracy:** the estimate from `gaze_intent.py` is coarse, so gaze
   pointing is best for large targets. Hand pointing is the precise mode.
 * **Elevated windows:** Windows blocks injected input into apps running as
   administrator unless the tray app is also elevated. This is reported, not
@@ -324,7 +351,8 @@ Other tools can drive the controller without C++ through `capi/osi_capi.h`
 * **Live tuning still to do:** gaze range and direction and the wink timing
   must be checked with a person in front of the camera (the tester's Gaze and
   Winks modes, then the tray wizard). The defaults are starting values.
-* **Calibration ownership:** Engineer 3's `run_gaze.py` has its own 9-dot
-  calibration; the engine guide assigns calibration to this module. Agree on one.
+* **Calibration ownership (team decision, 22 Nov 2026):** this module's wizard
+  and `os_integration.ini` are the only runtime calibration. Engineer 3's
+  `run_gaze.py` stays a standalone diagnostic.
 * **Scrolling:** there is no scroll gesture yet. Adding one means a new
   `ActionType` plus a `MOUSEEVENTF_WHEEL` input.

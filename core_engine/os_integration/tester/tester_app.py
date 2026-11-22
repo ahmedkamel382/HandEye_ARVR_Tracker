@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -21,8 +22,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 from PIL import Image, ImageTk
 
 import osi_capi
-from tester_engine import (EYE_STATES, HAND_STATES, MODES, REPO, TRACKING_NAMES, IniDoc, TesterEngine,
-                           prepare_ai_imports, user_settings_path)
+from tester_engine import (ENGINE_MATCH, EYE_STATES, HAND_STATES, MODES, REPO, TRACKING_NAMES, IniDoc, TesterConfig,
+                           TesterEngine, engine_differences, format_value, gaze_is_uncalibrated, prepare_ai_imports,
+                           read_settings, saved_all_monitors, user_settings_path)
 
 # ----------------------------------------------------------------------------- theme
 
@@ -132,6 +134,44 @@ class Pill(tk.Label):
 
 # ----------------------------------------------------------------------------- tuning model
 
+# slider: (section, key, default, decimals)
+VALUE_CONTROLS = {
+    "snap": ("stabilization", "anchor_lookback_seconds", 0.1, 3),
+    "drag": ("stabilization", "drag_threshold_px", 30.0, 1),
+    "pinch": ("gestures", "pinch_onset_seconds", 0.06, 3),
+    "release": ("gestures", "pinch_release_seconds", 0.08, 3),
+    "fist": ("gestures", "fist_onset_seconds", 0.3, 3),
+    "wink": ("gestures", "wink_onset_seconds", 0.25, 3),
+    "closure": ("gestures", "closure_onset_seconds", 1.0, 3),
+    "h_cut": ("hand_filter", "min_cutoff_hz", 1.2, 3),
+    "h_beta": ("hand_filter", "beta", 4.0, 2),
+    "g_cut": ("gaze_filter", "min_cutoff_hz", 0.8, 3),
+    "g_beta": ("gaze_filter", "beta", 6.0, 2),
+}
+DEFAULT_REGIONS = {"hand_region": (0.15, 0.15, 0.85, 0.85), "gaze_region": (0.3, 0.3, 0.7, 0.7)}
+# slider: (region key, axis 0 = x / 1 = y, slider units per unit of region span)
+REGION_CONTROLS = {
+    "zone_x": ("hand_region", 0, 1.0),
+    "zone_y": ("hand_region", 1, 1.0),
+    "gaze_x": ("gaze_region", 0, 30.0),     # span / 2 * 60 = degrees each way
+    "gaze_y": ("gaze_region", 1, 30.0),
+}
+
+
+def resize_axis(doc: IniDoc, key: str, axis: int, span: float) -> str:
+    """The region with one axis resized about its own centre, direction kept. The other axis is copied as written."""
+    default = DEFAULT_REGIONS[key]
+    text = doc.get("mapping", key)
+    values = _region(text, default)
+    written = (text or "").replace(",", " ").split()
+    if values is default or len(written) != 4:
+        written = [format_value(v) for v in values]
+    low, high = values[axis], values[axis + 2]
+    centre, half = (low + high) / 2, (span / 2 if high >= low else -span / 2)
+    written[axis], written[axis + 2] = format_value(centre - half), format_value(centre + half)
+    return " ".join(written)
+
+
 class Slider:
     def __init__(self, parent, label: str, lo: float, hi: float, fmt: str, on_change: Callable[[], None],
                  hint: str = ""):
@@ -169,9 +209,9 @@ class TesterApp:
         self.root = root
         self.lib = library
         self.log_file = log
-        self.engine = TesterEngine(library, self._log_from_engine)
         self._pending_log: List[str] = []
         self._log_lock = threading.Lock()
+        self.engine = TesterEngine(library, self._log_from_engine)      # may log about the saved settings
         self._photo = None
         self._tuning_after = None
         self._loading_tuning = False
@@ -189,9 +229,11 @@ class TesterApp:
         self._set_icon()
         self._build()
         self._load_tuning_from_settings()
+        self._use_saved_screen()
+        self._update_notes()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<F5>", lambda e: self.toggle_run())
-        root.bind("<space>", lambda e: self.toggle_active() if self.engine.running else None)
+        root.bind("<space>", self._space_pressed)
         self.root.after(self.TICK_MS, self.tick)
         self.log("Ready. Choose what to test, then press Start (F5).")
 
@@ -301,7 +343,7 @@ class TesterApp:
         ttk.Radiobutton(output, text="Real mouse (moves and clicks for real)", value=True, variable=self.real_var,
                         command=self._output_changed).pack(anchor="w")
         self.monitors_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(output, text="Use all monitors (default: primary monitor only)",
+        ttk.Checkbutton(output, text="Use all monitors (starts as your settings say)",
                         variable=self.monitors_var, command=self._options_changed).pack(anchor="w", pady=(4, 0))
 
         options = section(b, "3  Options")
@@ -310,24 +352,31 @@ class TesterApp:
         self.landmarks_var = tk.BooleanVar(value=True)
         self.zone_var = tk.BooleanVar(value=True)
         self.trail_var = tk.BooleanVar(value=True)
-        self.lowlight_var = tk.BooleanVar(value=True)
-        self.roi_var = tk.BooleanVar(value=True)
+        self.lowlight_var = tk.BooleanVar(value=TesterConfig.lowlight)
+        self.roi_var = tk.BooleanVar(value=TesterConfig.roi_recovery)
         for text, var in [("Allow clicks (pinch, fist, winks)", self.clicks_var),
                           ("Smoothing (Engineer 4's 1-Euro filter, like the engine)", self.smooth_var),
                           ("Draw landmarks", self.landmarks_var), ("Draw the hand's active zone", self.zone_var),
                           ("Draw the pointer trail", self.trail_var),
-                          ("Hand: low-light enhancement", self.lowlight_var),
-                          ("Hand: recover a lost hand near its last position", self.roi_var)]:
+                          ("Hand: low-light enhancement (not in core_engine)", self.lowlight_var),
+                          ("Hand: recover a lost hand near its last position (not in core_engine)", self.roi_var)]:
             ttk.Checkbutton(options, text=text, variable=var, command=self._options_changed).pack(anchor="w")
         self.index_alpha = Slider(options, "Index finger smoothing (Engineer 2's tracker)", 0.05, 1.0, "{:.2f}",
-                                  self._options_changed, "Lower = steadier but slower. 1.00 = no smoothing.")
-        self.index_alpha.set(0.35)
+                                  self._options_changed, "Lower = steadier but slower. 1.00 = off, so only Engineer 4's filter smooths.")
+        self.index_alpha.set(TesterConfig.index_alpha)
+        self.parity_label = ttk.Label(options, text="", style="Muted.TLabel", wraplength=420, justify="left")
+        self.parity_label.pack(anchor="w", pady=(8, 2))
+        ttk.Button(options, text="Match core_engine options", command=self.match_engine).pack(anchor="w")
+        self.gaze_note = ttk.Label(options, text="", style="Muted.TLabel", wraplength=420, justify="left")
+        self.gaze_note.pack(anchor="w", pady=(4, 0))
         cam = ttk.Frame(options, style="Panel.TFrame")
         cam.pack(fill="x", pady=(6, 0))
         ttk.Label(cam, text="Camera", style="Panel.TLabel").pack(side="left")
         self.camera_var = tk.IntVar(value=0)
-        ttk.Spinbox(cam, from_=0, to=9, width=4, textvariable=self.camera_var,
-                    command=self._options_changed).pack(side="left", padx=6)
+        spin = ttk.Spinbox(cam, from_=0, to=9, width=4, textvariable=self.camera_var, command=self._options_changed)
+        spin.pack(side="left", padx=6)
+        for event in ("<Return>", "<FocusOut>"):        # a typed number, not only the arrows
+            spin.bind(event, lambda e: self._options_changed())
         self.res_var = tk.StringVar(value="640 x 480")
         res = ttk.Combobox(cam, values=["640 x 480", "960 x 540", "1280 x 720"], textvariable=self.res_var,
                            state="readonly", width=11)
@@ -358,11 +407,13 @@ class TesterApp:
         ch = self._tuning_changed
         s = {}
         g = section(b, "Cursor")
-        s["zone"] = Slider(g, "Hand active zone margin", 0.0, 0.35, "{:.2f}", ch,
-                           "How much of the camera edge is ignored. Bigger = smaller hand movements reach the "
-                           "screen edges.")
-        s["gaze"] = Slider(g, "Gaze range (degrees each way)", 4, 30, "±{:.0f}°", ch,
-                           "How far you look to reach the screen edge.")
+        s["zone_x"] = Slider(g, "Hand zone width", 0.1, 1.0, "{:.2f}", ch)
+        s["zone_y"] = Slider(g, "Hand zone height", 0.1, 1.0, "{:.2f}", ch,
+                             "Part of the camera picture that covers the whole screen. Smaller = smaller hand "
+                             "movements reach the edges. A calibrated centre and direction are kept.")
+        s["gaze_x"] = Slider(g, "Gaze range left-right", 1, 45, "±{:.1f}°", ch)
+        s["gaze_y"] = Slider(g, "Gaze range up-down", 1, 45, "±{:.1f}°", ch,
+                             "How far you look to reach the screen edge. A calibrated centre and direction are kept.")
         self.source_var = tk.StringVar(value="hand_preferred")
         row = ttk.Frame(g, style="Panel.TFrame")
         row.pack(fill="x", pady=4)
@@ -412,9 +463,9 @@ class TesterApp:
         self.live: Dict[str, ttk.Label] = {}
         groups = [
             ("Hand (Engineer 2)", ["Tracker status", "Freshness", "Pointer", "Gesture", "Confidence",
-                                   "Time per frame"]),
+                                   "Python tracker time"]),
             ("Eyes (Engineer 3)", ["Face", "Eye state", "Gaze angle", "Head angle", "Gaze pointer",
-                                   "Time per frame "]),
+                                   "Python tracker time "]),
             ("OS stage (Engineer 5)", ["Cursor follows", "Cursor pixel", "Output", "Confirmed gesture",
                                        "Confirmed eye", "Stuck button"]),
             ("Counters", ["Left down / up", "Left clicks", "Right clicks", "Middle clicks", "Pauses",
@@ -466,6 +517,9 @@ class TesterApp:
              "or fist), or rest on it for 1 s in Index finger mode. You get hits, time and error at the end."),
             ("Real mouse", "Switch Output to Real mouse, press Activate. Esc pauses instantly; moving the real mouse "
              "takes over for 1.5 s. Do not run the tester and the engine at the same time (one camera)."),
+            ("Comparing with core_engine", "The defaults switch off what core_engine does not have: low-light "
+             "enhancement, lost-hand recovery and a second smoothing stage. The trackers here are still the Python "
+             "ones, so timings in this window are not core_engine's latency."),
             ("Recording", "Record CSV saves every frame (positions, states, actions, frame rate) to "
              "Documents\\HandEyeTests for later analysis."),
             ("Files", f"Tester log: %LOCALAPPDATA%\\HandEyeTracker\\tester.log\nYour settings: {user_settings_path()}"),
@@ -521,9 +575,49 @@ class TesterApp:
     def _mode_changed(self):
         self.engine.configure(**self._config())
         self._screen_trail.clear()
+        self._update_notes()
+        self.root.focus_set()
 
     def _options_changed(self):
         self.engine.configure(**self._config())
+        self._update_notes()
+
+    def match_engine(self):
+        self.lowlight_var.set(ENGINE_MATCH["lowlight"])
+        self.roi_var.set(ENGINE_MATCH["roi_recovery"])
+        self.smooth_var.set(ENGINE_MATCH["smoothing"])
+        self.clicks_var.set(ENGINE_MATCH["clicks"])
+        self.index_alpha.set(ENGINE_MATCH["index_alpha"])
+        self._use_saved_screen()
+        self._options_changed()
+
+    def _use_saved_screen(self):
+        all_monitors = saved_all_monitors(self.engine.settings_text())
+        self.monitors_var.set(all_monitors)
+        if self.engine.config.all_monitors != all_monitors:
+            self.engine.configure(all_monitors=all_monitors)
+
+    def _update_notes(self):
+        config = TesterConfig(**self._config())
+        mode = MODES[config.mode]
+        if mode.key == "camera":
+            self.parity_label.configure(text="", foreground=MUTED)
+        else:
+            differs = engine_differences(config, self.engine.settings_text())
+            if self._tuning_replaced or self._tuning_ini() != self._tuning_base:
+                differs.append("tuning changes are not saved")
+            if self.engine.saved_settings_error:
+                differs.append("your settings file has an error")
+            self.parity_label.configure(
+                text=("Differs from core_engine: " + "; ".join(differs) + "." if differs else
+                      "Options match core_engine. (Python trackers: timings are not the engine's latency.)"),
+                foreground=WARN if differs else GOOD)
+        uncalibrated = mode.gaze == "pointer" and gaze_is_uncalibrated(self.engine.settings_text(),
+                                                                       self.lib.default_settings_ini())
+        self.gaze_note.configure(
+            text=("Gaze is not calibrated: the cursor can stick to an edge or move the wrong way. In core_engine, "
+                  "use the tray icon: Calibrate > Gaze range.") if uncalibrated else "",
+            foreground=WARN)
 
     def _output_changed(self):
         if self.real_var.get():
@@ -536,11 +630,15 @@ class TesterApp:
                 self.real_var.set(False)
                 return
         self.engine.configure(**self._config())
+        self.root.focus_set()
 
     # ---------------------------------------------------------------- run control
     def toggle_run(self):
         if self.engine.running:
             self.engine.stop()
+            if self.engine.running:
+                self.log("Still stopping: waiting for the camera. Try again in a moment.")
+                return
             self.run_button.configure(text="▶  Start")
             self.active_button.configure(state="disabled")
             self.log("Stopped")
@@ -548,10 +646,27 @@ class TesterApp:
             self._photo = None
         else:
             self.engine.configure(**self._config())
-            self.engine.set_settings_text(self._tuning_ini())
+            # Start never rewrites settings; only an edit still waiting for its 250 ms delay is applied now.
+            if self._tuning_after:
+                self.root.after_cancel(self._tuning_after)
+                self._push_tuning()
             self.engine.start()
+            self.root.focus_set()       # so Space is the activate / pause shortcut, not a second click on Start
             self.run_button.configure(text="■  Stop")
             self.active_button.configure(state="normal")
+
+    # Widgets that use Space themselves.
+    SPACE_WIDGETS = {"TButton", "Button", "TCheckbutton", "Checkbutton", "TRadiobutton", "Radiobutton", "TSpinbox",
+                     "Spinbox", "TEntry", "Entry", "TCombobox", "Text"}
+
+    def _space_pressed(self, event):
+        """Space may always pause. It activates only when the focused widget has no use for Space."""
+        if not self.engine.running or event.widget is self.active_button:
+            return                      # that button toggles by itself
+        widget = event.widget
+        uses_space = isinstance(widget, str) or widget.winfo_class() in self.SPACE_WIDGETS
+        if self.engine.snapshot().report.active or not uses_space:
+            self.toggle_active()
 
     def toggle_active(self):
         active = self.engine.snapshot().report.active
@@ -571,74 +686,81 @@ class TesterApp:
         self.record_button.configure(text="■  Stop recording")
 
     # ---------------------------------------------------------------- tuning
-    def _load_tuning_from_settings(self):
-        doc = IniDoc(self.engine.settings_text())
+    def _control_values(self) -> dict:
+        values = {name: slider.get() for name, slider in self.sliders.items()}
+        values.update(source=self.source_var.get(), fist_action=self.fist_var.get())
+        return values
+
+    def _cancel_tuning_push(self):
+        if self._tuning_after:
+            self.root.after_cancel(self._tuning_after)
+            self._tuning_after = None
+
+    def _load_tuning_from_settings(self, replaced: bool = False):
+        """Show the current settings. The text stays the source of truth: sliders only describe edits to it."""
+        self._cancel_tuning_push()
+        self._tuning_base = self.engine.settings_text()
+        self._tuning_replaced = replaced        # Reset: Save then writes the whole text
+        doc = IniDoc(self._tuning_base)
         self._loading_tuning = True
         try:
-            hand = _region(doc.get("mapping", "hand_region"), (0.15, 0.15, 0.85, 0.85))
-            gaze = _region(doc.get("mapping", "gaze_region"), (0.3, 0.3, 0.7, 0.7))
-            s = self.sliders
-            s["zone"].set(max(0.0, min(0.35, min(hand[0], hand[1], 1 - hand[2], 1 - hand[3]))))
-            s["gaze"].set(max(4.0, min(30.0, abs(gaze[2] - gaze[0]) / 2 * 60)))
-            s["snap"].set(doc.get_float("stabilization", "anchor_lookback_seconds", 0.1))
-            s["drag"].set(doc.get_float("stabilization", "drag_threshold_px", 30))
-            s["pinch"].set(doc.get_float("gestures", "pinch_onset_seconds", 0.06))
-            s["release"].set(doc.get_float("gestures", "pinch_release_seconds", 0.08))
-            s["fist"].set(doc.get_float("gestures", "fist_onset_seconds", 0.3))
-            s["wink"].set(doc.get_float("gestures", "wink_onset_seconds", 0.25))
-            s["closure"].set(doc.get_float("gestures", "closure_onset_seconds", 1.0))
-            s["h_cut"].set(doc.get_float("hand_filter", "min_cutoff_hz", 1.2))
-            s["h_beta"].set(doc.get_float("hand_filter", "beta", 4.0))
-            s["g_cut"].set(doc.get_float("gaze_filter", "min_cutoff_hz", 0.8))
-            s["g_beta"].set(doc.get_float("gaze_filter", "beta", 6.0))
+            for name, (key, axis, scale) in REGION_CONTROLS.items():
+                values = _region(doc.get("mapping", key), DEFAULT_REGIONS[key])
+                self.sliders[name].set(abs(values[axis + 2] - values[axis]) * scale)
+            for name, (section_name, key, default, _) in VALUE_CONTROLS.items():
+                self.sliders[name].set(doc.get_float(section_name, key, default))
             self.source_var.set(doc.get("mapping", "cursor_source") or "hand_preferred")
             self.fist_var.set(doc.get("gestures", "fist_action") or "right_click")
-            self._gaze_inverted = gaze[2] < gaze[0], gaze[3] < gaze[1]
-            self._gaze_centre = ((gaze[0] + gaze[2]) / 2, (gaze[1] + gaze[3]) / 2)
+            self._loaded_values = self._control_values()
         finally:
             self._loading_tuning = False
 
-    def _tuning_ini(self) -> str:
-        doc = IniDoc(self.engine.settings_text())
-        s = self.sliders
-        m = round(s["zone"].get(), 3)
-        doc.set("mapping", "hand_region", (m, m, 1 - m, 1 - m))
-        half = s["gaze"].get() / 60.0
-        cx, cy = getattr(self, "_gaze_centre", (0.5, 0.5))
-        inv_x, inv_y = getattr(self, "_gaze_inverted", (False, False))
-        x0, x1 = (cx + half, cx - half) if inv_x else (cx - half, cx + half)
-        y0, y1 = (cy + half, cy - half) if inv_y else (cy - half, cy + half)
-        doc.set("mapping", "gaze_region", tuple(round(v, 4) for v in (x0, y0, x1, y1)))
-        doc.set("mapping", "cursor_source", self.source_var.get())
-        doc.set("stabilization", "anchor_lookback_seconds", round(s["snap"].get(), 3))
-        doc.set("stabilization", "drag_threshold_px", round(s["drag"].get(), 1))
-        doc.set("gestures", "pinch_onset_seconds", round(s["pinch"].get(), 3))
-        doc.set("gestures", "pinch_release_seconds", round(s["release"].get(), 3))
-        doc.set("gestures", "fist_onset_seconds", round(s["fist"].get(), 3))
-        doc.set("gestures", "wink_onset_seconds", round(s["wink"].get(), 3))
-        doc.set("gestures", "closure_onset_seconds", round(s["closure"].get(), 3))
-        doc.set("gestures", "fist_action", self.fist_var.get())
-        doc.set("hand_filter", "min_cutoff_hz", round(s["h_cut"].get(), 3))
-        doc.set("hand_filter", "beta", round(s["h_beta"].get(), 2))
-        doc.set("gaze_filter", "min_cutoff_hz", round(s["g_cut"].get(), 3))
-        doc.set("gaze_filter", "beta", round(s["g_beta"].get(), 2))
+    def _apply_edits(self, text: str) -> str:
+        """`text` with only the controls the user changed; exactly `text` when none were."""
+        now = self._control_values()
+        edited = {name for name, value in now.items() if value != self._loaded_values[name]}
+        if not edited:
+            return text
+        doc = IniDoc(text)
+        for name, (key, axis, scale) in REGION_CONTROLS.items():
+            if name in edited:
+                doc.set("mapping", key, resize_axis(doc, key, axis, now[name] / scale))
+        for name, (section_name, key, _, decimals) in VALUE_CONTROLS.items():
+            if name in edited:
+                doc.set(section_name, key, round(now[name], decimals))
+        if "source" in edited:
+            doc.set("mapping", "cursor_source", now["source"])
+        if "fist_action" in edited:
+            doc.set("gestures", "fist_action", now["fist_action"])
         return doc.text()
+
+    def _tuning_ini(self) -> str:
+        return self._apply_edits(self._tuning_base)
 
     def _tuning_changed(self):
         if self._loading_tuning:
             return
-        if self._tuning_after:
-            self.root.after_cancel(self._tuning_after)
+        self._cancel_tuning_push()
         self._tuning_after = self.root.after(250, self._push_tuning)
 
     def _push_tuning(self):
         self._tuning_after = None
-        self.engine.set_settings_text(self._tuning_ini())
+        text = self._tuning_ini()
+        if text == self.engine.settings_text():
+            return
+        error = self.engine.check_settings(text)
+        if error:
+            self.tuning_status.configure(text=f"Not applied: {error}", foreground=BAD)
+            return
+        self.engine.set_settings_text(text)
         self.tuning_status.configure(text="Applied to the running test (not saved).", foreground=MUTED)
+        self._update_notes()
 
     def reset_tuning(self):
         self.engine.reset_settings()
-        self._load_tuning_from_settings()
+        self._load_tuning_from_settings(replaced=True)
+        self._use_saved_screen()
+        self._update_notes()
         self.tuning_status.configure(text="Defaults restored (not saved).", foreground=MUTED)
 
     def load_user_settings(self):
@@ -646,36 +768,68 @@ class TesterApp:
         if not path.is_file():
             messagebox.showinfo("Settings", f"No saved settings yet:\n{path}", parent=self.root)
             return
-        self.engine.set_settings_text(path.read_text(encoding="utf-8"))
+        try:
+            text = read_settings(path)
+            error = self.engine.check_settings(text)
+        except (OSError, UnicodeDecodeError) as problem:
+            error = str(problem)
+        if error:
+            messagebox.showerror("Settings", f"Not loaded: {error}", parent=self.root)
+            return
+        self.engine.saved_settings_error = None
+        self.engine.set_settings_text(text)
         self._load_tuning_from_settings()
+        self._use_saved_screen()
+        self._update_notes()
         self.tuning_status.configure(text=f"Loaded {path}", foreground=MUTED)
 
     def save_user_settings(self):
         path = user_settings_path()
+        what = ("Replace your settings with the defaults and your edits? This also erases your calibration."
+                if self._tuning_replaced else "Save the values you changed to your settings?")
         if not messagebox.askyesno("Save settings",
-                                   f"Save these values as your settings?\n\n{path}\n\n"
+                                   f"{what}\n\n{path}\n\n"
                                    "The engine and the tray app will use them next time they start.",
                                    parent=self.root):
             return
-        text = self._tuning_ini()
-        probe_error = self._validate(text)
-        if probe_error:
-            messagebox.showerror("Settings", f"Not saved: {probe_error}", parent=self.root)
+        # The tray may have calibrated since this window opened: edit the file as it is now. A file that cannot
+        # be loaded is never written over, except by an explicit Reset and Save.
+        base = self._tuning_base
+        if not self._tuning_replaced and path.exists():
+            try:
+                saved = read_settings(path)
+                problem = self.engine.check_settings(saved)
+            except (OSError, UnicodeDecodeError) as error:
+                problem = str(error)
+            if problem:
+                messagebox.showerror(
+                    "Settings",
+                    f"Not saved, and your file was left as it is, because it has an error:\n\n{problem}\n\n"
+                    "Correct the file, or press Reset to defaults and then Save (that keeps a .bak copy).",
+                    parent=self.root)
+                return
+            base = saved
+        text = self._apply_edits(base)
+        error = self.engine.check_settings(text)
+        if error:
+            messagebox.showerror("Settings", f"Not saved: {error}", parent=self.root)
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".ini.tmp")
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                shutil.copyfile(path, path.with_name(path.name + ".bak"))
+            temporary = path.with_name(path.name + ".tester.tmp")       # the tray has its own .tmp
+            temporary.write_text(text, encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError as error:
+            messagebox.showerror("Settings", f"Not saved: {error}", parent=self.root)
+            return
+        self.engine.saved_settings_error = None
+        self.engine.set_settings_text(text)
+        self._load_tuning_from_settings()
+        self._update_notes()
         self.tuning_status.configure(text=f"Saved to {path}", foreground=GOOD)
         self.log(f"Settings saved to {path}")
-
-    def _validate(self, text: str) -> Optional[str]:
-        try:
-            probe = self.lib.controller(text, False, False)
-            probe.close()
-            return None
-        except ValueError as error:
-            return str(error)
 
     # ---------------------------------------------------------------- accuracy test
     def toggle_test(self):
@@ -704,25 +858,38 @@ class TesterApp:
         text.pack(fill="both", expand=True, padx=10, pady=10)
         text.insert("end", "Running checks...\n")
 
+        # Tk belongs to the main thread: read it here, and let the main thread poll for the results.
+        camera, camera_index = not self.engine.running, self._config()["camera_index"]
+        finished: List[List[Tuple[bool, str, str]]] = []
+
         def worker():
-            results = system_checks(self.lib, camera=not self.engine.running,
-                                    camera_index=self._config()["camera_index"])
-            def show():
-                text.delete("1.0", "end")
-                for ok, name, detail in results:
-                    text.insert("end", f"{'PASS' if ok else 'FAIL'}  {name}\n", "ok" if ok else "bad")
-                    if detail:
-                        text.insert("end", f"      {detail}\n", "detail")
-                failed = sum(1 for r in results if not r[0])
-                text.insert("end", "\nALL CHECKS PASSED\n" if not failed else f"\n{failed} check(s) failed\n",
-                            "ok" if not failed else "bad")
-                text.tag_configure("ok", foreground=GOOD)
-                text.tag_configure("bad", foreground=BAD)
-                text.tag_configure("detail", foreground=MUTED)
-                text.configure(state="disabled")
-            self.root.after(0, show)
+            try:
+                finished.append(system_checks(self.lib, camera=camera, camera_index=camera_index))
+            except Exception as error:
+                finished.append([(False, "Checks", repr(error))])
+
+        def show():
+            if not window.winfo_exists():
+                return          # closed before the checks finished
+            if not finished:
+                self.root.after(100, show)
+                return
+            results = finished[0]
+            text.delete("1.0", "end")
+            for ok, name, detail in results:
+                text.insert("end", f"{'PASS' if ok else 'FAIL'}  {name}\n", "ok" if ok else "bad")
+                if detail:
+                    text.insert("end", f"      {detail}\n", "detail")
+            failed = sum(1 for r in results if not r[0])
+            text.insert("end", "\nALL CHECKS PASSED\n" if not failed else f"\n{failed} check(s) failed\n",
+                        "ok" if not failed else "bad")
+            text.tag_configure("ok", foreground=GOOD)
+            text.tag_configure("bad", foreground=BAD)
+            text.tag_configure("detail", foreground=MUTED)
+            text.configure(state="disabled")
 
         threading.Thread(target=worker, daemon=True).start()
+        self.root.after(100, show)
 
     # ---------------------------------------------------------------- refresh
     def tick(self):
@@ -803,13 +970,13 @@ class TesterApp:
         put("Pointer", f"{h.point[0]:.3f}, {h.point[1]:.3f}" if h.point else "-")
         put("Gesture", HAND_STATES.get(h.state, str(h.state)))
         put("Confidence", f"{h.confidence:.2f}")
-        put("Time per frame", f"{h.ms:.1f} ms")
+        put("Python tracker time", f"{h.ms:.1f} ms")
         put("Face", "yes" if g.face else "no", GOOD if g.face else MUTED)
         put("Eye state", EYE_STATES.get(g.state, str(g.state)), WARN if g.state == -1 else TEXT)
         put("Gaze angle", _angles(g.yaw, g.pitch))
         put("Head angle", _angles(g.head_yaw, g.head_pitch))
         put("Gaze pointer", f"{g.point[0]:.3f}, {g.point[1]:.3f}" if g.point else "-")
-        put("Time per frame ", f"{g.ms:.1f} ms")
+        put("Python tracker time ", f"{g.ms:.1f} ms")
         put("Cursor follows", r.source)
         put("Cursor pixel", f"{r.cursor[0]}, {r.cursor[1]}" if r.cursor else "-")
         put("Output", ("active" if r.active else "paused") + (" (inhibited)" if r.inhibited else ""),
@@ -855,7 +1022,8 @@ class TesterApp:
 
         # Accuracy test
         clicked = False
-        total = snap.counters.left_down + snap.counters.left_click + snap.counters.right_click
+        total = (snap.counters.left_down + snap.counters.left_click + snap.counters.right_click
+                 + snap.counters.middle_click)
         if total > self._prev_click_total:
             clicked = True
         self._prev_click_total = total
@@ -897,7 +1065,7 @@ class TesterApp:
             self.record_button.configure(text="●  Record CSV")
 
     def close(self):
-        self.engine.stop()
+        self.engine.stop()                  # the watchdog releases at once, even if a camera read is blocked
         self.root.destroy()
 
 

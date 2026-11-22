@@ -8,18 +8,20 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 DLL_NAME = "os_integration_capi.dll"
-EXPECTED_VERSION = 1
+EXPECTED_VERSION = 2
 MAX_ACTIONS = 8
 
 OUTPUT_RECORD = 0
 OUTPUT_MOUSE = 1
 
 TRACKED, HELD, LOST = 0, 1, 2
+FILTER_INVALID, FILTER_OK, FILTER_REJECTED = 0, 1, 2
 
 ACTION_DOWN, ACTION_UP, ACTION_CLICK, ACTION_TOGGLE_PAUSE = 0, 1, 2, 3
 EVENT_MOVE, EVENT_DOWN, EVENT_UP, EVENT_CLICK = 0, 1, 2, 3
@@ -142,6 +144,11 @@ class OsiLibrary:
         self.version = int(d.osi_version())
         if self.version != EXPECTED_VERSION:
             raise RuntimeError(f"{DLL_NAME} version {self.version}, tester expects {EXPECTED_VERSION}: rebuild it")
+        # Bound after the version check: an older DLL does not export these.
+        d.osi_filter_update.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double),
+                                        ctypes.POINTER(ctypes.c_double), ctypes.c_double]
+        d.osi_filter_update.restype = ctypes.c_int32
+        d.osi_filter_reset.argtypes = [ctypes.c_void_p]
 
     def default_settings_ini(self) -> str:
         size = self._dll.osi_default_settings_ini(None, 0)
@@ -164,11 +171,13 @@ class OsiLibrary:
 
 
 class Controller:
-    """One osi::OsController. Use from a single thread."""
+    """One osi::OsController. The lock lets the tester's watchdog release buttons from its own thread."""
 
     def __init__(self, lib: OsiLibrary, settings_ini: str, all_monitors: bool, real_mouse: bool):
         self._lib = lib
         self._d = lib._dll
+        self._lock = threading.RLock()
+        self._h = None
         error = ctypes.create_string_buffer(512)
         self._h = self._d.osi_create(settings_ini.encode("utf-8"), 1 if all_monitors else 0,
                                      OUTPUT_MOUSE if real_mouse else OUTPUT_RECORD, error, len(error))
@@ -179,9 +188,10 @@ class Controller:
         self._events = (_Event * 256)()
 
     def close(self) -> None:
-        if self._h:
-            self._d.osi_destroy(self._h)  # releases any held button
-            self._h = None
+        with self._lock:
+            if self._h:
+                self._d.osi_destroy(self._h)  # releases any held button
+                self._h = None
 
     def __del__(self):
         self.close()
@@ -189,18 +199,23 @@ class Controller:
     def apply_settings(self, settings_ini: str) -> Optional[str]:
         """None on success, else the reason (the controller is then unchanged)."""
         error = ctypes.create_string_buffer(512)
-        if self._d.osi_apply_settings_ini(self._h, settings_ini.encode("utf-8"), error, len(error)):
+        with self._lock:
+            applied = self._d.osi_apply_settings_ini(self._h, settings_ini.encode("utf-8"), error, len(error))
+        if applied:
             return None
         return error.value.decode("utf-8", "replace")
 
     def set_active(self, active: bool) -> None:
-        self._d.osi_set_active(self._h, 1 if active else 0)
+        with self._lock:
+            self._d.osi_set_active(self._h, 1 if active else 0)
 
     def set_inhibited(self, inhibited: bool) -> None:
-        self._d.osi_set_inhibited(self._h, 1 if inhibited else 0)
+        with self._lock:
+            self._d.osi_set_inhibited(self._h, 1 if inhibited else 0)
 
     def release_all(self) -> bool:
-        return bool(self._d.osi_release_all(self._h))
+        with self._lock:
+            return bool(self._d.osi_release_all(self._h))
 
     @staticmethod
     def _tracker(value: Optional[TrackerInput]) -> _Tracker:
@@ -217,7 +232,8 @@ class Controller:
     def update(self, timestamp: float, hand: Optional[TrackerInput], gaze: Optional[TrackerInput]) -> Report:
         h, g = self._tracker(hand), self._tracker(gaze)
         r = self._report
-        self._d.osi_update(self._h, timestamp, ctypes.byref(h), ctypes.byref(g), ctypes.byref(r))
+        with self._lock:
+            self._d.osi_update(self._h, timestamp, ctypes.byref(h), ctypes.byref(g), ctypes.byref(r))
         return Report(
             processed=bool(r.processed), source=SOURCE_NAMES[r.source] if 0 <= r.source < 3 else "none",
             cursor=(r.cursor_x, r.cursor_y) if r.has_cursor else None, moved=bool(r.moved),
@@ -228,12 +244,14 @@ class Controller:
             unknown_states=r.unknown_states, confirmed_hand=r.confirmed_hand, confirmed_eye=r.confirmed_eye)
 
     def drain_events(self) -> List[Event]:
-        n = self._d.osi_drain_events(self._h, self._events, len(self._events))
+        with self._lock:
+            n = self._d.osi_drain_events(self._h, self._events, len(self._events))
         return [Event(e.kind, BUTTON_NAMES[e.button % 3], e.x, e.y) for e in self._events[:n]]
 
     def geometry(self) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
         target, desktop = _Rect(), _Rect()
-        self._d.osi_screen_geometry(self._h, ctypes.byref(target), ctypes.byref(desktop))
+        with self._lock:
+            self._d.osi_screen_geometry(self._h, ctypes.byref(target), ctypes.byref(desktop))
         return ((target.left, target.top, target.width, target.height),
                 (desktop.left, desktop.top, desktop.width, desktop.height))
 
@@ -251,6 +269,15 @@ class SmoothingFilter:
         if self._d.osi_filter_apply(self._h, ctypes.byref(x), ctypes.byref(y), timestamp, 1 if point else 0):
             return x.value, y.value
         return None
+
+    def update(self, point: Tuple[float, float], timestamp: float) -> Tuple[int, Optional[Tuple[float, float]]]:
+        """(FILTER_*, smoothed point). The point is None unless the status is FILTER_OK."""
+        x, y = ctypes.c_double(point[0]), ctypes.c_double(point[1])
+        status = self._d.osi_filter_update(self._h, ctypes.byref(x), ctypes.byref(y), timestamp)
+        return status, (x.value, y.value) if status == FILTER_OK else None
+
+    def reset(self) -> None:
+        self._d.osi_filter_reset(self._h)
 
     def close(self) -> None:
         if self._h:

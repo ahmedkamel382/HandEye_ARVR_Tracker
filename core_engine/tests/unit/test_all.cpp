@@ -227,6 +227,111 @@ static void t_hand_anchor_clamp_and_fallback() {
     g.classify(f, c, p);  CHECK(c == 0);
 }
 
+// E2-B: malformed structure and nonfinite coordinates must be rejected at the native
+// boundary. A bridge error leaves the native tracker state untouched and never reaches
+// the classifier. Finite out-of-range coordinates keep the existing clamp (E2B-17).
+static void t_hand_invalid_payload_rejection() {
+    int classify_calls = 0;
+    LambdaHandModel model([&](const double*, int& c, double& p) { ++classify_calls; c = 0; p = 1.0; });
+    auto bridge_error = [](const ModuleOut& o, int missed) {
+        return !o.ok && !o.detected() && o.tracking_state == TrackingState::Lost &&
+               o.missed_frames == missed && o.x == -1.0f && o.y == -1.0f;
+    };
+
+    // E2B-01: valid 21+21 still becomes a fresh TRACKED result.
+    {
+        HandNative h(&model);
+        Packed pk;
+        ModuleOut o = h.process(pk.p, kHandPacked);
+        CHECK(o.ok && o.detected() && o.tracking_state == TrackingState::Tracked);
+        CHECK_NEAR(o.x, 0.42, 1e-6);
+    }
+
+    // E2B-02/03: incorrect total counts are bridge errors. A 20+22 split that also
+    // sums to 42 cannot be distinguished here by count; the Python packer rejects it
+    // before the bridge (see check_hand_landmark_diag.py).
+    {
+        HandNative h(&model);
+        Packed pk;
+        CHECK(bridge_error(h.process(pk.p, kHandPoints + (kHandPoints - 1)), 0));   // 41
+        CHECK(bridge_error(h.process(pk.p, kHandPacked + 1), 0));                   // 43
+        CHECK(classify_calls == 1);                                                  // only the valid frame above
+    }
+
+    // E2B-08..13: NaN / +/-Inf in image X,Y,Z or world coordinates, including Z.
+    {
+        HandNative h(&model);
+        Packed pk;
+        auto set_img = [&](int i, int axis, float v) { pk.p[3 * i + axis] = v; };
+        auto set_world = [&](int i, int axis, float v) { pk.p[3 * (kHandPoints + i) + axis] = v; };
+
+        set_img(8, 0, NAN);   CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        set_img(8, 0, 0.42f);
+        set_img(8, 1, NAN);   CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        set_img(8, 1, 0.25f);
+        set_img(8, 2, NAN);   CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        set_img(8, 2, 0.0f);
+
+        set_world(5, 0, NAN); CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        set_world(6, 1, NAN); CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        set_world(7, 2, NAN); CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+
+        set_img(8, 0, INFINITY);  CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        set_img(8, 0, -INFINITY); CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        set_img(8, 0, 0.42f);
+        set_world(20, 2, INFINITY); CHECK(bridge_error(h.process(pk.p, kHandPacked), 0));
+        CHECK(classify_calls == 1);                                                  // no invalid payload classified
+    }
+
+    // E2B-14: invalid frame followed by a valid frame recovers normally.
+    {
+        HandNative h(&model);
+        Packed bad; bad.set(8, NAN, 0.25f);
+        CHECK(bridge_error(h.process(bad.p, kHandPacked), 0));
+        Packed good;
+        ModuleOut o = h.process(good.p, kHandPacked);
+        CHECK(o.ok && o.detected() && o.tracking_state == TrackingState::Tracked && o.missed_frames == 0);
+    }
+
+    // E2B-15: valid then invalid with no dropout must not mutate retained state.
+    {
+        HandNative h(&model);
+        Packed good;
+        ModuleOut v = h.process(good.p, kHandPacked);
+        Packed bad; bad.set(8, INFINITY, 0.25f);
+        CHECK(bridge_error(h.process(bad.p, kHandPacked), h.missedFrames()));
+        ModuleOut held = h.process(nullptr, 0);
+        CHECK(held.tracking_state == TrackingState::Held && held.missed_frames == 1);
+        CHECK(held.x == v.x && held.y == v.y);
+        ModuleOut reacq = h.process(good.p, kHandPacked);
+        CHECK(reacq.tracking_state == TrackingState::Tracked && reacq.missed_frames == 0);
+    }
+
+    // E2B-16: invalid frame while a hand is retained must not extend or clear grace.
+    {
+        HandNative h(&model);
+        Packed good;
+        ModuleOut v = h.process(good.p, kHandPacked);
+        ModuleOut first_miss = h.process(nullptr, 0);
+        CHECK(first_miss.tracking_state == TrackingState::Held && first_miss.missed_frames == 1);
+        Packed bad; bad.set(8, NAN, 0.25f);
+        CHECK(bridge_error(h.process(bad.p, kHandPacked), h.missedFrames()));
+        ModuleOut second_miss = h.process(nullptr, 0);
+        CHECK(second_miss.tracking_state == TrackingState::Held && second_miss.missed_frames == 2);
+        CHECK(second_miss.x == v.x && second_miss.y == v.y);
+    }
+
+    // E2B-17: finite out-of-range image coordinates keep the existing clamp.
+    {
+        HandNative h(&model);
+        Packed pk; pk.set(8, 1.5f, -0.2f);
+        ModuleOut o = h.process(pk.p, kHandPacked);
+        CHECK(o.ok && o.detected());
+        CHECK_NEAR(o.x, 1.0, 1e-9);
+        CHECK_NEAR(o.y, 0.0, 1e-9);
+    }
+}
+
 // ======================================================================= gaze maths
 // 478 landmarks (+ the head-pose matrix rows) with both eyes drawn so that the Eye Aspect Ratio equals the requested value.
 struct FacePts {
@@ -706,6 +811,30 @@ static bool same_point(const std::optional<GatedPoint>& p, double x, double y) {
     return p && std::fabs(p->x - x) < 1e-12 && std::fabs(p->y - y) < 1e-12;
 }
 
+// E2B downstream consequence: an invalid packed payload becomes a bridge error,
+// which the freshness gate treats as LOST: no DSP update, cached point cleared.
+static void t_e2b_invalid_payload_never_updates_dsp() {
+    int classify_calls = 0;
+    LambdaHandModel model([&](const double*, int& c, double& p) { ++classify_calls; c = 0; p = 1.0; });
+    HandNative hand(&model);
+    Packed good, bad;
+    bad.set(8, NAN, 0.25f);
+
+    SpyFilter spy;
+    FreshnessGate gate;
+    ModuleOut valid = hand.process(good.p, kHandPacked);
+    auto p0 = gate.update(valid, spy, true, 1.0);
+    CHECK(p0 && spy.calls.size() == 1);
+
+    ModuleOut invalid = hand.process(bad.p, kHandPacked);
+    CHECK(!invalid.ok && invalid.tracking_state == TrackingState::Lost);
+    auto p1 = gate.update(invalid, spy, true, 1.0 + 1.0 / 60.0);
+    CHECK(!p1 && !gate.hasCache());
+    CHECK(spy.calls.size() == 1);                       // invalid payload never updated DSP
+    CHECK(spy.resets == 1);                             // LOST cleared filter history
+    CHECK(classify_calls == 1);                         // invalid payload never reached classifier
+}
+
 static void t_gate_tracked_held_lost() {
     SpyFilter spy;
     FreshnessGate gate;
@@ -932,11 +1061,13 @@ int main() {
         { "hand: gate, vote, grace period", t_hand_vote_gate_grace },
         { "hand: TRACKED / HELD / LOST transitions", t_hand_tracking_state_transitions },
         { "hand: anchors, clamp, geometric fallback", t_hand_anchor_clamp_and_fallback },
+        { "hand: E2-B malformed / nonfinite rejection", t_hand_invalid_payload_rejection },
         { "gaze: calibration + feature vector", t_gaze_calibration_and_features },
         { "gaze: no face + recalibrate", t_gaze_no_face_and_recalibrate },
         { "gaze: calibration ignores zero EAR", t_gaze_calibration_ignores_zero_ear },
         { "gaze: face loss resets tracking state", t_gaze_face_loss_resets_tracking_state },
         { "gaze: no freshness fields", t_gaze_has_no_freshness_fields },
+        { "gate: E2-B invalid payload never updates DSP", t_e2b_invalid_payload_never_updates_dsp },
         { "gate: TRACKED / HELD / LOST -> filter calls", t_gate_tracked_held_lost },
         { "gate: startup, errors, edges, --no-filter", t_gate_startup_error_and_edges },
         { "gate: chain == observation-only filter", t_gate_chain_matches_observation_only_filter },

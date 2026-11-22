@@ -22,6 +22,18 @@ def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + (f"  [{extra}]" if extra else ""))
 
 
+def expect_bridge_error(name, fn):
+    """A malformed payload must raise so the native bridge reports n = -1."""
+    try:
+        fn()
+    except RuntimeError:
+        check(name, True)
+    except Exception as exc:
+        check(name, False, f"wrong exception {type(exc).__name__}: {exc}")
+    else:
+        check(name, False, "no exception raised")
+
+
 class P:
     def __init__(self, x, y, z=0.0):
         self.x, self.y, self.z = x, y, z
@@ -55,8 +67,23 @@ check("full result: world rows second", np.allclose(packed[21], [0.2, 0.3, 0.0])
 check("both empty: (0, 3)", le._pack_hand(R()).shape == (0, 3))
 check("image only: (0, 3)", le._pack_hand(R(hand(21), [])).shape == (0, 3))
 check("world only: (0, 3)", le._pack_hand(R([], hand(21))).shape == (0, 3))
-malformed = le._pack_hand(R(hand(20), hand(21)))
-check("malformed result is returned unchanged (41 rows)", malformed.shape == (41, 3), str(malformed.shape))
+expect_bridge_error("malformed image count is a bridge error (E2-B)",
+                    lambda: le._pack_hand(R(hand(20), hand(21))))
+expect_bridge_error("malformed world count is a bridge error (E2-B)",
+                    lambda: le._pack_hand(R(hand(21), hand(20))))
+expect_bridge_error("20+22 cannot become a 42-row payload (E2-B)",
+                    lambda: le._pack_hand(R(hand(20), hand(22))))
+
+# The diagnostic must still be written before the bridge error is raised.
+with tempfile.TemporaryDirectory() as td:
+    path = os.path.join(td, "malformed.csv")
+    writer = le._HandDiagWriter(path)
+    expect_bridge_error("diagnostic still written for malformed payload",
+                        lambda: le._pack_hand(R(hand(20), hand(22)), writer, 9, 999, "VIDEO"))
+    writer.close()
+    rows = list(csv.DictReader(open(path, newline="", encoding="utf-8")))
+    check("malformed diagnostic classified", len(rows) == 1 and rows[0]["reason"] == "MALFORMED"
+          and rows[0]["img_n"] == "20" and rows[0]["world_n"] == "22", str(rows))
 
 # ---------------------------------------------------------------- cause labels
 d = describe()

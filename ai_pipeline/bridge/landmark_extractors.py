@@ -18,10 +18,13 @@ Contract (called from core_engine/include/py_bridge.hpp, always on ONE thread):
                 No matrix from MediaPipe counts as no face.
                 HandLandmarkExtractor: N = 42 = the 21 normalised IMAGE landmarks (rows 0..20, used for the
                 cursor) followed by the 21 WORLD landmarks (rows 21..41, metres, used for the 24 gesture features).
+                Both groups must contain exactly 21 landmarks: a 20+22 split that also sums to 42 is malformed
+                and is reported as a bridge error (exception), while the diagnostic still records the counts.
+                This keeps malformed input distinguishable from an ordinary no-hand frame at the C++ boundary.
     extractor.shutdown()                         # releases the MediaPipe resources (called once at exit)
 
-Rules: no OS access, no flipping/colour conversion, exceptions are allowed (the C++ side counts them
-and treats the frame as "nothing detected"), never raise for "no face / no hand".
+Rules: no OS access, no flipping/colour conversion. Exceptions are allowed: the C++ side counts them
+and reports a bridge error, which is distinguishable from a no-hand frame. Never raise for "no face / no hand".
 
 Environment:
     AI_PIPELINE_ROOT   same meaning as in gaze_intent.py / hand_tracker.py (default: the folder above this one)
@@ -189,10 +192,17 @@ def _pack_hand(result, diag=None, seq: int = 0, ts_ms: int = 0, mode: str = "") 
             diag.write(_describe_hand(result, seq, ts_ms, mode))
         except Exception:
             pass
-    # hand_tracker.py: "no hand" = no world landmarks OR no image landmarks
-    if not result.hand_landmarks or not result.hand_world_landmarks:
+    # "no hand" = a missing group; an incorrect group size is a bridge error, not a
+    # missed detection. Raise so PyLandmarker::call returns -1 and main.cpp publishes
+    # the existing bridge-error result, distinguishable from n == 0 / HELD grace.
+    img = result.hand_landmarks
+    world = result.hand_world_landmarks
+    if not img or not world:
         return _EMPTY
-    return np.concatenate([_to_array(result.hand_landmarks[0]), _to_array(result.hand_world_landmarks[0])])
+    img_n, world_n = len(img[0]), len(world[0])
+    if img_n != 21 or world_n != 21:
+        raise RuntimeError(f"malformed hand payload: image={img_n}, world={world_n}; expected 21+21")
+    return np.concatenate([_to_array(img[0]), _to_array(world[0])])
 
 
 class FaceLandmarkExtractor:

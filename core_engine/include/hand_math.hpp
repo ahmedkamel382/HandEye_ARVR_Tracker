@@ -28,6 +28,18 @@ constexpr int kHandPoints   = 21;                 // landmarks of one hand
 constexpr int kHandPacked   = 2 * kHandPoints;    // image landmarks followed by world landmarks
 constexpr int kHandFeatures = 24;
 
+// A packed hand payload is valid only when BOTH groups contain exactly 21 landmarks
+// and every coordinate is finite. A total count of 42 is not sufficient: 20+22 is a
+// malformed pairing, and a nonfinite coordinate must never reach the cursor clamp,
+// handFeatures() or the classifier. This is the native E2-B boundary check.
+inline bool handPayloadValid(const float* pts, int n) {
+    if (n != kHandPacked || pts == nullptr) return false;
+    for (int i = 0; i < n * 3; ++i) {
+        if (!std::isfinite(pts[i])) return false;
+    }
+    return true;
+}
+
 // Order of hand_features.FEATURE_NAMES (the model file stores the same list and the engine checks it).
 inline const char* const* handFeatureNames() {
     static const char* const names[kHandFeatures] = {
@@ -176,7 +188,7 @@ public:
     // exactly what the tracker returned before this contract existed; HELD repeats the last TRACKED x, y, state.
     ModuleOut process(const float* pts, int n) {
         using namespace hand_idx;
-        if (n != 0 && (n != kHandPacked || !pts)) {            // bridge error: no output, tracker state untouched
+        if (n != 0 && !handPayloadValid(pts, n)) {              // bridge error: no output, tracker state untouched
             ModuleOut e;                                       // ok = false, x = y = -1, state 0
             e.tracking_state = TrackingState::Lost;
             e.missed_frames = missed_;

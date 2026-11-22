@@ -6,8 +6,9 @@ import csv
 import importlib.util
 import io
 import json
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest import mock
 
 import numpy as np
@@ -35,6 +36,7 @@ def _write_synthetic_run(
     frame_specs: Sequence[Dict[str, Any]],
     *,
     y_sign_mult: float = -1.0,
+    diag_csv: Optional[Path] = None,
 ) -> Path:
     """Build a valid E4REC v2 trace.txt + COMPLETE + 32-column gaze_diag.csv using live DLLs."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -45,7 +47,8 @@ def _write_synthetic_run(
         "E4REC BEGIN version=2 channel=gaze capacity=4096 min_cutoff=0.8 "
         "beta=6 derivative_cutoff=1.5 min_dt=1e-6 reset_gap=0.25"
     ]
-    diag_csv = run_dir / "gaze_diag.csv"
+    diag_csv = diag_csv or (run_dir / "gaze_diag.csv")
+    diag_csv.parent.mkdir(parents=True, exist_ok=True)
     has_initialized_dsp = False
 
     with diag_csv.open("w", encoding="utf-8", newline="") as f:
@@ -335,7 +338,12 @@ def test_mocked_cued_capture_writes_schedule_and_analyzes(tmp_path: Path):
         def __init__(self, cmd: List[str], **_kwargs: Any) -> None:
             self.cmd = cmd
             self.returncode = 0
-            _write_synthetic_run(run_dir, frames, y_sign_mult=-1.0)
+            dsp_dir = Path(cmd[cmd.index("--dsp-record-dir") + 1])
+            diag_csv_path = Path(cmd[cmd.index("--gaze-diag-log") + 1])
+            # core_engine OutputSession strictly requires --dsp-record-dir NOT to pre-exist, while parent exists.
+            assert not dsp_dir.exists(), f"--dsp-record-dir must not pre-exist: {dsp_dir}"
+            assert dsp_dir.parent.is_dir()
+            _write_synthetic_run(dsp_dir, frames, y_sign_mult=-1.0, diag_csv=diag_csv_path)
             self.stdout = io.StringIO(
                 "OS: log (stdout). Starts PAUSED\n"
                 "cap 30 | ai 30 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.51,0.72 s=0) hand(0.00,0.00 s=0) | os frames 35\n"
@@ -351,6 +359,9 @@ def test_mocked_cued_capture_writes_schedule_and_analyzes(tmp_path: Path):
 
         def wait(self, timeout=None):
             return 0
+
+    # Even if run_dir was already created as an empty folder beforehand, --cued-capture must still succeed.
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     with (
         mock.patch.object(ANALYZER.subprocess, "Popen", side_effect=FakeProc),
@@ -371,6 +382,9 @@ def test_mocked_cued_capture_writes_schedule_and_analyzes(tmp_path: Path):
         ])
 
     assert rc == 0
+    assert (run_dir / "dsp_record" / "trace.txt").is_file()
+    assert (run_dir / "dsp_record" / "COMPLETE").is_file()
+    assert (run_dir / "gaze_diag.csv").is_file()
     sched = json.loads((run_dir / "cued_schedule.json").read_text(encoding="utf-8"))
     assert "calib_ready_s" in sched
     assert [t["name"] for t in sched["targets"]] == ["CENTER", "LEFT", "RIGHT", "UP", "DOWN"]
@@ -378,6 +392,8 @@ def test_mocked_cued_capture_writes_schedule_and_analyzes(tmp_path: Path):
         assert t["target_end_s"] > t["target_start_s"]
 
     rep = json.loads(out_json.read_text(encoding="utf-8"))
+    assert Path(rep["integrity"]["dsp_record_dir"]) == (run_dir / "dsp_record").resolve()
+    assert Path(rep["integrity"]["artifact_dir"]) == run_dir.resolve()
     assert rep["analysis_params"]["wash_in_s"] == 0.5
     assert rep["analysis_params"]["blink_pad_frames"] == 2
     assert len(rep["windows"]) == 5
@@ -388,3 +404,207 @@ def test_mocked_cued_capture_writes_schedule_and_analyzes(tmp_path: Path):
     dirs = {d["comparison"]: d for d in rep["directions"]}
     assert dirs["HORIZONTAL_LEFT_TO_RIGHT"]["delta_raw_x_mean"] > 0.30
     assert dirs["VERTICAL_UP_TO_DOWN"]["delta_raw_y_mean"] > 0.10
+
+    # Offline re-analysis with ONLY --run-dir + wash-in + blink-pad auto-discovers dsp_record/, gaze_diag.csv, cued_schedule.json
+    rc_re = ANALYZER.main([
+        "--run-dir", str(run_dir),
+        "--wash-in-s", "0.5",
+        "--blink-pad-frames", "2",
+    ])
+    assert rc_re == 0
+    re_rep = json.loads((run_dir / "gaze_attribution_report.json").read_text(encoding="utf-8"))
+    assert len(re_rep["windows"]) == 5
+    assert (run_dir / "gaze_attribution_report.md").is_file()
+
+
+def test_cued_capture_refuses_existing_dsp_record_dir(tmp_path: Path):
+    run_dir = tmp_path / "existing_run"
+    (run_dir / "dsp_record").mkdir(parents=True, exist_ok=True)
+    fake_exe = tmp_path / "core_engine.exe"
+    fake_exe.write_text("stub", encoding="utf-8")
+
+    with mock.patch.object(ANALYZER.subprocess, "Popen") as popen_mock:
+        with pytest.raises(RuntimeError, match="Recorder output directory already exists"):
+            ANALYZER.run_cued_capture(
+                exe=fake_exe,
+                run_dir=run_dir,
+                diag_csv=run_dir / "gaze_diag.csv",
+                camera=0,
+                targets=["CENTER"],
+                hold_s=1.0,
+                gap_s=0.0,
+                audio=False,
+                yes=True,
+            )
+    popen_mock.assert_not_called()
+
+
+def test_cued_capture_surfaces_fast_exit_stderr_tail_never_empty(tmp_path: Path):
+    run_dir = tmp_path / "fast_fail_run"
+    fake_exe = tmp_path / "fake_core_engine.exe"
+    fake_exe.write_text("stub", encoding="utf-8")
+
+    helper = tmp_path / "fast_fail_engine.py"
+    helper.write_text(
+        "import sys\n"
+        "sys.stderr.write('[recording] startup failed: simulated fast exit error\\n')\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(4)\n",
+        encoding="utf-8",
+    )
+    real_popen = ANALYZER.subprocess.Popen
+
+    def _spawn_helper(cmd: List[str], **kwargs: Any):
+        return real_popen([sys.executable, str(helper), *cmd[1:]], **kwargs)
+
+    with mock.patch.object(ANALYZER.subprocess, "Popen", side_effect=_spawn_helper):
+        with pytest.raises(RuntimeError) as exc_info:
+            ANALYZER.run_cued_capture(
+                exe=fake_exe,
+                run_dir=run_dir,
+                diag_csv=run_dir / "gaze_diag.csv",
+                camera=0,
+                targets=["CENTER"],
+                hold_s=1.0,
+                gap_s=0.0,
+                audio=False,
+                yes=True,
+            )
+    msg = str(exc_info.value)
+    assert "exited with code 4" in msg
+    assert "[recording] startup failed: simulated fast exit error" in msg
+
+
+def test_cued_capture_real_subprocess_pipe_buffer_sync_and_ctrl_break(tmp_path: Path):
+    run_dir = tmp_path / "pipe_sync_run"
+    fake_exe = tmp_path / "fake_core_engine.exe"
+    fake_exe.write_text("stub", encoding="utf-8")
+
+    # Pre-build a synthetic recording payload template we can save from the helper subprocess.
+    seed_dir = tmp_path / "_seed"
+    frames: List[Dict[str, Any]] = []
+    # t=0..0.5s: calibration (state=-1); t=0.5..5.5s: active steady CENTER frames (state=0) at 30 Hz
+    for i in range(15):
+        frames.append({"t_s": i * 0.033333, "state": -1, "sx": 0.5, "sy": 0.5})
+    for i in range(15, 180):
+        frames.append({"t_s": i * 0.033333, "state": 0, "sx": 0.5, "sy": 0.0})
+    _write_synthetic_run(seed_dir, frames, y_sign_mult=-1.0)
+    trace_text = (seed_dir / "trace.txt").read_text(encoding="utf-8")
+    diag_text = (seed_dir / "gaze_diag.csv").read_text(encoding="utf-8")
+
+    helper = tmp_path / "delayed_pipe_engine.py"
+    helper.write_text(
+        f"""
+import os, signal, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+dsp_dir = Path(args[args.index('--dsp-record-dir') + 1])
+diag_csv = Path(args[args.index('--gaze-diag-log') + 1])
+if dsp_dir.exists():
+    sys.stderr.write(f"[recording] startup failed: Recorder output directory already exists: {{dsp_dir}}\\n")
+    sys.exit(4)
+dsp_dir.mkdir(parents=False, exist_ok=False)
+
+stop = False
+def _on_sig(signum, frame):
+    global stop
+    stop = True
+
+signal.signal(signal.SIGINT, _on_sig)
+if hasattr(signal, 'SIGBREAK'):
+    signal.signal(signal.SIGBREAK, _on_sig)
+
+t0 = time.monotonic()
+# Simulate Windows pipe buffering: print OS line WITHOUT flush, then wait 1.0s before flushing with first status line.
+sys.stdout.write("OS: OS integration (dry run, mouse untouched). Starts PAUSED\\n")
+time.sleep(1.0)
+sys.stdout.write("cap  31 | ai  31 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.72 s=0) hand(0.00,0.00 s=0) | os frames 31\\n")
+sys.stdout.flush()
+
+for os_f in (61, 91, 121, 151, 180):
+    target_dt = (os_f - 1) * 0.033333
+    while not stop and (time.monotonic() - t0) < target_dt:
+        time.sleep(0.02)
+    if stop:
+        break
+    sys.stdout.write(f"cap  30 | ai  30 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.72 s=0) hand(0.00,0.00 s=0) | os frames {{os_f}}\\n")
+    sys.stdout.flush()
+
+# Wait briefly for CTRL_BREAK_EVENT / SIGINT from run_cued_capture if targets just finished
+deadline = time.monotonic() + 3.0
+while not stop and time.monotonic() < deadline:
+    time.sleep(0.02)
+
+(dsp_dir / "trace.txt").write_text({trace_text!r}, encoding="utf-8")
+(dsp_dir / "COMPLETE").write_text("ok\\n", encoding="utf-8")
+diag_csv.write_text({diag_text!r}, encoding="utf-8")
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    real_popen = ANALYZER.subprocess.Popen
+
+    def _spawn_helper(cmd: List[str], **kwargs: Any):
+        return real_popen([sys.executable, str(helper), *cmd[1:]], **kwargs)
+
+    with mock.patch.object(ANALYZER.subprocess, "Popen", side_effect=_spawn_helper):
+        rc = ANALYZER.main([
+            "--cued-capture",
+            "--exe", str(fake_exe),
+            "--run-dir", str(run_dir),
+            "--targets", "CENTER",
+            "--hold-s", "1.5",
+            "--gap-s", "0.0",
+            "--no-audio",
+            "--yes",
+        ])
+
+    assert rc == 0
+    sched = json.loads((run_dir / "cued_schedule.json").read_text(encoding="utf-8"))
+    assert sched["time_sync_method"] == "trace_status_sync"
+    # Even with the 1.0s stdout buffer delay on "OS:", calib_ready_s must stay synced near trace capture_s (<= 2.6s)
+    assert 1.5 <= sched["calib_ready_s"] <= 2.6
+    tgt = sched["targets"][0]
+    assert tgt["target_end_s"] - tgt["target_start_s"] == pytest.approx(1.5, abs=0.15)
+    rep = json.loads((run_dir / "gaze_attribution_report.json").read_text(encoding="utf-8"))
+    assert rep["integrity"]["alignment_ok"] is True
+    assert rep["windows"][0]["eligible_frames"] >= 25
+    assert rep["windows"][0]["raw_x"]["pass_all"] is True
+
+
+def test_resolve_run_paths_flat_cued_subdir_and_explicit_layouts(tmp_path: Path):
+    # 1. Flat legacy layout
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    (flat / "trace.txt").write_text("stub", encoding="utf-8")
+    (flat / "gaze_diag.csv").write_text("stub", encoding="utf-8")
+    dsp, diag, sched = ANALYZER.resolve_run_paths(flat)
+    assert dsp == flat.resolve()
+    assert diag == (flat / "gaze_diag.csv").resolve()
+    assert sched is None
+
+    # 2. Cued subdir layout
+    cued = tmp_path / "cued"
+    (cued / "dsp_record").mkdir(parents=True)
+    (cued / "dsp_record" / "trace.txt").write_text("stub", encoding="utf-8")
+    (cued / "gaze_diag.csv").write_text("stub", encoding="utf-8")
+    (cued / "cued_schedule.json").write_text("{}", encoding="utf-8")
+    dsp2, diag2, sched2 = ANALYZER.resolve_run_paths(cued)
+    assert dsp2 == (cued / "dsp_record").resolve()
+    assert diag2 == (cued / "gaze_diag.csv").resolve()
+    assert sched2 == (cued / "cued_schedule.json").resolve()
+
+    # 3. Separate explicit dsp_record_dir referenced from cued_schedule.json
+    sep_run = tmp_path / "sep_run"
+    sep_rec = tmp_path / "sep_rec"
+    sep_run.mkdir()
+    sep_rec.mkdir()
+    (sep_rec / "trace.txt").write_text("stub", encoding="utf-8")
+    (sep_run / "gaze_diag.csv").write_text("stub", encoding="utf-8")
+    (sep_run / "cued_schedule.json").write_text(json.dumps({"dsp_record_dir": str(sep_rec)}), encoding="utf-8")
+    dsp3, diag3, sched3 = ANALYZER.resolve_run_paths(sep_run)
+    assert dsp3 == sep_rec.resolve()
+    assert diag3 == (sep_run / "gaze_diag.csv").resolve()
+    assert sched3 == (sep_run / "cued_schedule.json").resolve()
+

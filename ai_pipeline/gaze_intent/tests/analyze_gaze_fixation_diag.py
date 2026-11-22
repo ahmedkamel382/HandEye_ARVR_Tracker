@@ -27,6 +27,7 @@ Capabilities:
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import hashlib
 import importlib.util
@@ -35,6 +36,7 @@ import math
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -345,7 +347,7 @@ def build_cued_target_plan(
 
 def build_gaze_capture_command(
     exe: Path,
-    run_dir: Path,
+    dsp_record_dir: Path,
     diag_csv: Path,
     camera: int,
     seconds: int,
@@ -358,9 +360,92 @@ def build_gaze_capture_command(
         "--no-hand",
         "--gaze-filter", GAZE_FILTER_SPEC,
         "--seconds", str(seconds),
-        "--dsp-record-dir", str(run_dir),
+        "--dsp-record-dir", str(dsp_record_dir),
         "--gaze-diag-log", str(diag_csv),
     ]
+
+
+def _extract_trace_capture_times(trace_path: Path) -> List[float]:
+    times: List[float] = []
+    if not trace_path.is_file():
+        return times
+    for ln in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = ln.split()
+        if len(parts) >= 3 and parts[0] == "E4REC" and parts[1] == "F":
+            for token in parts[2:]:
+                if token.startswith("t="):
+                    times.append(float(token[2:]))
+                    break
+    return times
+
+
+def _resolve_capture_epoch_mono(
+    status_samples: Sequence[Tuple[int, float]],
+    trace_times: Sequence[float],
+    epoch_mono: Optional[float],
+    launch_mono: float,
+) -> Tuple[float, str]:
+    cands = [
+        rx_t - trace_times[os_frames - 1]
+        for os_frames, rx_t in status_samples
+        if 1 <= os_frames <= len(trace_times)
+    ]
+    tail = cands[1:] if len(cands) >= 3 else cands
+    if len(tail) >= 2 and (max(tail) - min(tail)) <= 0.25:
+        return float(np.median(tail)), "trace_status_sync"
+    fallback = epoch_mono if epoch_mono is not None else launch_mono
+    return fallback, "console_os_fallback"
+
+
+def resolve_run_paths(
+    run_dir: Path,
+    dsp_record_dir: Optional[Path] = None,
+    diag_csv: Optional[Path] = None,
+    cued_schedule: Optional[Path] = None,
+) -> Tuple[Path, Path, Optional[Path]]:
+    """Resolve (dsp_record_dir, diag_csv, cued_schedule_path) for flat or cued-subdir layouts."""
+    run_dir = run_dir.resolve()
+    sched_path = cued_schedule.resolve() if cued_schedule is not None else (
+        (run_dir / "cued_schedule.json") if (run_dir / "cued_schedule.json").is_file() else None
+    )
+    sched_data: Dict[str, Any] = {}
+    if sched_path is not None and sched_path.is_file():
+        try:
+            sched_data = json.loads(sched_path.read_text(encoding="utf-8"))
+        except Exception:
+            sched_data = {}
+
+    if dsp_record_dir is not None:
+        resolved_dsp = dsp_record_dir.resolve()
+    elif any((run_dir / marker).is_file() for marker in ("trace.txt", "COMPLETE", "INCOMPLETE")):
+        resolved_dsp = run_dir
+    elif any((run_dir / "dsp_record" / marker).is_file() for marker in ("trace.txt", "COMPLETE", "INCOMPLETE")):
+        resolved_dsp = run_dir / "dsp_record"
+    elif isinstance(sched_data.get("dsp_record_dir"), str):
+        cand = Path(sched_data["dsp_record_dir"])
+        if not cand.is_absolute():
+            cand = run_dir / cand
+        resolved_dsp = cand.resolve() if cand.exists() else (
+            (run_dir / "dsp_record") if (run_dir / "dsp_record").exists() else run_dir
+        )
+    else:
+        resolved_dsp = run_dir
+
+    if diag_csv is not None:
+        resolved_diag = diag_csv.resolve()
+    elif (run_dir / "gaze_diag.csv").is_file():
+        resolved_diag = run_dir / "gaze_diag.csv"
+    elif (resolved_dsp / "gaze_diag.csv").is_file():
+        resolved_diag = resolved_dsp / "gaze_diag.csv"
+    elif isinstance(sched_data.get("diag_csv"), str):
+        cand_diag = Path(sched_data["diag_csv"])
+        if not cand_diag.is_absolute():
+            cand_diag = run_dir / cand_diag
+        resolved_diag = cand_diag.resolve() if cand_diag.is_file() else (run_dir / "gaze_diag.csv")
+    else:
+        resolved_diag = run_dir / "gaze_diag.csv"
+
+    return resolved_dsp, resolved_diag, sched_path
 
 
 
@@ -886,11 +971,16 @@ def compute_direction_checks(windows_res: Sequence[Dict[str, Any]]) -> List[Dict
 
 def format_markdown_report(report: Dict[str, Any]) -> str:
     integ = report["integrity"]
+    artifact_dir = integ.get("artifact_dir") or integ["run_dir"]
+    dsp_dir = integ.get("dsp_record_dir") or integ["run_dir"]
+    run_line = f"- **Run directory:** `{artifact_dir}`"
+    if dsp_dir != artifact_dir:
+        run_line += f" | **DSP recorder dir:** `{dsp_dir}`"
     lines = [
         "# Gaze Fixation Stability, Attribution & A/B Shadow Replay Report",
         "",
         "## 1. Alignment & Integrity",
-        f"- **Run directory:** `{integ['run_dir']}`",
+        run_line,
         f"- **Diag CSV:** `{integ['diag_csv']}` (`{integ['diag_rows']}` rows, `{integ['diag_columns']}` columns)",
         f"- **Recorder markers:** `COMPLETE={integ['complete_marker_present']}`, `INCOMPLETE_absent={integ['incomplete_marker_absent']}`, `overflow={integ['overflow']}`, `config_changes={integ['config_changes']}`, `complete={integ['complete_flag']}`",
         f"- **DSP config (E4REC BEGIN):** `min_cutoff={integ['trace_header'].get('min_cutoff')}`, `beta={integ['trace_header'].get('beta')}`, `derivative_cutoff={integ['trace_header'].get('derivative_cutoff')}`",
@@ -1017,20 +1107,33 @@ def run_cued_capture(
     audio: bool,
     yes: bool,
     readiness_timeout_s: float = 30.0,
+    dsp_record_dir: Optional[Path] = None,
 ) -> Path:
+    run_dir = run_dir.resolve()
+    diag_csv = diag_csv.resolve()
+    dsp_dir = (dsp_record_dir or (run_dir / "dsp_record")).resolve()
+
     if not exe.is_file():
         raise FileNotFoundError(f"Missing core_engine executable: {exe}")
     if (run_dir / "trace.txt").exists() or (run_dir / "COMPLETE").exists():
         raise RuntimeError(f"Refusing to overwrite existing recording in {run_dir}")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    diag_csv.parent.mkdir(parents=True, exist_ok=True)
+    if dsp_dir.exists():
+        raise RuntimeError(
+            f"Recorder output directory already exists (use a fresh --run-dir or --dsp-record-dir): {dsp_dir}"
+        )
 
     plan = build_cued_target_plan(targets=targets, hold_s=hold_s, gap_s=gap_s, initial_settle_s=1.0)
     total_target_s = plan[-1]["offset_from_ready_end_s"] + 2.0
-    seconds = int(math.ceil(total_target_s + 20.0))  # 20s headroom for calibration + settle
-    cmd = build_gaze_capture_command(exe, run_dir, diag_csv, camera, seconds)
+    seconds = int(math.ceil(total_target_s + min(readiness_timeout_s, 15.0)))
+    if total_target_s > 65.0:
+        print(
+            f"[WARNING] Planned cued duration (~{total_target_s:.1f}s) may approach the 4096-frame "
+            "DSP recorder capacity at 60 FPS.",
+            flush=True,
+        )
+    cmd = build_gaze_capture_command(exe, dsp_dir, diag_csv, camera, seconds)
 
-    print("This command WILL open camera 0 in safe --os log --no-hand --filter dsp mode (NO mouse control).")
+    print(f"This command WILL open camera {camera} in safe --os log --no-hand --filter dsp mode (NO mouse control).")
     print("Command:", " ".join(cmd))
     if not yes:
         if not sys.stdin.isatty():
@@ -1038,25 +1141,40 @@ def run_cued_capture(
         if input("Type RECORD to start cued gaze capture: ").strip() != "RECORD":
             raise RuntimeError("Cued capture cancelled by user.")
 
+    # core_engine's OutputSession requires dsp_dir NOT to exist yet, while its parent must exist.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dsp_dir.parent.mkdir(parents=True, exist_ok=True)
+    diag_parent = diag_csv.parent
+    if diag_parent != dsp_dir and dsp_dir not in diag_parent.parents:
+        diag_parent.mkdir(parents=True, exist_ok=True)
+
     clock = time.monotonic
     launch_mono = clock()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    inbox: "queue.Queue[Tuple[str, float]]" = queue.Queue(maxsize=512)
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(REPO_ROOT),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+
+    inbox: "queue.Queue[Tuple[str, float]]" = queue.Queue()
+
     def _drain() -> None:
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            try:
-                inbox.put_nowait((raw_line.rstrip("\r\n"), clock()))
-            except queue.Full:
-                pass
+        if proc.stdout is None:
+            return
+        try:
+            for raw_line in proc.stdout:
+                inbox.put((raw_line.rstrip("\r\n"), clock()))
+        except Exception:
+            pass
+
     drain_thread = threading.Thread(target=_drain, daemon=True)
     drain_thread.start()
 
@@ -1064,8 +1182,33 @@ def run_cued_capture(
     epoch_mono: Optional[float] = None
     next_idx = 0
     active_idx: Optional[int] = None
-    scheduled_targets: List[Dict[str, Any]] = []
-    console_tail: List[str] = []
+    raw_targets: List[Dict[str, Any]] = []
+    status_samples: List[Tuple[int, float]] = []
+    console_tail: "collections.deque[str]" = collections.deque(maxlen=200)
+    all_targets_done_at: Optional[float] = None
+    stop_sent = False
+
+    def _handle_line(line: str, rx_time: float) -> None:
+        nonlocal epoch_mono
+        console_tail.append(line)
+        if epoch_mono is None and line.startswith("OS: "):
+            epoch_mono = rx_time
+        m = GAZE_STATUS_RE.fullmatch(line.strip())
+        if m:
+            status_samples.append((int(m.group(7)), rx_time))
+        if gate.feed(line, rx_time):
+            if epoch_mono is None:
+                epoch_mono = (gate.first_status_time - 1.0) if gate.first_status_time is not None else launch_mono
+            print(f"[Cued Capture] Calibration ready at capture_s~={gate.calib_ready_time - epoch_mono:.2f}s", flush=True)
+            _speak_cue_async("Calibration ready.", audio)
+
+    def _drain_inbox() -> None:
+        while True:
+            try:
+                line, rx_time = inbox.get_nowait()
+            except queue.Empty:
+                break
+            _handle_line(line, rx_time)
 
     print("[Cued Capture] Hold steady neutral gaze for initial calibration...", flush=True)
     _speak_cue_async("Hold still facing center for calibration.", audio)
@@ -1073,23 +1216,9 @@ def run_cued_capture(
     try:
         while proc.poll() is None:
             now = clock()
-            while True:
-                try:
-                    line, rx_time = inbox.get_nowait()
-                except queue.Empty:
-                    break
-                console_tail.append(line)
-                if len(console_tail) > 200:
-                    console_tail.pop(0)
-                if epoch_mono is None and line.startswith("OS: "):
-                    epoch_mono = rx_time
-                if gate.feed(line, rx_time):
-                    if epoch_mono is None:
-                        epoch_mono = (gate.first_status_time - 1.0) if gate.first_status_time is not None else launch_mono
-                    print(f"[Cued Capture] Calibration ready at capture_s~={gate.calib_ready_time - epoch_mono:.2f}s", flush=True)
-                    _speak_cue_async("Calibration ready.", audio)
+            _drain_inbox()
 
-            t_base = epoch_mono if epoch_mono is not None else launch_mono
+            t_base_live = epoch_mono if epoch_mono is not None else launch_mono
             if gate.calib_ready_time is None:
                 if now - launch_mono > readiness_timeout_s:
                     raise RuntimeError("Timed out waiting for live calibrated gaze readiness (state=0)")
@@ -1099,42 +1228,79 @@ def run_cued_capture(
                     item = plan[next_idx]
                     if rel_ready >= item["offset_from_ready_start_s"]:
                         active_idx = next_idx
-                        t_start_s = now - t_base
+                        t_start_s = now - t_base_live
                         msg = f"Look at {item['name']} and hold still."
                         print(f"[CUE START t={t_start_s:.2f}s] {msg}", flush=True)
                         _speak_cue_async(f"Look {item['name'].lower()}.", audio)
-                        scheduled_targets.append({
+                        raw_targets.append({
                             "name": item["name"],
-                            "target_start_s": round(t_start_s, 4),
-                            "target_end_s": None,
+                            "start_mono": now,
+                            "end_mono": None,
                         })
                 elif active_idx is not None:
                     item = plan[active_idx]
                     if rel_ready >= item["offset_from_ready_end_s"]:
-                        t_end_s = now - t_base
-                        scheduled_targets[active_idx]["target_end_s"] = round(t_end_s, 4)
+                        t_end_s = now - t_base_live
+                        raw_targets[active_idx]["end_mono"] = now
                         print(f"[CUE END   t={t_end_s:.2f}s] Done {item['name']}.", flush=True)
                         active_idx = None
                         next_idx += 1
                         if next_idx >= len(plan):
-                            print("[Cued Capture] All targets complete; waiting for clean engine shutdown...", flush=True)
+                            all_targets_done_at = now
+                            print("[Cued Capture] All targets complete; finishing capture cleanly...", flush=True)
                             _speak_cue_async("All targets complete.", audio)
+                elif all_targets_done_at is not None and not stop_sent and (now - all_targets_done_at) >= 1.5:
+                    stop_sent = True
+                    sig = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT) if os.name == "nt" else signal.SIGINT
+                    try:
+                        if hasattr(proc, "send_signal"):
+                            proc.send_signal(sig)
+                    except Exception:
+                        pass
             time.sleep(0.01)
     finally:
         if proc.poll() is None:
-            proc.terminate()
+            if stop_sent:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+            else:
+                proc.terminate()
+                proc.wait(timeout=5)
+        else:
             proc.wait(timeout=5)
-        drain_thread.join(timeout=2)
+        drain_thread.join(timeout=5)
+        _drain_inbox()
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
+    tail_list = list(console_tail)
     if proc.returncode != 0:
-        raise RuntimeError(f"core_engine exited with code {proc.returncode}; tail={console_tail[-5:]}")
-    if gate.calib_ready_time is None or len(scheduled_targets) != len(plan) or any(t["target_end_s"] is None for t in scheduled_targets):
-        raise RuntimeError("Cued capture ended before all targets completed.")
+        raise RuntimeError(f"core_engine exited with code {proc.returncode}; tail={tail_list[-15:]}")
+    if gate.calib_ready_time is None or len(raw_targets) != len(plan) or any(t["end_mono"] is None for t in raw_targets):
+        raise RuntimeError(f"Cued capture ended before all targets completed; tail={tail_list[-15:]}")
 
-    t_base = epoch_mono if epoch_mono is not None else launch_mono
+    trace_times = _extract_trace_capture_times(dsp_dir / "trace.txt")
+    t_base, sync_method = _resolve_capture_epoch_mono(status_samples, trace_times, epoch_mono, launch_mono)
+    scheduled_targets = [
+        {
+            "name": t["name"],
+            "target_start_s": round(float(t["start_mono"]) - t_base, 4),
+            "target_end_s": round(float(t["end_mono"]) - t_base, 4),
+        }
+        for t in raw_targets
+    ]
     schedule_payload = {
         "schema_version": 1,
         "command": cmd,
+        "dsp_record_dir": str(dsp_dir),
+        "diag_csv": str(diag_csv),
+        "time_sync_method": sync_method,
         "gaze_filter": GAZE_FILTER_SPEC,
         "wash_in_s": DEFAULT_CUED_WASH_IN_S,
         "blink_pad_frames": DEFAULT_BLINK_PAD_FRAMES,
@@ -1148,7 +1314,8 @@ def run_cued_capture(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--run-dir", type=Path, required=True, help="Recorder directory containing trace.txt and COMPLETE")
+    ap.add_argument("--run-dir", type=Path, required=True, help="Run directory (artifacts/reports, or legacy flat recorder dir containing trace.txt)")
+    ap.add_argument("--dsp-record-dir", type=Path, default=None, help="Recorder directory for trace.txt/COMPLETE (default for --cued-capture: <run-dir>/dsp_record; offline auto-detects <run-dir> or <run-dir>/dsp_record)")
     ap.add_argument("--diag-csv", type=Path, default=None, help="Path to gaze_diag.csv (default: <run-dir>/gaze_diag.csv)")
     ap.add_argument("--windows", type=str, default=None, help="Comma-separated NAME:START_S-END_S intervals, e.g. 'LEFT:5-15,RIGHT:17-27'")
     ap.add_argument("--auto-windows", action="store_true", help="Automatically segment active tracking windows")
@@ -1176,17 +1343,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error("--blink-pad-frames must be >= 0")
 
     run_dir = args.run_dir.resolve()
-    diag_csv = (args.diag_csv or (run_dir / "gaze_diag.csv")).resolve()
     out_json = (args.out_json or (run_dir / "gaze_attribution_report.json")).resolve()
     out_md = (args.out_md or (run_dir / "gaze_attribution_report.md")).resolve()
 
     cued_sched_path = args.cued_schedule.resolve() if args.cued_schedule else None
+    capture_dsp_dir: Optional[Path] = args.dsp_record_dir.resolve() if args.dsp_record_dir else None
+    capture_diag_csv = (args.diag_csv or (run_dir / "gaze_diag.csv")).resolve()
     if args.cued_capture:
+        if capture_dsp_dir is None:
+            capture_dsp_dir = run_dir / "dsp_record"
         targets = [t.strip() for t in args.targets.split(",") if t.strip()]
         cued_sched_path = run_cued_capture(
             exe=args.exe.resolve(),
             run_dir=run_dir,
-            diag_csv=diag_csv,
+            dsp_record_dir=capture_dsp_dir,
+            diag_csv=capture_diag_csv,
             camera=args.camera,
             targets=targets,
             hold_s=args.hold_s,
@@ -1195,11 +1366,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             yes=args.yes,
         )
 
-    default_sched = run_dir / "cued_schedule.json"
-    if cued_sched_path is None and args.windows is None and not args.auto_windows and default_sched.is_file():
-        cued_sched_path = default_sched
+    resolved_dsp_dir, resolved_diag_csv, auto_sched_path = resolve_run_paths(
+        run_dir,
+        dsp_record_dir=capture_dsp_dir if args.cued_capture else args.dsp_record_dir,
+        diag_csv=capture_diag_csv if args.cued_capture else args.diag_csv,
+        cued_schedule=cued_sched_path,
+    )
+    if cued_sched_path is None and args.windows is None and not args.auto_windows:
+        cued_sched_path = auto_sched_path
 
-    integrity, rows = load_and_align_run(run_dir, diag_csv)
+    integrity, rows = load_and_align_run(resolved_dsp_dir, resolved_diag_csv)
+    integrity["artifact_dir"] = str(run_dir)
+    integrity["dsp_record_dir"] = str(resolved_dsp_dir)
     dep_inv = _models_inventory(args.deployed_models_dir.resolve(), include_gesture=True)
     dep_yaw = tl2cgen.Predictor(str(args.deployed_models_dir.resolve() / "gaze_yaw.dll"))
     dep_pitch = tl2cgen.Predictor(str(args.deployed_models_dir.resolve() / "gaze_pitch.dll"))
@@ -1260,6 +1438,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "directions": directions,
     }
 
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_md.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
     md_text = format_markdown_report(report)
     out_md.write_text(md_text, encoding="utf-8")

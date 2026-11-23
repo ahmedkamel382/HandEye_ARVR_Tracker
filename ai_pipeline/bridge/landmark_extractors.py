@@ -85,13 +85,6 @@ def pack_hand(image_lms, world_lms):
     return packed, diag
 
 
-def _all_finite(*groups) -> bool:
-    try:
-        return all(math.isfinite(v) for g in groups for p in g for v in (p.x, p.y, p.z))
-    except Exception:
-        return False
-
-
 # One row per processed hand frame. ts_ms is the same integer the engine passes to
 # process_frame (TrackingResult::ts_ms / "observation_ms" in the E4DSP trace), so the
 # diagnostic joins the trial log exactly. "seq" is a per-extractor counter, not frame_id.
@@ -129,8 +122,11 @@ def _describe_hand(result, seq: int, ts_ms: int, mode: str) -> dict:
         reason = "MALFORMED"
     else:
         reason = "OK"
-    if reason == "OK" and not _all_finite(groups_img[0], groups_world[0]):
-        reason = "NONFINITE"
+    if reason == "OK":
+        with np.errstate(over="ignore", invalid="ignore"):
+            _, packed_info = pack_hand(groups_img[0], groups_world[0])
+        if not packed_info["valid"]:
+            reason = "NONFINITE"
 
     info = {
         "seq": seq,
@@ -143,7 +139,7 @@ def _describe_hand(result, seq: int, ts_ms: int, mode: str) -> dict:
         "min_x": "", "max_x": "", "min_y": "", "max_y": "",
         "edge_l": "", "edge_r": "", "edge_t": "", "edge_b": "",
     }
-    if img_n:
+    if img_n and reason != "NONFINITE":
         try:
             xs = [float(p.x) for p in groups_img[0]]
             ys = [float(p.y) for p in groups_img[0]]
@@ -229,6 +225,39 @@ def _pack_hand(result, diag=None, seq: int = 0, ts_ms: int = 0, mode: str = "") 
     return packed
 
 
+_FACE_N = 478           # expected face mesh + iris landmarks
+
+
+def pack_face(face_lms, pose_matrix):
+    """Validate and pack one face + 4x4 pose matrix. Returns (packed (484, 3) float32 or _EMPTY, diag dict).
+    Rejects (returns _EMPTY) unless there are exactly 478 landmarks, a 16-element pose matrix,
+    and every landmark/pose entry is finite."""
+    n_face = len(face_lms) if face_lms else 0
+    pose_arr = np.asarray(pose_matrix, dtype=np.float32) if pose_matrix is not None else np.empty(0, dtype=np.float32)
+    diag = {
+        "has_face": n_face > 0,
+        "has_pose": pose_arr.size > 0,
+        "n_face": n_face,
+        "pose_size": int(pose_arr.size),
+        "packed_n": 0,
+        "valid": False,
+        "reason": "",
+    }
+    if n_face != _FACE_N or pose_arr.shape != (4, 4):
+        diag["reason"] = "count"
+        return _EMPTY, diag
+    pts = _to_array(face_lms[:_FACE_N])
+    pose = np.zeros((_POSE_ROWS, 3), dtype=np.float32)
+    pose.reshape(-1)[:16] = pose_arr.reshape(-1)
+    packed = np.concatenate([pts, pose])
+    if not np.isfinite(packed).all():
+        diag["reason"] = "nonfinite"
+        return _EMPTY, diag
+    diag["packed_n"] = _FACE_N + _POSE_ROWS
+    diag["valid"] = True
+    return packed, diag
+
+
 class FaceLandmarkExtractor:
     """478 face-mesh points (468 mesh + 10 iris) + the head-pose matrix. Same MediaPipe settings as gaze_intent.py."""
 
@@ -249,10 +278,8 @@ class FaceLandmarkExtractor:
         result = self.detector.detect_for_video(mp_image, int(timestamp_ms))
         if not result.face_landmarks or not result.facial_transformation_matrixes:
             return _EMPTY
-        pts = _to_array(result.face_landmarks[0])
-        pose = np.zeros((_POSE_ROWS, 3), dtype=np.float32)
-        pose.reshape(-1)[:16] = np.asarray(result.facial_transformation_matrixes[0], dtype=np.float32).reshape(-1)
-        return np.concatenate([pts, pose])
+        packed, _ = pack_face(result.face_landmarks[0], result.facial_transformation_matrixes[0])
+        return packed
 
     def shutdown(self):
         if getattr(self, "detector", None) is not None:

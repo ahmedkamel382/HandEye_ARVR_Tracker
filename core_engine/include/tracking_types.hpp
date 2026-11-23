@@ -48,6 +48,13 @@ struct ModuleOut {
     // hand only (appended with defaults: existing aggregate initialisation keeps compiling; gaze leaves them as is):
     std::optional<TrackingState> tracking_state;   // unset = module without freshness info (gaze, disabled, Python error)
     int missed_frames = 0;                         // consecutive misses since the last real observation
+    // Hand-only, preview visualisation: normalised bbox from THIS frame's 21 image landmarks.
+    // Never used by tracking, DSP or diagnostics; valid only while a full packed hand was measured.
+    float bbox_l = 0.0f;
+    float bbox_t = 0.0f;
+    float bbox_r = 0.0f;
+    float bbox_b = 0.0f;
+    bool  bbox_valid = false;
     bool detected() const { return ok && x >= 0.0f && y >= 0.0f; }
 };
 

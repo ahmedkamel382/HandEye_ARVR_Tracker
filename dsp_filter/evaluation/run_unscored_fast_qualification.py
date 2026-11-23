@@ -173,16 +173,46 @@ def main(argv=None):
     ap.add_argument("--mode", choices=sorted(L.MOVEMENT_SECONDS), default="fast")
     ap.add_argument("--exe", required=True)
     ap.add_argument("--repo", default=str(Path(__file__).resolve().parents[2]))
+    ap.add_argument("--preview", action="store_true",
+                    help="add --preview so the operator can see the hand (UNSCORED only; drawing only)")
     ap.add_argument("--prepare-only", action="store_true")
+    ap.add_argument("--run", action="store_true",
+                    help="run the capture from an already prepared session")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     repo = Path(a.repo).resolve()
-    session, manifest = prepare_session(a, repo)
+    if a.preview:
+        # Patching the command here keeps the scored launcher untouched. --preview changes
+        # only preview drawing, not tracking, DSP, recorder or timing.
+        pass
+    if a.run:
+        # Reuse an existing prepared session; never re-render or overwrite audio.
+        session = Path(a.out_dir) / a.run_id
+        if not (session / "manifest.json").is_file():
+            raise RuntimeError("no prepared manifest in %s; run --prepare-only first" % session)
+        if (session / "recording").exists():
+            raise RuntimeError("recording already exists; use a new --run-id")
+        with open(session / "manifest.json", "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        print("Reusing prepared UNSCORED session:", session)
+    else:
+        session, manifest = prepare_session(a, repo)
     print("UNSCORED run directory:", session)
     print("Command:", " ".join(manifest["command"]))
     if a.prepare_only or a.dry_run:
         print("Prepared only (or dry run). No camera or speaker was activated.")
         return 0
+    if a.preview and not manifest.get("preview_enabled"):
+        cmd = list(manifest["command"])
+        if "--preview" not in cmd:
+            cmd.append("--preview")
+        manifest["command"] = cmd
+        manifest["preview_enabled"] = True
+        manifest["command_note"] = ("UNSCORED only: --preview added for operator visibility; "
+                                    "preview drawing does not change tracking/DSP/recorder.")
+        with open(session / "manifest.json", "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+        print("--preview added (UNSCORED): operator can see the hand")
     manifest["_repo"] = str(repo)
     run_capture(session, manifest)
     print("Capture finished. Run check_unscored_fast_readiness.py next.")

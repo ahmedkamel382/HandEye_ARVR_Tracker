@@ -103,8 +103,10 @@ def evaluate_leg(rows, move_t, duration, expect_increase, label):
     stop_t = move_t + duration
     move_win = window(rows, move_t - 0.5, stop_t + 0.5)
     pts = fresh(move_win)
-    baseline = fresh(window(rows, move_t - 1.5, move_t - 0.1))
-    endpoint = fresh(window(rows, stop_t + 0.1, stop_t + 1.5))
+    # The cue schedule holds each mark for several seconds. A fixation gate needs
+    # >=25 eligible samples, which at 12.4 FPS requires ~2 s; use a 2.9 s window.
+    baseline = fresh(window(rows, move_t - 3.0, move_t - 0.1))
+    endpoint = fresh(window(rows, stop_t + 0.1, stop_t + 3.0))
     out = {"leg": label, "move_t": move_t, "eligible_in_move_window": len(pts)}
 
     if len(pts) < GATES["crossing_samples_min"]:
@@ -156,6 +158,35 @@ def evaluate_leg(rows, move_t, duration, expect_increase, label):
     return out
 
 
+def detect_moves(rows, duration, min_travel=0.10):
+    """Locate the two FAST legs from the raw trace itself (direction-agnostic).
+
+    Finds the two strongest monotonic x transitions whose 10-90% crossing takes
+    roughly the configured movement duration. Returns (t1, t2, increasing_first).
+    """
+    pts = fresh(rows)
+    best = []
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            dt = pts[j]["t"] - pts[i]["t"]
+            if 0.10 <= dt <= duration + 0.5:
+                travel = pts[j]["x"] - pts[i]["x"]
+                if abs(travel) >= min_travel:
+                    best.append((abs(travel), pts[i]["t"], pts[j]["t"], travel > 0))
+    # Keep the two non-overlapping strongest transitions.
+    best.sort(reverse=True)
+    chosen = []
+    for item in best:
+        if all(abs(item[1] - c[1]) > duration + 1.0 for c in chosen):
+            chosen.append(item)
+        if len(chosen) == 2:
+            break
+    if len(chosen) != 2:
+        raise ValueError("could not locate two FAST legs in trace")
+    chosen.sort(key=lambda c: c[1])
+    return chosen[0][1], chosen[1][1], chosen[0][3]
+
+
 def move_times_from_cues(cues_path):
     with open(cues_path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -170,12 +201,12 @@ def move_times_from_cues(cues_path):
     return times[0], times[1]
 
 
-def evaluate(trace, move1, move2, mode):
+def evaluate(trace, move1, move2, mode, out_increasing=True):
     rows = parse_trace(trace)
     duration = DURATION[mode]
     legs = [
-        evaluate_leg(rows, move1, duration, True, "LEFT_TO_RIGHT"),
-        evaluate_leg(rows, move2, duration, False, "RIGHT_TO_LEFT"),
+        evaluate_leg(rows, move1, duration, out_increasing, "OUTWARD_LEG"),
+        evaluate_leg(rows, move2, duration, not out_increasing, "RETURN_LEG"),
     ]
     verdict = "PASS" if all(l["verdict"] == "PASS" for l in legs) else (
         "INCONCLUSIVE" if all(l["verdict"] != "FAIL" for l in legs) else "FAIL")
@@ -193,26 +224,26 @@ def self_test():
         rows.append("E4REC F frame=%d input_t=%.6f n=%d ok=%d ix=%.6f iy=%.6f trk=%d" %
                     (len(rows), t, n, ok, x, y, trk))
         t += 1.0 / 30.0
-    for _ in range(45): add(0.20, 0.50)
+    for _ in range(90): add(0.20, 0.50)   # 3.0 s baseline hold
     for i in range(15): add(0.20 + 0.50 * i / 14.0, 0.50)
-    for _ in range(60): add(0.70, 0.50)
+    for _ in range(120): add(0.70, 0.50)  # 4.0 s hold at far mark
     for i in range(15): add(0.70 - 0.50 * i / 14.0, 0.50)
-    for _ in range(60): add(0.20, 0.50)
+    for _ in range(120): add(0.20, 0.50)  # 4.0 s return hold
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "trace.txt")
         with open(p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(rows) + "\n")
-        rep = evaluate(p, 1.5, 4.0, "fast")
+        rep = evaluate(p, 3.0, 7.5, "fast")
         assert rep["verdict"] == "PASS", json.dumps(rep, indent=2)[:1500]
         print("SELF-TEST clean capture: PASS (expected PASS)")
         # Inject a >100 ms fresh-data gap (4 frames at 30 Hz) in the outward leg.
         gapped = [r for r in rows]
-        idx = next(i for i, r in enumerate(gapped) if "frame=48 " in r)
+        idx = next(i for i, r in enumerate(gapped) if "frame=95 " in r)
         for j in range(idx, idx + 4):
             gapped[j] = gapped[j].replace("ok=1", "ok=0")
         with open(p, "w", encoding="utf-8") as fh:
             fh.write("\n".join(gapped) + "\n")
-        rep2 = evaluate(p, 1.5, 4.0, "fast")
+        rep2 = evaluate(p, 3.0, 7.5, "fast")
         assert rep2["verdict"] != "PASS", json.dumps(rep2, indent=2)[:1500]
         print("SELF-TEST gapped capture:", rep2["verdict"], "(expected non-PASS)")
     print("SELF-TEST OK")
@@ -225,6 +256,8 @@ def main(argv=None):
     ap.add_argument("--mode", choices=sorted(DURATION), default="fast")
     ap.add_argument("--move1-t", type=float)
     ap.add_argument("--move2-t", type=float)
+    ap.add_argument("--auto-moves", action="store_true",
+                    help="detect the two FAST legs from the trace (direction-agnostic)")
     ap.add_argument("--out")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
@@ -233,13 +266,18 @@ def main(argv=None):
         return 0
     if not a.trace:
         ap.error("--trace is required unless --self-test is used")
-    if a.cues:
+    if a.auto_moves:
+        m1, m2, inc = detect_moves(parse_trace(a.trace), DURATION[a.mode])
+        print("Auto-detected moves: t=%.3f, t=%.3f, outward x increasing=%s" % (m1, m2, inc))
+    elif a.cues:
         m1, m2 = move_times_from_cues(a.cues)
+        inc = True
     elif a.move1_t is not None and a.move2_t is not None:
         m1, m2 = a.move1_t, a.move2_t
+        inc = True
     else:
-        ap.error("provide --cues or both --move1-t and --move2-t")
-    rep = evaluate(a.trace, m1, m2, a.mode)
+        ap.error("provide --auto-moves, --cues, or both --move1-t and --move2-t")
+    rep = evaluate(a.trace, m1, m2, a.mode, inc)
     text = json.dumps(rep, indent=2)
     print(text)
     if a.out:

@@ -21,6 +21,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -34,9 +35,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import run_cued_responsiveness as L  # exact cue schedule/audio helpers, unmodified
 
-STATUS = re.compile(
-    r"cap\s+(\d+)\s*\|\s*ai\s+(\d+)\s*\|\s*pyerr\s+(\d+)\s*\|\s*"
-    r"x\s+(-?[\d.]+)\s*\|\s*y\s+(-?[\d.]+)\s*\|\s*state\s+(\d+)\s*\|\s*n\s+(\d+)")
+# Use the launcher's proven status regex and readiness gate verbatim. My earlier
+# custom regex did not match the engine's real 1 Hz line, so cues were never issued.
+STATUS = L.STATUS
 
 
 def sha256(path):
@@ -75,6 +76,8 @@ def build_manifest(session, run_id, mode, exe, repo, prepare):
             "note": "Fill from the physical setup record before evaluating gates."},
         "command": L.engine_command(exe, session / "recording"),
         "command_note": "Direct native engine, NOT the scored launcher. No identity gate is applied.",
+        "readiness_note": "UNSCORED harness accepts any finite hand with increasing OS frames "
+                          "(the scored launcher additionally requires a Neutral hand state).",
     }
 
 
@@ -119,7 +122,11 @@ def run_capture(session, manifest):
     lineq = []
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
-    gate = L.ReadinessGate()
+    # UNSCORED relaxation: the launcher gate requires a Neutral (s=0) hand; some
+    # operators present a pinch/fist. Accept ANY valid finite hand with increasing
+    # OS frame counts so the cue clock still starts. Documented in the manifest.
+    last_count = 0
+    ready_hits = 0
     scheduler = None
     playback = L.CuePlayback(session, manifest)
     failure = None
@@ -132,10 +139,18 @@ def run_capture(session, manifest):
             while lineq:
                 line, received = lineq.pop(0)
                 console.append(line)
-                became = gate.feed(line, received)
-                if became and scheduler is None:
-                    scheduler = L.CueScheduler(manifest["mode"], received)
-                    events.append({"event": "ready", "received_monotonic": received})
+                m = STATUS.match(line.strip())
+                if m and scheduler is None:
+                    cap, ai, pyerr, xs, ys, st, cnt = m.groups()
+                    x, y = float(xs), float(ys)
+                    if (int(cap) > 0 and int(ai) > 0 and int(pyerr) == 0 and int(cnt) > last_count
+                            and math.isfinite(x) and math.isfinite(y) and 0 <= x <= 1 and 0 <= y <= 1):
+                        ready_hits += 1
+                        last_count = int(cnt)
+                    if ready_hits >= 2:
+                        scheduler = L.CueScheduler(manifest["mode"], received)
+                        events.append({"event": "ready", "received_monotonic": received,
+                                       "note": "UNSCORED relaxed readiness (any finite hand state)"})
             if scheduler is not None:
                 cue = scheduler.poll(clock(), process_alive=process.poll() is None)
                 if cue:

@@ -99,14 +99,22 @@ def fixation(points):
             "slope": sl, "dwell_ms": dwell_ms}
 
 
-def evaluate_leg(rows, move_t, duration, expect_increase, label):
+def evaluate_leg(rows, move_t, duration, expect_increase, label,
+                 hold_before=None, hold_after=None):
     stop_t = move_t + duration
     move_win = window(rows, move_t - 0.5, stop_t + 0.5)
     pts = fresh(move_win)
-    # The cue schedule holds each mark for several seconds. A fixation gate needs
-    # >=25 eligible samples, which at 12.4 FPS requires ~2 s; use a 2.9 s window.
-    baseline = fresh(window(rows, move_t - 3.0, move_t - 0.1))
-    endpoint = fresh(window(rows, stop_t + 0.1, stop_t + 3.0))
+    # Fixation gates apply to the SETTLED holds at each mark, not to the movement
+    # transition. Use the hold windows supplied by evaluate() (derived from both
+    # detected move times) so a stable mark is not mis-scored as unstable. >=25
+    # samples at 12.4 FPS needs ~2 s; require >=500 ms dwell within the window.
+    b0, b1 = (move_t - 3.6, move_t - 0.6)          # settled hold: end 0.6 s before move onset
+    e0, e1 = hold_after if hold_after else (stop_t + 0.1, stop_t + 3.0)
+    if hold_before:                                 # for the return leg, reuse the far-mark hold
+        b0, b1 = hold_before
+    e1 = min(e1, e0 + 3.0)                          # cap the settled hold to ~3 s
+    baseline = fresh(window(rows, b0, b1))
+    endpoint = fresh(window(rows, e0, e1))
     out = {"leg": label, "move_t": move_t, "eligible_in_move_window": len(pts)}
 
     if len(pts) < GATES["crossing_samples_min"]:
@@ -215,9 +223,17 @@ def move_times_from_cues(cues_path, ready_trace_t=None):
 def evaluate(trace, move1, move2, mode, out_increasing=True):
     rows = parse_trace(trace)
     duration = DURATION[mode]
+    fresh_rows = fresh(rows)
+    t_start = fresh_rows[0]["t"] if fresh_rows else 0.0
+    t_end = fresh_rows[-1]["t"] if fresh_rows else 0.0
+    settle = 0.8                      # ignore the seconds right after a movement
+    far_hold = (move1 + duration + settle, move2 - settle)
+    near_hold = (move2 + duration + settle, t_end - 0.2)
     legs = [
-        evaluate_leg(rows, move1, duration, out_increasing, "OUTWARD_LEG"),
-        evaluate_leg(rows, move2, duration, not out_increasing, "RETURN_LEG"),
+        evaluate_leg(rows, move1, duration, out_increasing, "OUTWARD_LEG",
+                     hold_after=far_hold),
+        evaluate_leg(rows, move2, duration, not out_increasing, "RETURN_LEG",
+                     hold_before=far_hold, hold_after=near_hold),
     ]
     verdict = "PASS" if all(l["verdict"] == "PASS" for l in legs) else (
         "INCONCLUSIVE" if all(l["verdict"] != "FAIL" for l in legs) else "FAIL")

@@ -1101,3 +1101,12 @@ def test_uncalibrated_default_gaze_region_keeps_candidate_neutral_inside_screen(
     finally:
         c.close()
 
+
+def test_old_placeholder_gaze_region_counts_as_uncalibrated(lib):
+    old = IniDoc(lib.default_settings_ini())
+    old.lines = [line for line in old.lines if not line.startswith("settings_version")]
+    old.set("mapping", "gaze_region", "0.3 0.3 0.7 0.7")
+    assert gaze_is_uncalibrated(old.text(), lib.default_settings_ini())
+    current = IniDoc(lib.default_settings_ini())
+    current.set("mapping", "gaze_region", "0.3 0.3 0.7 0.7")      # chosen on purpose in a current file
+    assert not gaze_is_uncalibrated(current.text(), lib.default_settings_ini())

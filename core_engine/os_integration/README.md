@@ -35,7 +35,7 @@ filters when the tray's Smoothing menu changes (`TrayOptions::on_settings_change
 | `app/` | `handeye_tray.exe`: system-tray app, settings, and calibration wizard. |
 | `capi/` | `os_integration_capi.dll`: a plain-C interface to `OsController` (used by the tester). |
 | `tester/` | **HandEye Tester**: `HandEyeTester.exe` + a test-bench UI for every part of the system. |
-| `tests/` | 100 library and tray tests, 9 C-interface tests and a latency benchmark (no GoogleTest needed). |
+| `tests/` | 108 library and tray tests, 9 C-interface tests and a latency benchmark (no GoogleTest needed). |
 
 ### Library files
 
@@ -235,9 +235,9 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Check | Result |
 | --- | --- |
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
-| `os_integration_tests` | 100 / 100 passed |
+| `os_integration_tests` | 108 / 108 passed |
 | `os_integration_capi_tests` | 9 / 9 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 114 / 114 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 117 / 117 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |
@@ -341,6 +341,12 @@ Other tools can drive the controller without C++ through `capi/osi_capi.h`
   region instead of clamping to the top edge. Run the tray's
   Calibrate > Gaze range wizard for per-user fit; live cued fixation and
   wizard verification remain pending before merge to `first-full-working-demo`.
+* **Settings written before the Y-sign fix** (no `settings_version`, version 1)
+  are converted on load: the old placeholder `gaze_region = 0.3 0.3 0.7 0.7`
+  becomes the current default, and any other gaze region gets y -> 1 - y, which
+  keeps every calibrated pitch on the same pixel. New files are written as
+  `settings_version = 2`. An older build reading a version 2 file would map
+  gaze upside down, so do not mix builds from before and after this change.
 * **Gaze accuracy:** the estimate from `gaze_intent.py` is coarse, so gaze
   pointing is best for large targets. Hand pointing is the precise mode.
 * **Elevated windows:** Windows blocks injected input into apps running as

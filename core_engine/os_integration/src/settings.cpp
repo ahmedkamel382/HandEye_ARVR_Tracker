@@ -287,6 +287,26 @@ const std::vector<Field>& fields() {
                                      }, 0.0, 1000.0, true));
         }
 
+        f.push_back({"app", "settings_version",
+                     [](Settings& s, std::string_view text) -> std::string {
+                         text = trim(text);
+                         int value = 0;
+                         const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+                         if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+                             return "expected a whole number";
+                         }
+                         s.app.settings_version = value;
+                         return {};
+                     },
+                     [](const Settings& s) { return std::to_string(s.app.settings_version); },
+                     [](const Settings& s) -> std::string {
+                         if (s.app.settings_version < 1 || s.app.settings_version > kSettingsVersion) {
+                             return "settings_version " + std::to_string(s.app.settings_version) +
+                                    " is not supported by this version (newest: " +
+                                    std::to_string(kSettingsVersion) + ")";
+                         }
+                         return {};
+                     }});
         f.push_back(bool_field("app", "start_active",
                                [](Settings& s) -> bool& { return s.app.start_active; }));
         f.push_back(seconds_field("app", "physical_mouse_yield_seconds",
@@ -303,6 +323,13 @@ const std::vector<Field>& fields() {
 
 // Keys written by earlier versions that no longer mean anything. They are
 // skipped silently so old settings files load without warnings.
+// The placeholder gaze_region every version 1 tray wrote into new settings files.
+constexpr InputRegion kVersion1GazeDefault{0.30, 0.30, 0.70, 0.70};
+
+bool same_region(const InputRegion& a, const InputRegion& b) noexcept {
+    return a.x_min == b.x_min && a.y_min == b.y_min && a.x_max == b.x_max && a.y_max == b.y_max;
+}
+
 bool retired_key(std::string_view section, std::string_view key) {
     return section == "app" && key == "udp_port"; // development UDP bridge, removed
 }
@@ -358,6 +385,8 @@ SettingsLoadResult parse_settings(std::string_view text) {
     }
     std::string section;
     std::size_t line_number = 0;
+    bool saw_version = false;
+    bool saw_gaze_region = false;
     while (!text.empty()) {
         ++line_number;
         const auto newline = text.find('\n');
@@ -394,6 +423,7 @@ SettingsLoadResult parse_settings(std::string_view text) {
                                       std::string(key));
             continue;
         }
+        saw_version = saw_version || (section == "app" && key == "settings_version");
         Settings candidate = result.settings;
         std::string problem = field->parse(candidate, value);
         if (problem.empty()) {
@@ -405,6 +435,24 @@ SettingsLoadResult parse_settings(std::string_view text) {
             continue;
         }
         result.settings = candidate;
+        saw_gaze_region = saw_gaze_region || (section == "mapping" && key == "gaze_region");
+    }
+    if (!saw_version) {
+        result.settings.app.settings_version = 1; // written before settings_version existed
+    }
+    if (result.settings.app.settings_version < 2) {
+        InputRegion& gaze = result.settings.mapping.gaze_region;
+        if (!saw_gaze_region) {
+            // nothing saved: the current default already applies
+        } else if (same_region(gaze, kVersion1GazeDefault)) {
+            gaze = Settings{}.mapping.gaze_region;
+            result.migrated = "gaze_region was the old placeholder; the current default is used";
+        } else {
+            gaze.y_min = 1.0 - gaze.y_min; // same pixels for the same pitch under the corrected Y sign
+            gaze.y_max = 1.0 - gaze.y_max;
+            result.migrated = "gaze_region was converted to the corrected vertical direction";
+        }
+        result.settings.app.settings_version = kSettingsVersion;
     }
     return result;
 }

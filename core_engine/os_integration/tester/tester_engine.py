@@ -876,9 +876,14 @@ def _changes_control(old: TesterConfig, new: TesterConfig) -> bool:
     return replace(old, **drawing) != new
 
 
+VERSION1_GAZE_DEFAULT = (0.3, 0.3, 0.7, 0.7)      # the placeholder version 1 trays saved; settings.cpp replaces it
+
+
 def gaze_is_uncalibrated(settings: str, defaults: str) -> bool:
+    doc = IniDoc(settings)
     fallback = _region(IniDoc(defaults).get("mapping", "gaze_region"), None)
-    return _region(IniDoc(settings).get("mapping", "gaze_region"), fallback) == fallback
+    region = _region(doc.get("mapping", "gaze_region"), fallback)
+    return region == fallback or (doc.get("app", "settings_version") is None and region == VERSION1_GAZE_DEFAULT)
 
 
 class _WorkerState:

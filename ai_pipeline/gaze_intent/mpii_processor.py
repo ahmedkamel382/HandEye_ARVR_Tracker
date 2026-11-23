@@ -1,12 +1,10 @@
 import os
 import cv2
 import numpy as np
-import pandas as pd
 import math
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from tqdm import tqdm
 
 from gaze_intent import extract_gaze_features
 
@@ -43,6 +41,9 @@ def vector_to_pitch_yaw(gaze_vector):
 
 
 def process_mpiigaze():
+    import pandas as pd
+    from tqdm import tqdm
+
     if not os.path.exists(DATASET_PATH):
         print(f"Error: Could not find dataset at {DATASET_PATH}")
         return

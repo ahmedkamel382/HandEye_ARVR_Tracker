@@ -376,9 +376,14 @@ class TestFeatureExtractionAndGeometry:
         assert math.isclose(r_ear, 1.0, abs_tol=1e-9)
 
     def test_mpii_processor_shared_feature_extraction_and_vector_to_pitch_yaw(self):
+        import importlib.util
+
         stub_detector = StubFaceDetector()
-        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector):
-            import mpii_processor as mp_proc
+        spec = importlib.util.spec_from_file_location("mpii_processor", GAZE_DIR / "mpii_processor.py")
+        mp_proc = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"pandas": None, "tqdm": None}), \
+             patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector):
+            spec.loader.exec_module(mp_proc)
 
         # Verify mpii_processor reuses the exact same extract_gaze_features function from gaze_intent
         assert mp_proc.extract_gaze_features is gi.extract_gaze_features

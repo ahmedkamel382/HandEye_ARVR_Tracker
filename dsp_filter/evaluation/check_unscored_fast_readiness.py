@@ -187,7 +187,14 @@ def detect_moves(rows, duration, min_travel=0.10):
     return chosen[0][1], chosen[1][1], chosen[0][3]
 
 
-def move_times_from_cues(cues_path):
+def move_times_from_cues(cues_path, ready_trace_t=None):
+    """Return trace-time for the two MOVE cues.
+
+    Cue `at_seconds` are relative to the cue clock start (engine readiness), NOT to
+    the E4DSP trace clock. Without `ready_trace_t` (the trace time when the cue clock
+    started) the returned values are cue-relative and must not be used to index the
+    trace. Callers must either supply the anchor or use --auto-moves.
+    """
     with open(cues_path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
     cues = data.get("cues", data) if isinstance(data, dict) else data
@@ -198,7 +205,11 @@ def move_times_from_cues(cues_path):
             times.append(float(c["at_seconds"]))
     if len(times) != 2:
         raise ValueError("expected exactly two MOVE cues, found %d" % len(times))
-    return times[0], times[1]
+    if ready_trace_t is None:
+        raise ValueError(
+            "cue at_seconds are cue-clock relative; supply --ready-trace-t (trace time "
+            "when the cue clock started) or use --auto-moves instead")
+    return ready_trace_t + times[0], ready_trace_t + times[1]
 
 
 def evaluate(trace, move1, move2, mode, out_increasing=True):
@@ -217,6 +228,21 @@ def evaluate(trace, move1, move2, mode, out_increasing=True):
 
 def self_test():
     import tempfile
+    # Cue anchor: at_seconds must be offset by the ready trace time; unanchored use is rejected.
+    with tempfile.TemporaryDirectory() as td:
+        cues = os.path.join(td, "cues.json")
+        with open(cues, "w", encoding="utf-8") as fh:
+            json.dump({"cues": [{"at_seconds": 0, "message": "Hold left."},
+                                {"at_seconds": 11.0, "message": "MOVE! Go right."},
+                                {"at_seconds": 25.5, "message": "MOVE! Go left."}]}, fh)
+        assert move_times_from_cues(cues, 4.5) == (15.5, 30.0)
+        try:
+            move_times_from_cues(cues)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unanchored cue times must be rejected")
+    print("SELF-TEST cue anchor: OK")
     # Clean synthetic capture: 30 Hz, baseline 1 s, fast outward/return, endpoints held.
     rows, t = [], 0.0
     def add(x, y, trk=0, ok=1, n=42):
@@ -253,6 +279,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--trace")
     ap.add_argument("--cues")
+    ap.add_argument("--ready-trace-t", type=float,
+                    help="trace time when the cue clock started (anchors --cues at_seconds)")
     ap.add_argument("--mode", choices=sorted(DURATION), default="fast")
     ap.add_argument("--move1-t", type=float)
     ap.add_argument("--move2-t", type=float)
@@ -270,7 +298,7 @@ def main(argv=None):
         m1, m2, inc = detect_moves(parse_trace(a.trace), DURATION[a.mode])
         print("Auto-detected moves: t=%.3f, t=%.3f, outward x increasing=%s" % (m1, m2, inc))
     elif a.cues:
-        m1, m2 = move_times_from_cues(a.cues)
+        m1, m2 = move_times_from_cues(a.cues, a.ready_trace_t)
         inc = True
     elif a.move1_t is not None and a.move2_t is not None:
         m1, m2 = a.move1_t, a.move2_t

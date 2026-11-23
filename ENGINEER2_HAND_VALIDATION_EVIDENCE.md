@@ -73,9 +73,51 @@ Ready for independent review on the development branch. **Not proposed for merge
 
 ## Item 7 — Diagnostic suite "31/33"
 
-**Status: 🟡 LOCATED, NOT MODIFIED.**
+**Status: ✅ FIXED AND VERIFIED on this branch; 🟡 demo-side test file still needs a 2-line update.**
 
-The referenced suite is `ai_pipeline/bridge/tests/check_hand_landmark_diag.py`: **33 checks** on `origin/first-full-working-demo` and on `origin/review/engineer1-bridge`, versus **36 checks** on this branch (the E2-B additions). All 36 checks pass here. The two outdated assertions expecting malformed data to pass through live in the demo/E1 version of that file. Fixing them there is an Engineer 1 overlap; this branch's version already asserts rejection and does not need weakening.
+### Reproduction
+
+The demo's test file was run against the demo's production `landmark_extractors.py` in an isolated temp directory: **31 PASS / 2 FAIL**, exit 1 — reproducing the reported result exactly. The failures were:
+
+```
+FAIL malformed result is returned unchanged (41 rows)  [(0, 3)]
+FAIL label: malformed  [MALFORMED]
+```
+
+Both are outdated assertions that expect malformed payloads to pass through as 41 rows, which contradicts the approved production rejection (`pack_hand()` returns `_EMPTY`).
+
+### Production fix on this branch
+
+`ai_pipeline/bridge/landmark_extractors.py::_describe_hand()` now:
+
+- reports `n = 42` only when the payload is actually published, and `n = 0` for every rejected reason (`BOTH_EMPTY`, `IMAGE_ONLY`, `WORLD_ONLY`, `MALFORMED`, `NONFINITE`);
+- classifies `NONFINITE` using the **float32 representation actually stored by the native bridge**, so a float64-finite value (e.g. `1e100`) that overflows to Inf in float32 is no longer reported as `OK / n=42`;
+- suppresses bbox/edge fields for `NONFINITE`, removing the misleading diagnostic values.
+
+Production rejection behavior was not weakened: `_pack_hand()` still raises on malformed counts and the native validator still rejects non-finite input.
+
+### Regression tests
+
+`ai_pipeline/bridge/tests/check_hand_landmark_diag.py` now has 41 checks (42 PASS lines) covering: malformed counts → `n=0`, valid → `n=42`, non-finite image/world coordinates → `NONFINITE / n=0`, float32-overflow → `NONFINITE / n=0`, and no misleading bbox for non-finite input.
+
+### Verification
+
+| Command | Result |
+|---|---|
+| `python -B ai_pipeline/bridge/tests/check_hand_landmark_diag.py` | ALL CHECKS PASSED, exit 0 |
+| `python -m pytest ai_pipeline/hand_kinematics/tests -q` | 24 passed |
+
+### Exact remaining demo-side patch (test file only, not applied here)
+
+```
+- check("malformed result is returned unchanged (41 rows)", malformed.shape == (41, 3), str(malformed.shape))
++ check("malformed result is rejected (0 rows)", malformed.shape == (0, 3), str(malformed.shape))
+
+- check("label: malformed", d["reason"] == "MALFORMED" and d["n"] == 41, d["reason"])
++ check("label: malformed", d["reason"] == "MALFORMED" and d["n"] == 0, d["reason"])
+```
+
+These are assertion corrections only; they align the demo's test file with its own production contract and do not weaken validation. They were not applied to `first-full-working-demo` because changes to that shared integration branch require the team's review process.
 
 ---
 
@@ -117,7 +159,7 @@ Trial 4 remains INCONCLUSIVE and unchanged. The completed E2-C five-run unscored
 | Item | Status |
 |---|---|
 | 6 — Tester/native validation mismatch | 🟡 Implemented and automated-tested; live comparison outstanding |
-| 7 — Diagnostic suite 31/33 | 🟡 Located; demo-side assertions not modified |
+| 7 — Diagnostic suite 31/33 | ✅ Fixed on this branch (41 checks pass, float32 overflow classified); 🟡 demo's 2-line test patch supplied, not applied to shared branch |
 | 8 — Branch review | ✅ Read-only review complete |
 | 3/H1 — Physical FAST qualification | 🔴 Still open |
 | H2 — Executable approval | 🔴 Still open |

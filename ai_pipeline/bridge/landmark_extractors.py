@@ -103,18 +103,36 @@ def _describe_hand(result, seq: int, ts_ms: int, mode: str) -> dict:
     else:
         reason = "OK"
 
+    # The native bridge stores landmarks as float32. A value that is finite in
+    # float64 can overflow to Inf when cast, so checking only the Python floats
+    # would report "OK / n=42" for a payload the engine actually rejects. Check
+    # the exact representation used downstream and report the rejection.
+    if reason == "OK":
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                coords = np.asarray(
+                    [[float(p.x), float(p.y), float(p.z)] for p in groups_img[0]] +
+                    [[float(p.x), float(p.y), float(p.z)] for p in groups_world[0]],
+                    dtype=np.float64,
+                )
+                finite32 = bool(np.isfinite(coords.astype(np.float32)).all())
+        except Exception:
+            finite32 = False
+        if not finite32:
+            reason = "NONFINITE"
+
     info = {
         "seq": seq,
         "ts_ms": ts_ms,
         "mode": mode,
         "img_n": img_n,
         "world_n": world_n,
-        "n": 0 if reason in ("BOTH_EMPTY", "IMAGE_ONLY", "WORLD_ONLY") else img_n + world_n,
+        "n": 42 if reason == "OK" else 0,   # rows actually published to the native engine
         "reason": reason,
         "min_x": "", "max_x": "", "min_y": "", "max_y": "",
         "edge_l": "", "edge_r": "", "edge_t": "", "edge_b": "",
     }
-    if img_n:
+    if img_n and reason != "NONFINITE":
         try:
             xs = [float(p.x) for p in groups_img[0]]
             ys = [float(p.y) for p in groups_img[0]]

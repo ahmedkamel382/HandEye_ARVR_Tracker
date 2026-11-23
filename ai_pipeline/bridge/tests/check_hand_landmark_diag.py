@@ -95,7 +95,17 @@ check("label: world only", d["reason"] == "WORLD_ONLY" and d["world_n"] == 21 an
 d = describe(hand(21), hand(21))
 check("label: normal", d["reason"] == "OK" and d["n"] == 42 and d["img_n"] == 21 and d["world_n"] == 21, d["reason"])
 d = describe(hand(20), hand(21))
-check("label: malformed", d["reason"] == "MALFORMED" and d["n"] == 41, d["reason"])
+check("label: malformed", d["reason"] == "MALFORMED" and d["n"] == 0, str(d))
+d = describe(hand(21), hand(21))
+check("label: OK publishes 42 rows", d["reason"] == "OK" and d["n"] == 42, str(d))
+d = describe([P(float("nan"), 0.3)] + hand(20), hand(21))
+check("label: nonfinite image coordinate", d["reason"] == "NONFINITE" and d["n"] == 0, str(d))
+d = describe(hand(21), [P(0.2, float("inf"), 0.0)] + hand(20))
+check("label: nonfinite world coordinate", d["reason"] == "NONFINITE" and d["n"] == 0, str(d))
+d = describe([P(1e100, 0.3, 0.0)] + hand(20), hand(21))
+check("label: float64-finite value overflowing float32 is NONFINITE",
+      d["reason"] == "NONFINITE" and d["n"] == 0, str(d))
+check("nonfinite diagnostic has no misleading bbox", d["min_x"] == "" and d["edge_r"] == "", str(d))
 
 # ---------------------------------------------------------------- bounding box
 img = [P(0.1, 0.2), P(0.5, 0.6), P(0.3, 0.4)] + [P(0.3, 0.4) for _ in range(18)]

@@ -148,7 +148,7 @@ VALUE_CONTROLS = {
     "g_cut": ("gaze_filter", "min_cutoff_hz", 0.8, 3),
     "g_beta": ("gaze_filter", "beta", 6.0, 2),
 }
-DEFAULT_REGIONS = {"hand_region": (0.15, 0.15, 0.85, 0.85), "gaze_region": (0.25, 0.6, 0.75, 0.8)}
+DEFAULT_REGIONS = {"hand_region": (0.15, 0.15, 0.85, 0.85), "gaze_region": (0.25, 0.58, 0.75, 0.82)}
 # slider: (region key, axis 0 = x / 1 = y, slider units per unit of region span)
 REGION_CONTROLS = {
     "zone_x": ("hand_region", 0, 1.0),

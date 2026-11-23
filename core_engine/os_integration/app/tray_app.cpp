@@ -919,6 +919,7 @@ void TrayApp::on_wizard_done() {
                 break;
             case WizardKind::GazeRange:
                 s.mapping.gaze_region = outcome.settings.mapping.gaze_region;
+                s.mapping.gaze_calibrated = true;
                 break;
             case WizardKind::EyeTiming:
                 s.gestures.wink_onset_seconds = outcome.settings.gestures.wink_onset_seconds;

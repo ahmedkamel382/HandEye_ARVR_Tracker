@@ -237,8 +237,8 @@ class TestTreeliteModelDlls:
             assert float(pitch_pred.predict(dmat).item()) == pitch_val_1
             assert float(yaw_pred.predict(dmat).item()) == yaw_val_1
 
-        # Golden regression values for integrated Candidate gaze models (cd6c0db)
-        assert math.isclose(pitch_val_1, -13.1737435620, rel_tol=1e-5, abs_tol=1e-5)
+        # Golden regression values for integrated Candidate HGB abs_pitch + ET rel_yaw models
+        assert math.isclose(pitch_val_1, -16.2770163919, rel_tol=1e-5, abs_tol=1e-5)
         assert math.isclose(yaw_val_1, 0.8371970249, rel_tol=1e-5, abs_tol=1e-5)
 
         # Batch of realistic feature vectors stays finite and within plausible angular bounds
@@ -683,6 +683,35 @@ class TestMockedGazeIntentPipeline:
         assert tracker.is_calibrated
         assert state == 0 and lms is not None and is_valid_output(ay, ap)
         assert math.isfinite(hy) and math.isfinite(hp)
+
+    def test_process_frame_nonzero_head_pitch_uses_abs_pitch_without_double_addition(self, mocked_gaze_tracker):
+        tracker, stub = mocked_gaze_tracker
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        ts = 0
+        for _ in range(CALIBRATION_FRAMES):
+            ts += 33
+            tracker.process_frame(blank, ts)
+
+        class _ConstModel:
+            def __init__(self, value: float):
+                self.value = value
+
+            def predict(self, _):
+                return np.array([[self.value]], dtype=np.float32)
+
+        tracker.pitch_model = _ConstModel(-16.25)
+        tracker.yaw_model = _ConstModel(2.5)
+        stub.next_landmarks = make_synthetic_landmarks(iris_left=(0.5, 0.0), iris_right=(0.5, 0.0))
+        stub.next_pose = make_pose_matrix(pitch_deg=15.0, yaw_deg=-5.0, roll_deg=0.0)
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is not None
+        assert math.isclose(hp, 15.0, abs_tol=1e-4)
+        assert math.isclose(hy, -5.0, abs_tol=1e-4)
+        # pitch_model outputs abs_pitch directly (-16.25), NOT rel_pitch -> ap must NOT be -1.25
+        assert math.isclose(ap, -16.25, abs_tol=1e-4)
+        # yaw_model outputs rel_yaw (+2.5) -> abs_yaw = rel_yaw + head_yaw = -2.5
+        assert math.isclose(ay, -2.5, abs_tol=1e-4)
 
 
 # ===========================================================================

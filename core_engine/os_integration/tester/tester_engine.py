@@ -638,16 +638,44 @@ class TesterEngine:
             if not cap.isOpened():
                 cap = cv2.VideoCapture(config.camera_index)
             # The same requests, in the same order, as core_engine's openSource().
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+            cap.set(cv2.CAP_PROP_FOURCC, mjpg)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
             cap.set(cv2.CAP_PROP_FPS, 60)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cap, "get"):
+                try:
+                    raw_fc = cap.get(cv2.CAP_PROP_FOURCC)
+                    fc_int = int(round(raw_fc)) if math.isfinite(raw_fc) and raw_fc > 0 else 0
+                    if fc_int != mjpg:
+                        cap.set(cv2.CAP_PROP_FOURCC, mjpg)
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
+                        cap.set(cv2.CAP_PROP_FPS, 60)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open camera {config.camera_index}. Close other apps using it "
                                    f"(Zoom, Teams, the engine) or pick another camera.")
             state.cap = cap
-            self.event(f"Camera {config.camera_index} opened")
+            cam_info = ""
+            if hasattr(cap, "get"):
+                try:
+                    fc_raw = cap.get(cv2.CAP_PROP_FOURCC)
+                    fc_int = int(round(fc_raw)) if math.isfinite(fc_raw) and fc_raw > 0 else 0
+                    fc_bytes = fc_int.to_bytes(4, "little", signed=False) if fc_int else b""
+                    fc_str = fc_bytes.decode("ascii") if len(fc_bytes) == 4 and all(32 <= b <= 126 for b in fc_bytes) else (
+                        f"0x{fc_int:08X}" if fc_int else "NONE")
+                    neg_w = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+                    neg_h = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                    neg_fps = cap.get(cv2.CAP_PROP_FPS)
+                    auto_exp = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                    cam_info = f" ({neg_w}x{neg_h} FOURCC={fc_str} reported={neg_fps:.1f} FPS auto_exp={auto_exp:.3g})"
+                except Exception:
+                    cam_info = ""
+            self.event(f"Camera {config.camera_index} opened{cam_info}")
         # Trackers (reloaded only when their options change)
         hand_key = (mode.hand, config.lowlight, config.roi_recovery, round(config.index_alpha, 3)) if mode.hand else None
         if hand_key != state.hand_key:
@@ -695,6 +723,8 @@ class TesterEngine:
             self.event("Output: REAL MOUSE (paused - press Activate)" if config.real_mouse
                        else "Output: simulation (the real mouse is never touched)")
         state.rebuild_smoothers(self.lib, config, settings)
+        if state.controller and hasattr(state.controller, "set_clicks_enabled"):
+            state.controller.set_clicks_enabled(config.clicks)
         self._publish(smoothing_available=state.smoothing_available)
         if old is None or old.mode != config.mode:
             self.event(f"Mode: {mode.title}")
@@ -764,19 +794,19 @@ class TesterEngine:
         hand = state.hand.process(bgr) if state.hand else HandObs()     # trackers mirror internally
         gaze = state.gaze.process(cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)) if state.gaze else GazeObs()
 
-        # Inputs for Engineer 5's OsController
+        # Inputs for Engineer 5's OsController: always pass raw states so wink/blink cursor lock and
+        # closure-pause stay active even when config.clicks is False (OsController suppresses clicks cleanly).
         hand_in = None
         if mode.hand:
             point, tracking = state.hand_smoother.apply(hand.point, hand.tracking, t)
-            hand_state = hand.state if (config.clicks and mode.hand == "gesture") else 0
+            hand_state = hand.state if mode.hand == "gesture" else 0
             hand_in = osi_capi.TrackerInput(point, hand_state, tracking)
         gaze_in = None
         if mode.gaze:
             gaze_tracking = osi_capi.TRACKED if gaze.point is not None else osi_capi.LOST
             point, tracking = (state.gaze_smoother.apply(gaze.point, gaze_tracking, t) if mode.gaze == "pointer"
                                else (None, osi_capi.LOST))
-            eye_state = gaze.state if (config.clicks or gaze.state == -1) else 0
-            gaze_in = osi_capi.TrackerInput(point, eye_state, tracking)
+            gaze_in = osi_capi.TrackerInput(point, gaze.state, tracking)
 
         controller = state.controller
         yielding = False
@@ -885,13 +915,26 @@ def _changes_control(old: TesterConfig, new: TesterConfig) -> bool:
     return replace(old, **drawing) != new
 
 
-LEGACY_PLACEHOLDER_GAZE_REGIONS = ((0.3, 0.3, 0.7, 0.7), (0.25, 0.25, 0.75, 0.75))
+LEGACY_PLACEHOLDER_GAZE_REGIONS = (
+    (0.3, 0.3, 0.7, 0.7),
+    (0.25, 0.25, 0.75, 0.75),
+    (0.25, 0.60, 0.75, 0.80),
+)
 
 
 def gaze_is_uncalibrated(settings: str, defaults: str) -> bool:
+    doc = IniDoc(settings)
     fallback = _region(IniDoc(defaults).get("mapping", "gaze_region"), None)
-    region = _region(IniDoc(settings).get("mapping", "gaze_region"), fallback)
-    return region == fallback or region in LEGACY_PLACEHOLDER_GAZE_REGIONS
+    region = _region(doc.get("mapping", "gaze_region"), fallback)
+    cal = (doc.get("mapping", "gaze_calibrated") or "").strip().lower()
+    if region in LEGACY_PLACEHOLDER_GAZE_REGIONS:
+        return True
+    if cal in ("true", "1", "yes", "on"):
+        return False
+    if region == fallback:
+        return True
+    # Custom non-placeholder region (e.g. legacy INI or manual edit): treat as calibrated.
+    return False
 
 
 class _WorkerState:

@@ -681,10 +681,13 @@ def test_uncalibrated_gaze_is_detected(lib):
     doc = IniDoc(defaults)
     doc.set("mapping", "gaze_region", "0.71 0.33 0.29 0.08")
     assert not gaze_is_uncalibrated(doc.text(), defaults)
-    for legacy in ("0.3 0.3 0.7 0.7", "0.25 0.25 0.75 0.75"):
+    for legacy in ("0.3 0.3 0.7 0.7", "0.25 0.25 0.75 0.75", "0.25 0.60 0.75 0.80"):
         legacy_doc = IniDoc(defaults)
         legacy_doc.set("mapping", "gaze_region", legacy)
         assert gaze_is_uncalibrated(legacy_doc.text(), defaults)
+    explicit_cal = IniDoc(defaults)
+    explicit_cal.set("mapping", "gaze_calibrated", "true")
+    assert not gaze_is_uncalibrated(explicit_cal.text(), defaults)
 
 
 # ---------------------------------------------------------------- #7 Run checks
@@ -1096,14 +1099,61 @@ def test_uncalibrated_default_gaze_region_keeps_candidate_neutral_inside_screen(
     c = lib.controller(defaults.text(), all_monitors=False, real_mouse=False)
     try:
         target, _ = c.geometry()
-        # Candidate golden neutral: yaw=+0.837 deg -> 0.514, pitch=-13.174 deg -> 0.720
-        r = c.update(0.0, None, osi_capi.TrackerInput((0.514, 0.720), 0))
+        # Candidate HGB abs_pitch + ET rel_yaw golden neutral: abs_yaw=+0.837 deg -> 0.514, abs_pitch=-16.277 deg -> 0.771
+        r = c.update(0.0, None, osi_capi.TrackerInput((0.514, 0.771), 0))
         assert r.cursor is not None
         cx, cy = r.cursor
         assert target[0] + 50 < cx < target[0] + target[2] - 50
         assert target[1] + 50 < cy < target[1] + target[3] - 50
     finally:
         c.close()
+
+
+def test_clicks_disabled_keeps_gaze_blink_lock_and_blocks_clicks(lib, worker, monkeypatch):
+    # Direct C API check
+    doc = IniDoc(lib.default_settings_ini())
+    doc.set("mapping", "cursor_source", "gaze_only")
+    c = lib.controller(doc.text(), all_monitors=False, real_mouse=False)
+    try:
+        c.set_active(True)
+        c.set_clicks_enabled(False)
+        t = 0.0
+        for _ in range(6):
+            r = c.update(t, None, osi_capi.TrackerInput((0.50, 0.77), 0))
+            t += 1.0 / 32.0
+        base_cursor = r.cursor
+        for _ in range(12):
+            rw = c.update(t, None, osi_capi.TrackerInput((0.95, 0.05), 1))
+            assert rw.cursor == base_cursor
+            assert not any(
+                e.kind in (osi_capi.EVENT_CLICK, osi_capi.EVENT_DOWN) for e in c.drain_events()
+            )
+            t += 1.0 / 32.0
+    finally:
+        c.close()
+
+    # Worker _step check: clicks=False must still forward gaze.state (not overwrite with 0)
+    class _WinkGaze(FakeGaze):
+        def process(self, rgb):
+            return tester_engine.GazeObs(point=(0.95, 0.05), state=1, ms=1.0, face=True)
+
+    engine, state, _, cv2 = worker("gaze")
+    state.gaze = _WinkGaze()
+    seen_states = []
+    orig_update = state.controller.update
+
+    def _spy_update(t_val, hand_in, gaze_in):
+        if gaze_in is not None:
+            seen_states.append(gaze_in.state)
+        return orig_update(t_val, hand_in, gaze_in)
+
+    monkeypatch.setattr(state.controller, "update", _spy_update)
+    cfg = replace(state.config, clicks=False)
+    engine._apply_config(state, cfg, engine.settings_text(), cv2)
+    engine._step(state, cfg, cv2)
+    assert seen_states == [1]
+    assert state.controller.count(osi_capi.EVENT_CLICK) == 0
+
 
 
 # ---- [Engineer 5] P1 #4: Non-finite validation & recovery across Tester & osi_capi ----

@@ -483,12 +483,11 @@ class GazeIntent:
             )
             gaze_batch = tl2cgen.DMatrix(gaze_features)
 
-            # Get Relative Eye-in-Socket predictions
-            rel_pitch = float(self.pitch_model.predict(gaze_batch).item())
+            # gaze_pitch.dll predicts direct absolute world pitch (y_abs_pitch = true_pitch);
+            # gaze_yaw.dll predicts relative eye-in-socket yaw (y_rel_yaw = true_yaw - head_yaw).
+            abs_pitch = float(self.pitch_model.predict(gaze_batch).item())
             rel_yaw = float(self.yaw_model.predict(gaze_batch).item())
-
-            # RECOMBINE: Calculate Absolute World Gaze
-            abs_pitch = rel_pitch + head_pitch
+            rel_pitch = abs_pitch - head_pitch
             abs_yaw = rel_yaw + head_yaw
 
             if not all(math.isfinite(v) for v in (rel_pitch, rel_yaw, abs_pitch, abs_yaw)):

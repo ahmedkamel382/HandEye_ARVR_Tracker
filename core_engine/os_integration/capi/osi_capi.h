@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OSI_CAPI_VERSION 2 /* 2: osi_filter_update, osi_filter_reset */
+#define OSI_CAPI_VERSION 3 /* 3: osi_set_clicks_enabled; 2: osi_filter_update, osi_filter_reset */
 #define OSI_MAX_ACTIONS 8
 #define OSI_MAX_EVENTS 256
 
@@ -116,6 +116,7 @@ OSI_API int32_t osi_apply_settings_ini(void* handle, const char* settings_ini, c
 
 OSI_API void osi_set_active(void* handle, int32_t active);
 OSI_API void osi_set_inhibited(void* handle, int32_t inhibited);
+OSI_API void osi_set_clicks_enabled(void* handle, int32_t enabled);
 OSI_API int32_t osi_release_all(void* handle); /* 1 when no button is left down */
 
 /* One frame. Fills `report` (may be NULL). Returns `report->processed`. */

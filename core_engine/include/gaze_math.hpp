@@ -2,8 +2,8 @@
 //   478 face landmarks + the 4x4 facial transformation matrix
 //      -> EAR, 30-frame blink calibration, rolling features -> wink model (gesture_model.dll) -> state
 //      -> iris ratios (projected on the eye-corner line) + head pose (Euler angles from the matrix)
-//      -> pitch / yaw models (gaze_pitch.dll, gaze_yaw.dll) = eye-in-socket angles
-//      -> + head angles = absolute world gaze (raw, bypassing C++ EMA to let DSP handle filtering)
+//      -> pitch / yaw models (gaze_pitch.dll = direct absolute world pitch, gaze_yaw.dll = eye-in-socket yaw)
+//      -> abs_yaw = rel_yaw + head_yaw, rel_pitch = abs_pitch - head_pitch (raw, bypassing C++ EMA for DSP)
 // Like the Python: during calibration (state -1) and with no face (state 0) all four angles are NaN (the Python's
 // INVALID_ANGLE) and the pointer is x = y = -1, so no invalid value can reach the DSP stage.
 // All arithmetic is double, like Python's float64; the features are rounded to float32 before the models (what the
@@ -210,11 +210,11 @@ namespace core {
             }
 
             const float gf[kPoseFeatures] = { float(sx), float(sy), float(head_pitch), float(head_yaw), float(head_roll) };
-            const double rel_pitch = pitch_ ? pitch_->predict(gf) : 0.0;
+            // gaze_pitch.dll predicts direct absolute world pitch; gaze_yaw.dll predicts eye-in-socket rel_yaw.
+            const double abs_pitch = pitch_ ? pitch_->predict(gf) : head_pitch;
             const double rel_yaw = yaw_ ? yaw_->predict(gf) : 0.0;
 
-            // absolute world gaze = eye-in-socket + head (raw absolute values, bypassing EMA to leave filtering to DSP)
-            const double abs_pitch = rel_pitch + head_pitch;
+            const double rel_pitch = abs_pitch - head_pitch;
             const double abs_yaw = rel_yaw + head_yaw;
             if (!std::isfinite(rel_pitch) || !std::isfinite(rel_yaw) ||
                 !std::isfinite(abs_pitch) || !std::isfinite(abs_yaw)) {

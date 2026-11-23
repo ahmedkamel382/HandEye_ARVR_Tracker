@@ -122,17 +122,40 @@ def _norm_coord_y(abs_pitch_deg: np.ndarray, y_sign: float = FIXED_Y_SIGN) -> np
     return _clamp01(0.5 + y_sign * (abs_pitch_deg / SPAN_DEG))
 
 
+def _detect_pitch_mode(pitch_pred: tl2cgen.Predictor) -> str:
+    """Detect whether gaze_pitch.dll predicts rel_pitch (legacy) or direct abs_pitch (HGB).
+
+    For rel_pitch models trained on `true_pitch - head_pitch`, increasing head_pitch from
+    -20 deg to +20 deg while holding iris features fixed drives the prediction strongly downward
+    (delta < -20 deg). Direct abs_pitch models output nearly constant world pitch (< 20 deg delta).
+    """
+    probe = np.array(
+        [[0.5, 0.0, -20.0, 0.0, 0.0], [0.5, 0.0, 20.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    preds = np.asarray(pitch_pred.predict(tl2cgen.DMatrix(probe)), dtype=np.float64).reshape(-1)
+    return "rel_pitch" if (float(preds[1] - preds[0]) < -20.0) else "abs_pitch"
+
+
 def _predict_angles(
     yaw_pred: tl2cgen.Predictor,
     pitch_pred: tl2cgen.Predictor,
     features_5d: np.ndarray,
+    pitch_mode: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if len(features_5d) == 0:
         return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+    if pitch_mode is None:
+        pitch_mode = _detect_pitch_mode(pitch_pred)
     f32 = np.ascontiguousarray(features_5d, dtype=np.float32)
     dm = tl2cgen.DMatrix(f32)
     rel_yaw = np.asarray(yaw_pred.predict(dm), dtype=np.float64).reshape(-1)
-    rel_pitch = np.asarray(pitch_pred.predict(dm), dtype=np.float64).reshape(-1)
+    raw_pitch = np.asarray(pitch_pred.predict(dm), dtype=np.float64).reshape(-1)
+    if pitch_mode == "abs_pitch":
+        head_pitch = f32[:, 2].astype(np.float64)
+        rel_pitch = raw_pitch - head_pitch
+    else:
+        rel_pitch = raw_pitch
     return rel_yaw, rel_pitch
 
 
@@ -840,6 +863,7 @@ def analyze_window(
     wash_in_s: float = 0.0,
     blink_pad_frames: int = DEFAULT_BLINK_PAD_FRAMES,
     padded_bad_indices: Optional[Set[int]] = None,
+    strict_protocol_wash_in: bool = False,
 ) -> Dict[str, Any]:
     if padded_bad_indices is None:
         padded_bad_indices = compute_blink_pad_indices(all_rows, blink_pad_frames)
@@ -848,12 +872,10 @@ def analyze_window(
     if eff_start_s >= end_s:
         raise ValueError(f"Window {name} has empty effective span after wash_in_s={wash_in_s}: [{eff_start_s}, {end_s})")
 
-    in_raw_win = [r for r in all_rows if start_s <= r["capture_s"] < end_s]
-    in_win_indexed = [(i, r) for i, r in enumerate(all_rows) if eff_start_s <= r["capture_s"] < end_s]
-    wash_in_excluded = len(in_raw_win) - len(in_win_indexed)
+    in_raw_win = [(i, r) for i, r in enumerate(all_rows) if start_s <= r["capture_s"] < end_s]
 
     exclusions = {
-        "wash_in": wash_in_excluded,
+        "wash_in": 0,
         "calibration": 0,
         "lost_or_unusable": 0,
         "nonneutral": 0,
@@ -861,28 +883,60 @@ def analyze_window(
         "unpublished": 0,
     }
     eligible: List[Dict[str, Any]] = []
-    for idx, r in in_win_indexed:
+
+    def _exclusion_reason(idx: int, r: Dict[str, Any]) -> Optional[str]:
         if r["state"] == -1:
-            exclusions["calibration"] += 1
-        elif r["detected"] != 1 or r["landmarks"] != 484:
-            exclusions["lost_or_unusable"] += 1
-        elif r["state"] != 0:
-            exclusions["nonneutral"] += 1
-        elif idx in padded_bad_indices:
-            exclusions["blink_pad"] += 1
-        elif r["published"] != 1 or r["raw_x"] is None or r["raw_y"] is None:
-            exclusions["unpublished"] += 1
-        else:
-            eligible.append(r)
+            return "calibration"
+        if r["detected"] != 1 or r["landmarks"] != 484:
+            return "lost_or_unusable"
+        if r["state"] != 0:
+            return "nonneutral"
+        if idx in padded_bad_indices:
+            return "blink_pad"
+        if r["published"] != 1 or r["raw_x"] is None or r["raw_y"] is None:
+            return "unpublished"
+        return None
+
+    if strict_protocol_wash_in:
+        total_frames_in_window = len(in_raw_win)
+        clean_since_s: Optional[float] = None
+        prev_cap_s: Optional[float] = None
+        for idx, r in in_raw_win:
+            cap_s = float(r["capture_s"])
+            reason = _exclusion_reason(idx, r)
+            if reason is not None:
+                exclusions[reason] += 1
+                clean_since_s = None
+            else:
+                if clean_since_s is None or (
+                    prev_cap_s is not None and (cap_s - prev_cap_s) * 1000.0 > MAX_FRESH_GAP_MS
+                ):
+                    clean_since_s = cap_s
+                if wash_in_s > 0.0 and (cap_s - clean_since_s) + 1e-9 < wash_in_s:
+                    exclusions["wash_in"] += 1
+                else:
+                    eligible.append(r)
+            prev_cap_s = cap_s
+    else:
+        in_win_indexed = [(i, r) for i, r in in_raw_win if r["capture_s"] >= eff_start_s]
+        exclusions["wash_in"] = len(in_raw_win) - len(in_win_indexed)
+        total_frames_in_window = len(in_win_indexed)
+        for idx, r in in_win_indexed:
+            reason = _exclusion_reason(idx, r)
+            if reason is not None:
+                exclusions[reason] += 1
+            else:
+                eligible.append(r)
 
     if not eligible:
         return {
             "window": name,
             "raw_interval_s": [start_s, end_s],
-            "interval_s": [eff_start_s, end_s],
+            "interval_s": [start_s if strict_protocol_wash_in else eff_start_s, end_s],
             "wash_in_s": wash_in_s,
+            "strict_protocol_wash_in": strict_protocol_wash_in,
             "blink_pad_frames": blink_pad_frames,
-            "total_frames_in_window": len(in_win_indexed),
+            "total_frames_in_window": total_frames_in_window,
             "eligible_frames": 0,
             "exclusions": exclusions,
             "raw_x": _compute_axis_metrics(np.empty(0), np.empty(0)),
@@ -906,14 +960,17 @@ def analyze_window(
     )
     med = np.median(X.astype(np.float64), axis=0).astype(np.float32)
 
+    dep_pitch_mode = _detect_pitch_mode(dep_pitch)
+
     # Replay deployed DLLs to confirm exact 5-D reconstruction against recorded trace
-    rep_ry, rep_rp = _predict_angles(dep_yaw, dep_pitch, X)
+    rep_ry, rep_rp = _predict_angles(dep_yaw, dep_pitch, X, pitch_mode=dep_pitch_mode)
     logged_ry = np.array([r["rel_yaw_deg"] for r in eligible], dtype=np.float64)
     logged_rp = np.array([r["rel_pitch_deg"] for r in eligible], dtype=np.float64)
     hy = X[:, 3].astype(np.float64)
     hp = X[:, 2].astype(np.float64)
     rep_ax = _norm_coord_x(rep_ry + hy)
     rep_ay = _norm_coord_y(rep_rp + hp, logged_y_sign_mult)
+    dep_base_raw_pitch = (rep_rp + hp) if dep_pitch_mode == "abs_pitch" else rep_rp
 
     # Counterfactuals use canonical fixed Y sign (0.5 - pitch / 60.0)
     # Counterfactual 1: Iris-only (vary sx, sy; hold head_pitch, head_yaw, head_roll at window median)
@@ -921,7 +978,7 @@ def analyze_window(
     X_iris[:, 2] = med[2]
     X_iris[:, 3] = med[3]
     X_iris[:, 4] = med[4]
-    ry_iris, rp_iris = _predict_angles(dep_yaw, dep_pitch, X_iris)
+    ry_iris, rp_iris = _predict_angles(dep_yaw, dep_pitch, X_iris, pitch_mode=dep_pitch_mode)
     nx_iris = _norm_coord_x(ry_iris + float(med[3]))
     ny_iris = _norm_coord_y(rp_iris + float(med[2]), FIXED_Y_SIGN)
 
@@ -929,12 +986,12 @@ def analyze_window(
     X_head = X.copy()
     X_head[:, 0] = med[0]
     X_head[:, 1] = med[1]
-    ry_head_in, rp_head_in = _predict_angles(dep_yaw, dep_pitch, X_head)
+    ry_head_in, rp_head_in = _predict_angles(dep_yaw, dep_pitch, X_head, pitch_mode=dep_pitch_mode)
     nx_head_tot = _norm_coord_x(ry_head_in + hy)
     ny_head_tot = _norm_coord_y(rp_head_in + hp, FIXED_Y_SIGN)
 
     # Direct additive head angle only (hold rel_* at median prediction)
-    rel_med_ry, rel_med_rp = _predict_angles(dep_yaw, dep_pitch, med.reshape(1, 5))
+    rel_med_ry, rel_med_rp = _predict_angles(dep_yaw, dep_pitch, med.reshape(1, 5), pitch_mode=dep_pitch_mode)
     nx_head_add = _norm_coord_x(float(rel_med_ry[0]) + hy)
     ny_head_add = _norm_coord_y(float(rel_med_rp[0]) + hp, FIXED_Y_SIGN)
 
@@ -973,10 +1030,11 @@ def analyze_window(
     res: Dict[str, Any] = {
         "window": name,
         "raw_interval_s": [start_s, end_s],
-        "interval_s": [eff_start_s, end_s],
+        "interval_s": [start_s if strict_protocol_wash_in else eff_start_s, end_s],
         "wash_in_s": wash_in_s,
+        "strict_protocol_wash_in": strict_protocol_wash_in,
         "blink_pad_frames": blink_pad_frames,
-        "total_frames_in_window": len(in_win_indexed),
+        "total_frames_in_window": total_frames_in_window,
         "eligible_frames": len(eligible),
         "max_eligible_gap_ms": float(np.max(np.diff(times) * 1000.0)) if len(times) >= 2 else 0.0,
         "exclusions": exclusions,
@@ -987,6 +1045,7 @@ def analyze_window(
         "filtered_y": _compute_axis_metrics(filt_y, times),
         "feature_summary": feature_summary,
         "deployed_replay_verification": {
+            "deployed_pitch_mode": dep_pitch_mode,
             "logged_y_sign_mult": logged_y_sign_mult,
             "max_abs_err_rel_yaw_deg": float(np.max(np.abs(rep_ry - logged_ry))),
             "max_abs_err_rel_pitch_deg": float(np.max(np.abs(rep_rp - logged_rp))),
@@ -1000,19 +1059,22 @@ def analyze_window(
             "head_regressor_input_only": _cf_summary(nx_head_tree, ny_head_tree),
         },
         "local_cliff_sensitivity_pm005": _local_sensitivity_stats(
-            dep_yaw, dep_pitch, X, rep_ry, rep_rp, delta=0.005
+            dep_yaw, dep_pitch, X, rep_ry, dep_base_raw_pitch, delta=0.005
         ),
         "top_5_jumps_x": _top_jumps(eligible, "x", top_k=5),
         "top_5_jumps_y": _top_jumps(eligible, "y", top_k=5, y_sign_mult=FIXED_Y_SIGN),
     }
 
     if cand_yaw is not None and cand_pitch is not None:
-        c_ry, c_rp = _predict_angles(cand_yaw, cand_pitch, X)
+        cand_pitch_mode = _detect_pitch_mode(cand_pitch)
+        c_ry, c_rp = _predict_angles(cand_yaw, cand_pitch, X, pitch_mode=cand_pitch_mode)
+        c_base_raw_pitch = (c_rp + hp) if cand_pitch_mode == "abs_pitch" else c_rp
         c_ayaw = c_ry + hy
         c_apitch = c_rp + hp
         c_nx = _norm_coord_x(c_ayaw)
         c_ny = _norm_coord_y(c_apitch, FIXED_Y_SIGN)
         res["candidate_shadow_replay"] = {
+            "pitch_mode": cand_pitch_mode,
             "raw_x": _compute_axis_metrics(c_nx, times),
             "raw_y": _compute_axis_metrics(c_ny, times),
             "rel_yaw_mean_deg": float(np.mean(c_ry)),
@@ -1020,7 +1082,7 @@ def analyze_window(
             "abs_yaw_mean_deg": float(np.mean(c_ayaw)),
             "abs_pitch_mean_deg": float(np.mean(c_apitch)),
             "local_cliff_sensitivity_pm005": _local_sensitivity_stats(
-                cand_yaw, cand_pitch, X, c_ry, c_rp, delta=0.005
+                cand_yaw, cand_pitch, X, c_ry, c_base_raw_pitch, delta=0.005
             ),
         }
     return res
@@ -1120,9 +1182,10 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
 
     lines += ["", "## 2. Raw Fixation Stability & Attribution by Window"]
     for w in report["windows"]:
+        wash_mode = "strict-protocol" if w.get("strict_protocol_wash_in") else "window-start"
         lines.append(
             f"### Window `{w['window']}` ([{w['interval_s'][0]:.3f}s, {w['interval_s'][1]:.3f}s), "
-            f"wash_in={w.get('wash_in_s', 0.0):.2f}s, blink_pad=+-{w.get('blink_pad_frames', 0)}f)"
+            f"wash_in={w.get('wash_in_s', 0.0):.2f}s ({wash_mode}), blink_pad=+-{w.get('blink_pad_frames', 0)}f)"
         )
         lines.append(f"- Frames in window: `{w['total_frames_in_window']}`, Eligible (`state=0, detected=1`): `{w['eligible_frames']}`, Exclusions: `{w['exclusions']}`")
         if w["eligible_frames"] == 0:
@@ -1445,6 +1508,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--auto-windows", action="store_true", help="Automatically segment active tracking windows")
     ap.add_argument("--cued-schedule", type=Path, default=None, help="Path to cued_schedule.json (auto-detected in <run-dir> if present and --windows/--auto-windows omitted)")
     ap.add_argument("--wash-in-s", type=float, default=None, help="Seconds to trim from the start of each window (default: 0.5 with cued schedule, else 0.0)")
+    ap.add_argument(
+        "--strict-protocol-wash-in",
+        action="store_true",
+        help="Restart the wash-in countdown inside a window whenever a frame is excluded or gap > 100 ms (matches evaluate_holds.py)",
+    )
     ap.add_argument("--blink-pad-frames", type=int, default=DEFAULT_BLINK_PAD_FRAMES, help="Frames to exclude before/after blink or face loss (default: 2)")
     ap.add_argument("--deployed-models-dir", type=Path, default=DEFAULT_DEPLOYED_MODELS_DIR)
     ap.add_argument("--candidate-models-dir", type=Path, default=None, help="Optional directory containing candidate gaze_yaw.dll / gaze_pitch.dll")
@@ -1537,6 +1605,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             wash_in_s=wash_in_s,
             blink_pad_frames=args.blink_pad_frames,
             padded_bad_indices=padded_bad,
+            strict_protocol_wash_in=args.strict_protocol_wash_in,
         )
         for name, s, e in windows_spec
     ]
@@ -1549,6 +1618,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "cued_schedule": cued_meta,
         "analysis_params": {
             "wash_in_s": wash_in_s,
+            "strict_protocol_wash_in": args.strict_protocol_wash_in,
             "blink_pad_frames": args.blink_pad_frames,
             "fixed_y_sign": FIXED_Y_SIGN,
         },

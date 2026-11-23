@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -549,11 +550,66 @@ void usage() {
 "hotkeys (Windows): Ctrl+Alt+P = pause/resume (OS integration), F9 = quit.  Ctrl+C also quits.  Tray icon: Calibrate, Exit.\n");
 }
 
+std::string decodeFourcc(double raw_fourcc) {
+    const uint32_t code = (std::isfinite(raw_fourcc) && raw_fourcc > 0.0)
+                              ? static_cast<uint32_t>(std::llround(raw_fourcc))
+                              : 0u;
+    if (code == 0u) return "NONE";
+    char ch[5] = {
+        char(code & 0xFFu),
+        char((code >> 8) & 0xFFu),
+        char((code >> 16) & 0xFFu),
+        char((code >> 24) & 0xFFu),
+        '\0'
+    };
+    for (int i = 0; i < 4; ++i) {
+        const unsigned char uc = static_cast<unsigned char>(ch[i]);
+        if (uc < 32 || uc > 126) {
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "0x%08X", code);
+            return std::string(hex);
+        }
+    }
+    return std::string(ch);
+}
+
+struct CameraNegotiation {
+    std::string fourcc;
+    int width = 0;
+    int height = 0;
+    double reported_fps = 0.0;
+    double auto_exposure = 0.0;
+};
+
+CameraNegotiation queryCameraNegotiation(cv::VideoCapture& cap, int fallback_w = 0, int fallback_h = 0) {
+    CameraNegotiation n;
+    n.fourcc = decodeFourcc(cap.get(cv::CAP_PROP_FOURCC));
+    const double gw = cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    const double gh = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    n.width = (std::isfinite(gw) && gw > 0.0) ? int(std::llround(gw)) : fallback_w;
+    n.height = (std::isfinite(gh) && gh > 0.0) ? int(std::llround(gh)) : fallback_h;
+    n.reported_fps = cap.get(cv::CAP_PROP_FPS);
+    n.auto_exposure = cap.get(cv::CAP_PROP_AUTO_EXPOSURE);
+    return n;
+}
+
 // Opens the camera (or the video file). On Windows the camera is tried with DirectShow first, then with the
 // default backend. Prints what to try when nothing works.
 bool openSource(const Config& cfg, cv::VideoCapture& cap) {
     if (!cfg.video_path.empty()) {
-        if (!cap.open(cfg.video_path, cv::CAP_OPENCV_MJPEG)) cap.open(cfg.video_path);
+        std::string lower_ext;
+        const size_t dot = cfg.video_path.find_last_of('.');
+        if (dot != std::string::npos) {
+            lower_ext = cfg.video_path.substr(dot);
+            for (char& ch : lower_ext) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+        }
+        const bool is_mjpeg_container =
+            (lower_ext == ".avi" || lower_ext == ".mjpg" || lower_ext == ".mjpeg");
+        if (!is_mjpeg_container || !cap.open(cfg.video_path, cv::CAP_OPENCV_MJPEG)) {
+            cap.open(cfg.video_path);
+        }
         if (!cap.isOpened()) std::fprintf(stderr, "Could not open the video file: %s\n", cfg.video_path.c_str());
         return cap.isOpened();
     }
@@ -575,11 +631,20 @@ bool openSource(const Config& cfg, cv::VideoCapture& cap) {
             "  - Try another camera: --camera 1\n", cfg.camera_index);
         return false;
     }
-    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    const double mjpg = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    cap.set(cv::CAP_PROP_FOURCC,       mjpg);
     cap.set(cv::CAP_PROP_FRAME_WIDTH,  cfg.width);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, cfg.height);
     cap.set(cv::CAP_PROP_FPS,          cfg.fps);
     cap.set(cv::CAP_PROP_BUFFERSIZE,   1);
+    // Verify FOURCC after resolution/FPS negotiation; some DirectShow drivers reset FOURCC on size changes.
+    if (decodeFourcc(cap.get(cv::CAP_PROP_FOURCC)) != "MJPG") {
+        cap.set(cv::CAP_PROP_FOURCC, mjpg);
+        cap.set(cv::CAP_PROP_FRAME_WIDTH,  cfg.width);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, cfg.height);
+        cap.set(cv::CAP_PROP_FPS,          cfg.fps);
+        cap.set(cv::CAP_PROP_BUFFERSIZE,   1);
+    }
     return true;
 }
 
@@ -762,14 +827,23 @@ int runCheck(const Config& cfg) {
         for (int i = 0; i < 30 && m.empty(); ++i) cap.read(m);
         if (m.empty()) bad("video source", "opened, but no frame arrived", "another program may hold the camera");
         else {
-            char buf[160];
+            const CameraNegotiation neg = queryCameraNegotiation(cap, m.cols, m.rows);
+            char buf[256];
             if (cfg.video_path.empty()) {
                 const double fps = measureFps(cap);
-                std::snprintf(buf, sizeof buf, "%dx%d, delivers %.1f FPS (asked for %.0f)", m.cols, m.rows, fps, cfg.fps);
-                if (fps > 0 && fps < 50) warn("video source", std::string(buf) + "  - below 60 FPS: low light makes the camera slow its exposure; check the driver/mode");
-                else ok("video source", buf);
+                std::snprintf(buf, sizeof buf,
+                              "%dx%d FOURCC=%s reported=%.1f FPS effective=%.1f FPS (asked %.0f) auto_exposure=%.3g",
+                              m.cols, m.rows, neg.fourcc.c_str(), neg.reported_fps, fps, cfg.fps, neg.auto_exposure);
+                if (fps > 0 && fps < 30.0) {
+                    warn("video source", std::string(buf) + "  - below 30 FPS: low light or slow driver mode will fail the 100 ms fresh-gap budget");
+                } else if (fps > 0 && fps < 50.0) {
+                    warn("video source", std::string(buf) + "  - below 60 FPS: low light makes the camera slow its exposure; check the driver/mode");
+                } else {
+                    ok("video source", buf);
+                }
             } else {
-                std::snprintf(buf, sizeof buf, "video file %dx%d", m.cols, m.rows);
+                std::snprintf(buf, sizeof buf, "video file %dx%d FOURCC=%s reported=%.3f FPS",
+                              m.cols, m.rows, neg.fourcc.c_str(), neg.reported_fps);
                 ok("video source", buf);
             }
         }
@@ -861,16 +935,23 @@ int main(int argc, char** argv) {
     cv::Mat first;
     for (int i = 0; i < 30 && first.empty(); ++i) cap.read(first);
     if (first.empty() || first.type() != CV_8UC3) { std::fprintf(stderr, "No usable frames from source\n"); return 1; }
-    const double reported_fps = cap.get(cv::CAP_PROP_FPS);
+    const CameraNegotiation neg = queryCameraNegotiation(cap, first.cols, first.rows);
+    const double reported_fps = neg.reported_fps;
     if (!from_file) {
         const double eff = measureFps(cap);                       // what the driver REALLY delivers
-        std::printf("Camera delivers %.1f FPS (asked for %.0f)\n", eff, cfg.fps);
-        if (eff > 0 && eff < 50)
+        std::printf("Camera delivers %.1f FPS (asked for %.0f | negotiated %dx%d FOURCC=%s reported=%.1f FPS auto_exposure=%.3g)\n",
+                    eff, cfg.fps, neg.width, neg.height, neg.fourcc.c_str(), reported_fps, neg.auto_exposure);
+        if (eff > 0 && eff < 30.0) {
+            std::printf("[warning] camera effective rate %.1f FPS is below 30 FPS: consecutive frame gaps may exceed the 100 ms fresh-gap budget.\n",
+                        eff);
+        }
+        if (eff > 0 && eff < 50.0)
             std::printf("[warning] below 60 FPS. Common causes: low light (auto-exposure slows the camera), USB hub, "
                         "a driver mode without MJPG. The engine still works; it will just track at the camera's rate.\n");
     }
-    std::printf("Source: %dx%d @ %.1f FPS | pool=%d (%.1f MB) | policy=%s\n", first.cols, first.rows,
-                reported_fps, cfg.pool_size, double(cfg.pool_size) * first.total() * 3 / 1048576.0,
+    std::printf("Source: %dx%d FOURCC=%s @ %.3f FPS | pool=%d (%.1f MB) | policy=%s\n",
+                first.cols, first.rows, neg.fourcc.c_str(), reported_fps, cfg.pool_size,
+                double(cfg.pool_size) * first.total() * 3 / 1048576.0,
                 cfg.latest_only ? "latest-only" : "process-every-frame");
 
     Pipeline P(cfg, first.size());

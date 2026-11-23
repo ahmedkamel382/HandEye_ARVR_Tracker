@@ -64,6 +64,11 @@ public:
     void set_inhibited(bool inhibited) noexcept;
     [[nodiscard]] bool inhibited() const noexcept { return inhibited_; }
 
+    // Enables or suppresses mouse button clicks/holds while keeping gesture
+    // tracking, TogglePause (eye closure), and gaze blink/wink cursor lock active.
+    void set_clicks_enabled(bool enabled) noexcept;
+    [[nodiscard]] bool clicks_enabled() const noexcept { return clicks_enabled_; }
+
     // Sends button-up for every button this controller is holding. A button
     // stays tracked as held until Windows accepts its release; refused
     // releases are retried by retry_pending_releases() and on every update().
@@ -117,6 +122,7 @@ private:
     bool has_timestamp_ = false;
     bool active_ = false;
     bool inhibited_ = false;
+    bool clicks_enabled_ = true;
 };
 
 } // namespace osi

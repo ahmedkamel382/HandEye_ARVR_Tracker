@@ -198,6 +198,8 @@ const std::vector<Field>& fields() {
                                  [](Settings& s) -> InputRegion& { return s.mapping.hand_region; }));
         f.push_back(region_field("mapping", "gaze_region",
                                  [](Settings& s) -> InputRegion& { return s.mapping.gaze_region; }));
+        f.push_back(bool_field("mapping", "gaze_calibrated",
+                               [](Settings& s) -> bool& { return s.mapping.gaze_calibrated; }));
         f.push_back(enum_field(
             "mapping", "cursor_source",
             [](Settings& s) -> CursorSourceMode& { return s.mapping.cursor_source; },
@@ -331,6 +333,20 @@ double preset_factor(SmoothingPreset preset) noexcept {
     return 1.0;
 }
 
+constexpr double fabs_c17(double x) noexcept { return x < 0.0 ? -x : x; }
+
+constexpr bool same_region(const InputRegion& a, const InputRegion& b) noexcept {
+    constexpr double kEps = 1e-9;
+    return fabs_c17(a.x_min - b.x_min) <= kEps && fabs_c17(a.y_min - b.y_min) <= kEps &&
+           fabs_c17(a.x_max - b.x_max) <= kEps && fabs_c17(a.y_max - b.y_max) <= kEps;
+}
+
+constexpr bool is_legacy_placeholder_gaze_region(const InputRegion& r) noexcept {
+    return same_region(r, InputRegion{0.3, 0.3, 0.7, 0.7}) ||
+           same_region(r, InputRegion{0.25, 0.25, 0.75, 0.75}) ||
+           same_region(r, InputRegion{0.25, 0.60, 0.75, 0.80});
+}
+
 } // namespace
 
 std::vector<std::string> validate(const Settings& settings) {
@@ -358,6 +374,8 @@ SettingsLoadResult parse_settings(std::string_view text) {
     }
     std::string section;
     std::size_t line_number = 0;
+    bool saw_gaze_calibrated = false;
+    bool saw_gaze_region = false;
     while (!text.empty()) {
         ++line_number;
         const auto newline = text.find('\n');
@@ -404,7 +422,24 @@ SettingsLoadResult parse_settings(std::string_view text) {
                    field->format(result.settings) + ")");
             continue;
         }
+        if (section == "mapping" && key == "gaze_calibrated") {
+            saw_gaze_calibrated = true;
+        } else if (section == "mapping" && key == "gaze_region") {
+            saw_gaze_region = true;
+        }
         result.settings = candidate;
+    }
+    // Safe legacy INI migration: upgrade old uncalibrated placeholder gaze regions to the current default,
+    // while preserving custom calibrated user regions when gaze_calibrated was not yet written.
+    if (result.error.empty() && !saw_gaze_calibrated && saw_gaze_region) {
+        const InputRegion& default_gaze = MappingSettings{}.gaze_region;
+        if (is_legacy_placeholder_gaze_region(result.settings.mapping.gaze_region) ||
+            same_region(result.settings.mapping.gaze_region, default_gaze)) {
+            result.settings.mapping.gaze_region = default_gaze;
+            result.settings.mapping.gaze_calibrated = false;
+        } else {
+            result.settings.mapping.gaze_calibrated = true;
+        }
     }
     return result;
 }

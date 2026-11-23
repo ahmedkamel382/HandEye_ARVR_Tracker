@@ -228,6 +228,12 @@ void osi_set_inhibited(void* handle, int32_t inhibited) {
     }
 }
 
+void osi_set_clicks_enabled(void* handle, int32_t enabled) {
+    if (auto* h = static_cast<Handle*>(handle)) {
+        h->controller->set_clicks_enabled(enabled != 0);
+    }
+}
+
 int32_t osi_release_all(void* handle) {
     auto* h = static_cast<Handle*>(handle);
     return h == nullptr || h->controller->release_all_buttons() ? 1 : 0;

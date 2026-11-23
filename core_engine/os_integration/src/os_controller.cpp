@@ -188,6 +188,9 @@ FrameReport OsController::update(const FramePayload& frame) noexcept {
             if (action.type == ActionType::TogglePause) {
                 continue;
             }
+            if (!clicks_enabled_) {
+                continue;
+            }
             // The cursor is not where the user aimed: a press would land on
             // whatever is under its old position, and so would a drop.
             if (!on_target) {
@@ -284,6 +287,16 @@ void OsController::set_inhibited(bool inhibited) noexcept {
         release_all_buttons();
     }
     last_sent_.reset();
+}
+
+void OsController::set_clicks_enabled(bool enabled) noexcept {
+    if (clicks_enabled_ == enabled) {
+        return;
+    }
+    clicks_enabled_ = enabled;
+    if (!clicks_enabled_) {
+        release_all_buttons();
+    }
 }
 
 // The button counts as released only once Windows accepts the button-up.

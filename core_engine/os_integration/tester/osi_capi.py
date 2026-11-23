@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 DLL_NAME = "os_integration_capi.dll"
-EXPECTED_VERSION = 2
+EXPECTED_VERSION = 3
 MAX_ACTIONS = 8
 
 OUTPUT_RECORD = 0
@@ -145,6 +145,7 @@ class OsiLibrary:
         if self.version != EXPECTED_VERSION:
             raise RuntimeError(f"{DLL_NAME} version {self.version}, tester expects {EXPECTED_VERSION}: rebuild it")
         # Bound after the version check: an older DLL does not export these.
+        d.osi_set_clicks_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         d.osi_filter_update.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double),
                                         ctypes.POINTER(ctypes.c_double), ctypes.c_double]
         d.osi_filter_update.restype = ctypes.c_int32
@@ -212,6 +213,10 @@ class Controller:
     def set_inhibited(self, inhibited: bool) -> None:
         with self._lock:
             self._d.osi_set_inhibited(self._h, 1 if inhibited else 0)
+
+    def set_clicks_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._d.osi_set_clicks_enabled(self._h, 1 if enabled else 0)
 
     def release_all(self) -> bool:
         with self._lock:

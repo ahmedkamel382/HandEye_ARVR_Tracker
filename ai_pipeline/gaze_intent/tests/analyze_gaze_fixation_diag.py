@@ -59,6 +59,8 @@ MIN_SAMPLES = 25
 LIMIT_SD = 0.010
 LIMIT_RANGE = 0.030
 LIMIT_SLOPE = 0.005  # units / second
+MAX_FRESH_GAP_MS = 100.0
+COORD_TOL = 1e-6
 DEFAULT_CUED_WASH_IN_S = 0.5
 DEFAULT_BLINK_PAD_FRAMES = 2
 DEFAULT_CUED_TARGETS = ("CENTER", "LEFT", "RIGHT", "UP", "DOWN")
@@ -148,13 +150,16 @@ def _compute_axis_metrics(values: np.ndarray, times_s: np.ndarray) -> Dict[str, 
             "pop_sd": None,
             "ols_slope_per_s": None,
             "max_abs_step": None,
+            "max_gap_ms": None,
             "clipped_zero_or_one": 0,
             "pass_n": False,
             "pass_sd": False,
             "pass_range": False,
             "pass_slope": False,
+            "pass_gap": False,
             "pass_all": False,
         }
+    finite_ok = bool(np.all(np.isfinite(values)) and np.all(np.isfinite(times_s)))
     mean_v = float(np.mean(values))
     med_v = float(np.median(values))
     q75, q25 = np.percentile(values, [75, 25])
@@ -169,15 +174,18 @@ def _compute_axis_metrics(values: np.ndarray, times_s: np.ndarray) -> Dict[str, 
         denom = float(np.sum(t_c * t_c))
         slope = float(np.sum(t_c * (values - mean_v)) / denom) if denom > 0.0 else 0.0
         max_step = float(np.max(np.abs(np.diff(values))))
+        max_gap_ms = float(np.max(np.diff(times_s) * 1000.0))
     else:
         slope = 0.0
         max_step = 0.0
+        max_gap_ms = 0.0
 
     clipped = int(np.sum((values <= 0.0) | (values >= 1.0)))
     pass_n = n >= MIN_SAMPLES
-    pass_sd = sd_v <= LIMIT_SD
-    pass_range = rng_v <= LIMIT_RANGE
-    pass_slope = abs(slope) <= LIMIT_SLOPE
+    pass_sd = finite_ok and (sd_v <= LIMIT_SD)
+    pass_range = finite_ok and (rng_v <= LIMIT_RANGE)
+    pass_slope = finite_ok and (abs(slope) <= LIMIT_SLOPE)
+    pass_gap = finite_ok and (max_gap_ms <= MAX_FRESH_GAP_MS)
     return {
         "n": n,
         "mean": mean_v,
@@ -189,12 +197,14 @@ def _compute_axis_metrics(values: np.ndarray, times_s: np.ndarray) -> Dict[str, 
         "pop_sd": sd_v,
         "ols_slope_per_s": slope,
         "max_abs_step": max_step,
+        "max_gap_ms": max_gap_ms,
         "clipped_zero_or_one": clipped,
         "pass_n": pass_n,
         "pass_sd": pass_sd,
         "pass_range": pass_range,
         "pass_slope": pass_slope,
-        "pass_all": bool(pass_n and pass_sd and pass_range and pass_slope),
+        "pass_gap": pass_gap,
+        "pass_all": bool(finite_ok and pass_n and pass_sd and pass_range and pass_slope and pass_gap),
     }
 
 
@@ -239,6 +249,8 @@ def load_cued_schedule(schedule_path: Path) -> Tuple[Dict[str, Any], List[Tuple[
 
 
 def auto_detect_windows(records: Sequence[Dict[str, Any]]) -> List[Tuple[str, float, float]]:
+    if not records:
+        return []
     eligible = [r for r in records if r["eligible"]]
     if not eligible:
         t0 = float(records[0]["capture_s"])
@@ -492,9 +504,28 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
     ts_ms_mismatches = 0
     cap_s_mismatches = 0
     state_mismatches = 0
+    norm_x_mismatches = 0
+    norm_y_mismatches = 0
+    frame_id_non_increasing = 0
+    ts_ms_non_increasing = 0
+    capture_s_non_increasing = 0
+    nonfinite_errors = 0
     max_cap_s_diff = 0.0
     max_dx = 0.0
     max_dy = 0.0
+
+    diag_float_cols = (
+        "left_iris_x", "right_iris_x", "sx", "left_iris_y", "right_iris_y", "sy",
+        "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
+        "rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg",
+        "norm_x", "norm_y",
+        "lm33_x", "lm33_y", "lm133_x", "lm133_y", "lm468_x", "lm468_y",
+        "lm362_x", "lm362_y", "lm263_x", "lm263_y", "lm473_x", "lm473_y",
+    )
+
+    prev_fid: Optional[int] = None
+    prev_ts_ms: Optional[int] = None
+    prev_cap_s: Optional[float] = None
 
     for tr, dg in zip(trace_rows, diag_rows):
         t_fid = int(tr["frame_id"])
@@ -514,16 +545,47 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
             fid_mismatches += 1
         if t_obs_ms != d_ts_ms:
             ts_ms_mismatches += 1
-        cap_diff = abs(t_cap_s - d_cap_s)
-        max_cap_s_diff = max(max_cap_s_diff, cap_diff)
-        if cap_diff > 1e-12:
-            cap_s_mismatches += 1
         if t_state != d_state:
             state_mismatches += 1
-        dx = abs(t_tx - d_nx)
-        dy = abs(t_ty - d_ny)
-        max_dx = max(max_dx, dx)
-        max_dy = max(max_dy, dy)
+
+        if prev_fid is not None and (t_fid <= prev_fid or d_fid <= prev_fid):
+            frame_id_non_increasing += 1
+        if prev_ts_ms is not None and (t_obs_ms <= prev_ts_ms or d_ts_ms <= prev_ts_ms):
+            ts_ms_non_increasing += 1
+        if prev_cap_s is not None:
+            if not (math.isfinite(t_cap_s) and math.isfinite(d_cap_s)) or t_cap_s <= prev_cap_s or d_cap_s <= prev_cap_s:
+                capture_s_non_increasing += 1
+        prev_fid = t_fid
+        prev_ts_ms = t_obs_ms
+        if math.isfinite(t_cap_s):
+            prev_cap_s = t_cap_s
+
+        if math.isfinite(t_cap_s) and math.isfinite(d_cap_s):
+            cap_diff = abs(t_cap_s - d_cap_s)
+            max_cap_s_diff = max(max_cap_s_diff, cap_diff)
+            if cap_diff > 1e-12:
+                cap_s_mismatches += 1
+        else:
+            nonfinite_errors += 1
+            cap_s_mismatches += 1
+
+        if math.isfinite(t_tx) and math.isfinite(d_nx):
+            dx = abs(t_tx - d_nx)
+            max_dx = max(max_dx, dx)
+            if dx > COORD_TOL:
+                norm_x_mismatches += 1
+        else:
+            nonfinite_errors += 1
+            norm_x_mismatches += 1
+
+        if math.isfinite(t_ty) and math.isfinite(d_ny):
+            dy = abs(t_ty - d_ny)
+            max_dy = max(max_dy, dy)
+            if dy > COORD_TOL:
+                norm_y_mismatches += 1
+        else:
+            nonfinite_errors += 1
+            norm_y_mismatches += 1
 
         raw_x = float(tr["raw_x"]) if tr["raw_x"] != "" else None
         raw_y = float(tr["raw_y"]) if tr["raw_y"] != "" else None
@@ -532,15 +594,42 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
         landmarks = int(tr["landmarks"])
         detected = int(dg["detected"])
         published = int(tr["published"])
+
+        parsed_diag = {col: float(dg[col]) for col in diag_float_cols}
+        if detected == 1:
+            if not all(math.isfinite(v) for v in parsed_diag.values()):
+                nonfinite_errors += 1
+        for opt_val in (raw_x, raw_y, filt_x, filt_y):
+            if opt_val is not None and not math.isfinite(opt_val):
+                nonfinite_errors += 1
+        if published == 1 and (
+            raw_x is None or raw_y is None or filt_x is None or filt_y is None
+            or not (math.isfinite(raw_x) and math.isfinite(raw_y) and math.isfinite(filt_x) and math.isfinite(filt_y))
+        ):
+            nonfinite_errors += 1
+
+        diag_core_finite = all(
+            math.isfinite(parsed_diag[k])
+            for k in (
+                "sx", "sy", "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
+                "rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg", "norm_x", "norm_y",
+            )
+        )
         eligible = (
             detected == 1
             and d_state == 0
             and landmarks == 484
             and published == 1
+            and math.isfinite(t_cap_s)
             and raw_x is not None
             and raw_y is not None
+            and filt_x is not None
+            and filt_y is not None
             and math.isfinite(raw_x)
             and math.isfinite(raw_y)
+            and math.isfinite(filt_x)
+            and math.isfinite(filt_y)
+            and diag_core_finite
         )
 
         aligned.append(
@@ -558,22 +647,25 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
                 "raw_y": raw_y,
                 "filtered_x": filt_x,
                 "filtered_y": filt_y,
-                "sx": float(dg["sx"]),
-                "sy": float(dg["sy"]),
-                "head_pitch_deg": float(dg["head_pitch_deg"]),
-                "head_yaw_deg": float(dg["head_yaw_deg"]),
-                "head_roll_deg": float(dg["head_roll_deg"]),
-                "rel_pitch_deg": float(dg["rel_pitch_deg"]),
-                "rel_yaw_deg": float(dg["rel_yaw_deg"]),
-                "abs_pitch_deg": float(dg["abs_pitch_deg"]),
-                "abs_yaw_deg": float(dg["abs_yaw_deg"]),
+                "sx": parsed_diag["sx"],
+                "sy": parsed_diag["sy"],
+                "head_pitch_deg": parsed_diag["head_pitch_deg"],
+                "head_yaw_deg": parsed_diag["head_yaw_deg"],
+                "head_roll_deg": parsed_diag["head_roll_deg"],
+                "rel_pitch_deg": parsed_diag["rel_pitch_deg"],
+                "rel_yaw_deg": parsed_diag["rel_yaw_deg"],
+                "abs_pitch_deg": parsed_diag["abs_pitch_deg"],
+                "abs_yaw_deg": parsed_diag["abs_yaw_deg"],
                 "norm_x": d_nx,
                 "norm_y": d_ny,
                 "eligible": eligible,
             }
         )
 
-    detected_rows = [r for r in aligned if r["detected"] == 1]
+    detected_rows = [
+        r for r in aligned
+        if r["detected"] == 1 and math.isfinite(r["abs_pitch_deg"]) and math.isfinite(r["norm_y"])
+    ]
     if detected_rows:
         ap_arr = np.array([r["abs_pitch_deg"] for r in detected_rows], dtype=np.float64)
         ny_arr = np.array([r["norm_y"] for r in detected_rows], dtype=np.float64)
@@ -607,6 +699,13 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
         "ts_ms_mismatches": ts_ms_mismatches,
         "capture_s_mismatches": cap_s_mismatches,
         "state_mismatches": state_mismatches,
+        "norm_x_mismatches": norm_x_mismatches,
+        "norm_y_mismatches": norm_y_mismatches,
+        "frame_id_non_increasing": frame_id_non_increasing,
+        "ts_ms_non_increasing": ts_ms_non_increasing,
+        "capture_s_non_increasing": capture_s_non_increasing,
+        "nonfinite_errors": nonfinite_errors,
+        "coord_tol": COORD_TOL,
         "max_abs_capture_s_diff": max_cap_s_diff,
         "max_abs_delta_norm_x": max_dx,
         "max_abs_delta_norm_y": max_dy,
@@ -620,9 +719,24 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
             and int(footer_meta.get("overflow", -1)) == 0
             and int(footer_meta.get("config_changes", -1)) == 0
             and int(footer_meta.get("complete", 0)) == 1
+            and len(trace_rows) > 0
+            and len(diag_rows) == len(trace_rows)
+            and len(diag_cols) == len(EXPECTED_DIAG_COLUMNS)
             and fid_mismatches == 0
+            and ts_ms_mismatches == 0
             and cap_s_mismatches == 0
             and state_mismatches == 0
+            and norm_x_mismatches == 0
+            and norm_y_mismatches == 0
+            and frame_id_non_increasing == 0
+            and ts_ms_non_increasing == 0
+            and capture_s_non_increasing == 0
+            and nonfinite_errors == 0
+            and math.isfinite(max_cap_s_diff)
+            and math.isfinite(max_dx)
+            and math.isfinite(max_dy)
+            and max_dx <= COORD_TOL
+            and max_dy <= COORD_TOL
         ),
     }
     return integrity, aligned
@@ -979,17 +1093,27 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
     lines = [
         "# Gaze Fixation Stability, Attribution & A/B Shadow Replay Report",
         "",
+    ]
+    if not integ.get("alignment_ok", False):
+        lines.extend([
+            "> [!CAUTION]",
+            "> **INVALID RUN / FAILED ALIGNMENT & INTEGRITY CHECKS.** Do not use metrics below as valid qualification evidence.",
+            "",
+        ])
+    lines.extend([
         "## 1. Alignment & Integrity",
+        f"- **Alignment & integrity verdict:** **{'VALID (`alignment_ok=True`)' if integ.get('alignment_ok') else 'INVALID (`alignment_ok=False`)'}**",
         run_line,
         f"- **Diag CSV:** `{integ['diag_csv']}` (`{integ['diag_rows']}` rows, `{integ['diag_columns']}` columns)",
         f"- **Recorder markers:** `COMPLETE={integ['complete_marker_present']}`, `INCOMPLETE_absent={integ['incomplete_marker_absent']}`, `overflow={integ['overflow']}`, `config_changes={integ['config_changes']}`, `complete={integ['complete_flag']}`",
         f"- **DSP config (E4REC BEGIN):** `min_cutoff={integ['trace_header'].get('min_cutoff')}`, `beta={integ['trace_header'].get('beta')}`, `derivative_cutoff={integ['trace_header'].get('derivative_cutoff')}`",
-        f"- **1:1 Alignment:** `frame_id_mismatches={integ['frame_id_mismatches']}`, `capture_s_mismatches={integ['capture_s_mismatches']}` (`max_diff={integ['max_abs_capture_s_diff']:.3e} s`), `state_mismatches={integ['state_mismatches']}`, `max_delta_norm=({integ['max_abs_delta_norm_x']:.3e}, {integ['max_abs_delta_norm_y']:.3e})`, `logged_y_sign={integ['logged_y_sign']}`",
+        f"- **1:1 Alignment (`COORD_TOL={integ.get('coord_tol', COORD_TOL):.1e}`):** `frame_id_mismatches={integ['frame_id_mismatches']}`, `ts_ms_mismatches={integ.get('ts_ms_mismatches', 0)}`, `capture_s_mismatches={integ['capture_s_mismatches']}` (`max_diff={integ['max_abs_capture_s_diff']:.3e} s`), `state_mismatches={integ['state_mismatches']}`, `norm_mismatches=({integ.get('norm_x_mismatches', 0)}, {integ.get('norm_y_mismatches', 0)})`, `max_delta_norm=({integ['max_abs_delta_norm_x']:.3e}, {integ['max_abs_delta_norm_y']:.3e})`, `logged_y_sign={integ['logged_y_sign']}`",
+        f"- **Monotonicity & finiteness:** `frame_id_non_increasing={integ.get('frame_id_non_increasing', 0)}`, `ts_ms_non_increasing={integ.get('ts_ms_non_increasing', 0)}`, `capture_s_non_increasing={integ.get('capture_s_non_increasing', 0)}`, `nonfinite_errors={integ.get('nonfinite_errors', 0)}`",
         "",
         "### Model Inventory",
         "| Role | File | Bytes | SHA-256 |",
         "| --- | --- | ---: | --- |",
-    ]
+    ])
     for role, inv_map in (("Deployed", report["deployed_models"]), ("Candidate", report.get("candidate_models") or {})):
         for name, info in inv_map.items():
             lines.append(f"| {role} | `{name}` | {info.get('bytes')} | `{info.get('sha256')}` |")
@@ -1007,10 +1131,10 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
         rx, ry = w["raw_x"], w["raw_y"]
         lines.extend([
             "",
-            "| Axis | N (>=25) | Mean | SD (<=0.010) | Range (<=0.030) | |Slope|/s (<=0.005) | Max Step | Clipped 0/1 | Verdict |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
-            f"| `raw_x` | {rx['n']} | {rx['mean']:.5f} | {rx['pop_sd']:.6f} | {rx['range']:.6f} | {abs(rx['ols_slope_per_s']):.6f} | {rx['max_abs_step']:.6f} | {rx['clipped_zero_or_one']} | **{'PASS' if rx['pass_all'] else 'FAIL'}** |",
-            f"| `raw_y` | {ry['n']} | {ry['mean']:.5f} | {ry['pop_sd']:.6f} | {ry['range']:.6f} | {abs(ry['ols_slope_per_s']):.6f} | {ry['max_abs_step']:.6f} | {ry['clipped_zero_or_one']} | **{'PASS' if ry['pass_all'] else 'FAIL'}** |",
+            f"| Axis | N (>=25) | Mean | SD (<=0.010) | Range (<=0.030) | |Slope|/s (<=0.005) | Max Gap ms (<={MAX_FRESH_GAP_MS:.0f}) | Max Step | Clipped 0/1 | Verdict |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            f"| `raw_x` | {rx['n']} | {rx['mean']:.5f} | {rx['pop_sd']:.6f} | {rx['range']:.6f} | {abs(rx['ols_slope_per_s']):.6f} | {rx['max_gap_ms']:.1f} | {rx['max_abs_step']:.6f} | {rx['clipped_zero_or_one']} | **{'PASS' if rx['pass_all'] else 'FAIL'}** |",
+            f"| `raw_y` | {ry['n']} | {ry['mean']:.5f} | {ry['pop_sd']:.6f} | {ry['range']:.6f} | {abs(ry['ols_slope_per_s']):.6f} | {ry['max_gap_ms']:.1f} | {ry['max_abs_step']:.6f} | {ry['clipped_zero_or_one']} | **{'PASS' if ry['pass_all'] else 'FAIL'}** |",
         ])
         vd = w["variance_decomposition"]
         lines.extend([
@@ -1027,12 +1151,12 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
             lines.extend([
                 "",
                 "**A/B Shadow Replay (Deployed vs. Candidate on identical 5-D frames; fixed Y sign `0.5 - pitch/60`):**",
-                "| Model | Axis | Mean | SD | Range | |Slope|/s | Max Step | `±0.005` Max | Verdict |",
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
-                f"| Deployed | `X` | {rx['mean']:.5f} | {rx['pop_sd']:.6f} | {rx['range']:.6f} | {abs(rx['ols_slope_per_s']):.6f} | {rx['max_abs_step']:.6f} | {w['local_cliff_sensitivity_pm005']['sx']['max_abs_deg']:.3f}° | **{'PASS' if rx['pass_all'] else 'FAIL'}** |",
-                f"| Candidate | `X` | {crx['mean']:.5f} | {crx['pop_sd']:.6f} | {crx['range']:.6f} | {abs(crx['ols_slope_per_s']):.6f} | {crx['max_abs_step']:.6f} | {cs['local_cliff_sensitivity_pm005']['sx']['max_abs_deg']:.3f}° | **{'PASS' if crx['pass_all'] else 'FAIL'}** |",
-                f"| Deployed (logged Y) | `Y` | {ry['mean']:.5f} | {ry['pop_sd']:.6f} | {ry['range']:.6f} | {abs(ry['ols_slope_per_s']):.6f} | {ry['max_abs_step']:.6f} | {w['local_cliff_sensitivity_pm005']['sy']['max_abs_deg']:.3f}° | **{'PASS' if ry['pass_all'] else 'FAIL'}** |",
-                f"| Candidate (fixed Y) | `Y` | {cry['mean']:.5f} | {cry['pop_sd']:.6f} | {cry['range']:.6f} | {abs(cry['ols_slope_per_s']):.6f} | {cry['max_abs_step']:.6f} | {cs['local_cliff_sensitivity_pm005']['sy']['max_abs_deg']:.3f}° | **{'PASS' if cry['pass_all'] else 'FAIL'}** |",
+                f"| Model | Axis | Mean | SD | Range | |Slope|/s | Max Gap ms (<={MAX_FRESH_GAP_MS:.0f}) | Max Step | `±0.005` Max | Verdict |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+                f"| Deployed | `X` | {rx['mean']:.5f} | {rx['pop_sd']:.6f} | {rx['range']:.6f} | {abs(rx['ols_slope_per_s']):.6f} | {rx['max_gap_ms']:.1f} | {rx['max_abs_step']:.6f} | {w['local_cliff_sensitivity_pm005']['sx']['max_abs_deg']:.3f}° | **{'PASS' if rx['pass_all'] else 'FAIL'}** |",
+                f"| Candidate | `X` | {crx['mean']:.5f} | {crx['pop_sd']:.6f} | {crx['range']:.6f} | {abs(crx['ols_slope_per_s']):.6f} | {crx['max_gap_ms']:.1f} | {crx['max_abs_step']:.6f} | {cs['local_cliff_sensitivity_pm005']['sx']['max_abs_deg']:.3f}° | **{'PASS' if crx['pass_all'] else 'FAIL'}** |",
+                f"| Deployed (logged Y) | `Y` | {ry['mean']:.5f} | {ry['pop_sd']:.6f} | {ry['range']:.6f} | {abs(ry['ols_slope_per_s']):.6f} | {ry['max_gap_ms']:.1f} | {ry['max_abs_step']:.6f} | {w['local_cliff_sensitivity_pm005']['sy']['max_abs_deg']:.3f}° | **{'PASS' if ry['pass_all'] else 'FAIL'}** |",
+                f"| Candidate (fixed Y) | `Y` | {cry['mean']:.5f} | {cry['pop_sd']:.6f} | {cry['range']:.6f} | {abs(cry['ols_slope_per_s']):.6f} | {cry['max_gap_ms']:.1f} | {cry['max_abs_step']:.6f} | {cs['local_cliff_sensitivity_pm005']['sy']['max_abs_deg']:.3f}° | **{'PASS' if cry['pass_all'] else 'FAIL'}** |",
             ])
         for axis_label, key in (("X (`norm_x`)", "top_5_jumps_x"), ("Y (`norm_y` fixed sign)", "top_5_jumps_y")):
             jumps = w.get(key) or []
@@ -1433,6 +1557,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "max_pop_sd": LIMIT_SD,
             "max_range": LIMIT_RANGE,
             "max_abs_ols_slope_per_s": LIMIT_SLOPE,
+            "max_fresh_gap_ms": MAX_FRESH_GAP_MS,
+            "coord_tol": COORD_TOL,
         },
         "windows": windows_res,
         "directions": directions,
@@ -1444,12 +1570,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     md_text = format_markdown_report(report)
     out_md.write_text(md_text, encoding="utf-8")
 
+    if not integrity["alignment_ok"]:
+        print("=== INVALID RUN / ALIGNMENT FAILED ===")
     print(f"=== ALIGNMENT & INTEGRITY ===")
     print(
-        f"rows={integrity['trace_rows']} COMPLETE={integrity['complete_marker_present']} "
+        f"alignment_ok={integrity['alignment_ok']} rows={integrity['trace_rows']} "
+        f"COMPLETE={integrity['complete_marker_present']} "
         f"overflow={integrity['overflow']} config_changes={integrity['config_changes']} "
-        f"fid_mis={integrity['frame_id_mismatches']} cap_s_mis={integrity['capture_s_mismatches']} "
-        f"y_sign={integrity['logged_y_sign']} "
+        f"fid_mis={integrity['frame_id_mismatches']} ts_mis={integrity['ts_ms_mismatches']} "
+        f"cap_s_mis={integrity['capture_s_mismatches']} state_mis={integrity['state_mismatches']} "
+        f"norm_mis=({integrity['norm_x_mismatches']}, {integrity['norm_y_mismatches']}) "
+        f"non_inc=({integrity['frame_id_non_increasing']}, {integrity['ts_ms_non_increasing']}, {integrity['capture_s_non_increasing']}) "
+        f"nonfinite={integrity['nonfinite_errors']} y_sign={integrity['logged_y_sign']} "
         f"max_dnorm=({integrity['max_abs_delta_norm_x']:.3e}, {integrity['max_abs_delta_norm_y']:.3e})"
     )
     for w in windows_res:
@@ -1460,8 +1592,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         vd = w["variance_decomposition"]
         print(
             f"[{w['window']}] n={rx['n']} | "
-            f"raw_x: mean={rx['mean']:.5f} SD={rx['pop_sd']:.6f} rng={rx['range']:.6f} |slope|={abs(rx['ols_slope_per_s']):.6f} [{'PASS' if rx['pass_all'] else 'FAIL'}] | "
-            f"raw_y: mean={ry['mean']:.5f} SD={ry['pop_sd']:.6f} rng={ry['range']:.6f} |slope|={abs(ry['ols_slope_per_s']):.6f} [{'PASS' if ry['pass_all'] else 'FAIL'}]"
+            f"raw_x: mean={rx['mean']:.5f} SD={rx['pop_sd']:.6f} rng={rx['range']:.6f} |slope|={abs(rx['ols_slope_per_s']):.6f} gap={rx['max_gap_ms']:.1f}ms [{'PASS' if rx['pass_all'] else 'FAIL'}] | "
+            f"raw_y: mean={ry['mean']:.5f} SD={ry['pop_sd']:.6f} rng={ry['range']:.6f} |slope|={abs(ry['ols_slope_per_s']):.6f} gap={ry['max_gap_ms']:.1f}ms [{'PASS' if ry['pass_all'] else 'FAIL'}]"
         )
         print(
             f"    Attribution SD: iris_only=({vd['iris_only_vs_median_head']['x_sd']:.6f}, {vd['iris_only_vs_median_head']['y_sd']:.6f}) "
@@ -1473,8 +1605,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             crx, cry = cs["raw_x"], cs["raw_y"]
             print(
                 f"    Candidate A/B : "
-                f"X: mean={crx['mean']:.5f} SD={crx['pop_sd']:.6f} rng={crx['range']:.6f} [{'PASS' if crx['pass_all'] else 'FAIL'}] | "
-                f"Y: mean={cry['mean']:.5f} SD={cry['pop_sd']:.6f} rng={cry['range']:.6f} [{'PASS' if cry['pass_all'] else 'FAIL'}] | "
+                f"X: mean={crx['mean']:.5f} SD={crx['pop_sd']:.6f} rng={crx['range']:.6f} gap={crx['max_gap_ms']:.1f}ms [{'PASS' if crx['pass_all'] else 'FAIL'}] | "
+                f"Y: mean={cry['mean']:.5f} SD={cry['pop_sd']:.6f} rng={cry['range']:.6f} gap={cry['max_gap_ms']:.1f}ms [{'PASS' if cry['pass_all'] else 'FAIL'}] | "
                 f"cliff_max=({cs['local_cliff_sensitivity_pm005']['sx']['max_abs_deg']:.3f}deg, {cs['local_cliff_sensitivity_pm005']['sy']['max_abs_deg']:.3f}deg)"
             )
     for d in directions:

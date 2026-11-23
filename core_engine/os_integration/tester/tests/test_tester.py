@@ -681,6 +681,10 @@ def test_uncalibrated_gaze_is_detected(lib):
     doc = IniDoc(defaults)
     doc.set("mapping", "gaze_region", "0.71 0.33 0.29 0.08")
     assert not gaze_is_uncalibrated(doc.text(), defaults)
+    for legacy in ("0.3 0.3 0.7 0.7", "0.25 0.25 0.75 0.75"):
+        legacy_doc = IniDoc(defaults)
+        legacy_doc.set("mapping", "gaze_region", legacy)
+        assert gaze_is_uncalibrated(legacy_doc.text(), defaults)
 
 
 # ---------------------------------------------------------------- #7 Run checks
@@ -1100,4 +1104,98 @@ def test_uncalibrated_default_gaze_region_keeps_candidate_neutral_inside_screen(
         assert target[1] + 50 < cy < target[1] + target[3] - 50
     finally:
         c.close()
+
+
+# ---- [Engineer 5] P1 #4: Non-finite validation & recovery across Tester & osi_capi ----
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, math.nan])
+def test_smoother_rejects_nonfinite_and_recovers(dsp_filter, bad):
+    for filt in (dsp_filter, None):
+        gate = Smoother(filt)
+        pt0, trk0 = gate.apply((0.3, 0.4), TRACKED, 1.0)
+        assert pt0 is not None and trk0 == TRACKED
+        assert gate.apply((bad, 0.4), TRACKED, 1.1) == (None, LOST)
+        assert gate.apply((0.3, bad), TRACKED, 1.2) == (None, LOST)
+        # Held must not replay after invalid reset
+        assert gate.apply((0.3, 0.4), HELD, 1.3) == (None, LOST)
+        # Clean frame recovers immediately
+        pt_rec, trk_rec = gate.apply((0.6, 0.7), TRACKED, 1.4)
+        assert pt_rec is not None and trk_rec == TRACKED
+        assert math.isfinite(pt_rec[0]) and math.isfinite(pt_rec[1])
+
+
+def test_hand_source_rejects_nonfinite_index_and_hand_and_recovers():
+    # Bypass __init__ to test HandSource.process normalization without loading MediaPipe weights
+    blank = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    # Index mode
+    src_idx = tester_engine.HandSource.__new__(tester_engine.HandSource)
+    src_idx.kind = "index"
+
+    class _FakeIdx:
+        def __init__(self, seq):
+            self._seq = iter(seq)
+
+        def track(self, _):
+            return next(self._seq)
+
+    src_idx.tracker = _FakeIdx([
+        type("R", (), {"valid": True, "x": float("inf"), "y": 0.5, "camera_x": 0.5, "camera_y": 0.5, "status": "TRACKING"})(),
+        type("R", (), {"valid": True, "x": 0.4, "y": 0.6, "camera_x": 0.4, "camera_y": 0.6, "status": "TRACKING"})(),
+    ])
+    obs_bad = src_idx.process(blank)
+    assert obs_bad.point is None and obs_bad.tracking == LOST
+    obs_ok = src_idx.process(blank)
+    assert obs_ok.point == (0.4, 0.6) and obs_ok.tracking == TRACKED
+
+    # Hand gesture mode
+    src_hand = tester_engine.HandSource.__new__(tester_engine.HandSource)
+    src_hand.kind = "hand"
+
+    class _FakeHand:
+        def __init__(self):
+            self.status = "DETECTED"
+            self._last_bbox = None
+            self.last_confidence = 0.9
+            self._seq = iter([
+                (float("nan"), 0.5, 1),
+                (float("inf"), 0.5, 1),
+                (0.25, 0.75, 1),
+            ])
+
+        def process_frame(self, _):
+            return next(self._seq)
+
+    src_hand.tracker = _FakeHand()
+    for _ in range(2):
+        bad_obs = src_hand.process(blank)
+        assert bad_obs.point is None and bad_obs.tracking == LOST
+    ok_obs = src_hand.process(blank)
+    assert ok_obs.point == (0.25, 0.75) and ok_obs.tracking == TRACKED and ok_obs.state == 1
+
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, math.nan])
+def test_osi_capi_rejects_nonfinite_tracker_points_and_recovers(lib, bad):
+    ini = lib.default_settings_ini()
+    c = lib.controller(ini, all_monitors=False, real_mouse=False)
+    try:
+        c.set_active(True)
+        # Before any valid sample, non-finite input must not produce a cursor
+        r0 = c.update(0.05, osi_capi.TrackerInput((bad, 0.5), 0, TRACKED), None)
+        assert r0.cursor is None and not r0.moved
+
+        # Establish a valid cursor, then inject non-finite X and Y
+        good = c.update(0.10, osi_capi.TrackerInput((0.5, 0.5), 0, TRACKED), None)
+        assert good.cursor is not None and good.moved
+        r1 = c.update(0.20, osi_capi.TrackerInput((bad, 0.5), 0, TRACKED), None)
+        assert not r1.moved and r1.cursor == good.cursor
+        r2 = c.update(0.30, osi_capi.TrackerInput((0.5, bad), 0, TRACKED), None)
+        assert not r2.moved and r2.cursor == good.cursor
+
+        # Next clean sample moves cleanly to the new position
+        rec = c.update(0.40, osi_capi.TrackerInput((0.6, 0.4), 0, TRACKED), None)
+        assert rec.moved and rec.cursor is not None and rec.cursor != good.cursor
+    finally:
+        c.close()
+
 

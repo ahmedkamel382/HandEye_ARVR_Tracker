@@ -284,17 +284,24 @@ class HandSource:
         if self.kind == "index":
             r = self.tracker.track(bgr)
             obs.status = r.status
-            if r.valid and r.x is not None:
-                obs.point = (float(r.x), float(r.y))
-                obs.camera_point = (float(r.camera_x), float(r.camera_y))
-                obs.tracking = osi_capi.TRACKED
+            if r.valid and r.x is not None and r.y is not None:
+                rx, ry = float(r.x), float(r.y)
+                if math.isfinite(rx) and math.isfinite(ry):
+                    obs.point = (rx, ry)
+                    cx = float(r.camera_x) if r.camera_x is not None else rx
+                    cy = float(r.camera_y) if r.camera_y is not None else ry
+                    obs.camera_point = (cx, cy) if (math.isfinite(cx) and math.isfinite(cy)) else obs.point
+                    obs.tracking = osi_capi.TRACKED
         else:
             x, y, state = self.tracker.process_frame(bgr)
             obs.status = str(getattr(self.tracker, "status", ""))
             obs.tracking = {"DETECTED": osi_capi.TRACKED, "RECOVERED_ROI": osi_capi.TRACKED,
                             "HELD": osi_capi.HELD}.get(obs.status, osi_capi.LOST)
-            if x >= 0 and y >= 0 and obs.tracking != osi_capi.LOST:
-                obs.point = (float(x), float(y))
+            fx, fy = float(x), float(y)
+            if not (math.isfinite(fx) and math.isfinite(fy)):
+                obs.tracking = osi_capi.LOST
+            elif fx >= 0 and fy >= 0 and obs.tracking != osi_capi.LOST:
+                obs.point = (fx, fy)
                 obs.camera_point = obs.point
                 obs.state = int(state)
             bbox = getattr(self.tracker, "_last_bbox", None)   # read-only, for drawing
@@ -358,14 +365,13 @@ class Smoother:
 
     def apply(self, point, tracking: int, t: float) -> Tuple[Optional[Tuple[float, float]], int]:
         """(point to publish, TRACKED / HELD / LOST)."""
-        detected = point is not None and point[0] >= 0 and point[1] >= 0    # ModuleOut::detected(); False for NaN
+        detected = (point is not None and math.isfinite(point[0]) and math.isfinite(point[1])
+                    and point[0] >= 0 and point[1] >= 0)            # ModuleOut::detected(); rejects NaN & +-Inf
         if not detected or tracking not in (osi_capi.TRACKED, osi_capi.HELD):
             return self._lose()
         if tracking == osi_capi.HELD:
             return self._replay()
         if self.filter is None:
-            if not (math.isfinite(point[0]) and math.isfinite(point[1])):
-                return self._lose()
             output = point
         else:
             status, output = self.filter.update(point, t)
@@ -374,6 +380,9 @@ class Smoother:
             if status != osi_capi.FILTER_OK:
                 self.last, self._has_history = None, False  # the filter reset itself
                 return None, osi_capi.LOST
+        if output is None or not (math.isfinite(output[0]) and math.isfinite(output[1])):
+            self.last, self._has_history = None, False
+            return None, osi_capi.LOST
         self.last = (min(1.0, max(0.0, output[0])), min(1.0, max(0.0, output[1])))
         self._has_history = True
         return self.last, osi_capi.TRACKED
@@ -876,9 +885,13 @@ def _changes_control(old: TesterConfig, new: TesterConfig) -> bool:
     return replace(old, **drawing) != new
 
 
+LEGACY_PLACEHOLDER_GAZE_REGIONS = ((0.3, 0.3, 0.7, 0.7), (0.25, 0.25, 0.75, 0.75))
+
+
 def gaze_is_uncalibrated(settings: str, defaults: str) -> bool:
     fallback = _region(IniDoc(defaults).get("mapping", "gaze_region"), None)
-    return _region(IniDoc(settings).get("mapping", "gaze_region"), fallback) == fallback
+    region = _region(IniDoc(settings).get("mapping", "gaze_region"), fallback)
+    return region == fallback or region in LEGACY_PLACEHOLDER_GAZE_REGIONS
 
 
 class _WorkerState:

@@ -109,13 +109,17 @@ TrackerSample to_sample(const osi_tracker* tracker) noexcept {
         sample.tracking = TrackerState::Lost;
         return sample;
     }
-    if (tracker->has_point != 0) {
+    const bool has_valid_point = tracker->has_point != 0
+                                 && std::isfinite(tracker->x)
+                                 && std::isfinite(tracker->y);
+    if (has_valid_point) {
         sample.point = NormalizedPoint{tracker->x, tracker->y};
     }
     sample.state = tracker->state;
-    sample.tracking = tracker->tracking == OSI_HELD   ? TrackerState::Held
-                      : tracker->tracking == OSI_LOST ? TrackerState::Lost
-                                                      : TrackerState::Tracked;
+    sample.tracking = (tracker->has_point != 0 && !has_valid_point) ? TrackerState::Lost
+                      : tracker->tracking == OSI_HELD             ? TrackerState::Held
+                      : tracker->tracking == OSI_LOST             ? TrackerState::Lost
+                                                                  : TrackerState::Tracked;
     return sample;
 }
 

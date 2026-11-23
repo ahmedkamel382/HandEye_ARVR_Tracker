@@ -383,45 +383,33 @@ class TestFeatureExtractionAndGeometry:
         real_import = builtins.__import__
 
         def import_without_dataset_deps(name, globals=None, locals=None, fromlist=(), level=0):
-            if name in ("pandas", "tqdm"):
-                if name in sys.modules:
-                    return sys.modules[name]
+            if name in ("pandas", "tqdm") or name.startswith(("pandas.", "tqdm.")):
                 raise ModuleNotFoundError(f"Simulated missing optional dataset package: {name}")
             return real_import(name, globals, locals, fromlist, level)
 
-        stub_pandas = types.ModuleType("pandas")
-        stub_tqdm = types.ModuleType("tqdm")
-        stub_tqdm.tqdm = lambda iterable, *a, **kw: iterable
-
-        # Load mpii_processor under simulated absence of pandas/tqdm (matching minimal runtime envs)
-        mpii_path = GAZE_DIR / "mpii_processor.py"
-        spec = importlib.util.spec_from_file_location("mpii_processor_no_pandas", str(mpii_path))
-        assert spec is not None and spec.loader is not None
-        mp_proc = importlib.util.module_from_spec(spec)
-        with (
-            patch.dict(sys.modules, {"pandas": stub_pandas, "tqdm": stub_tqdm}),
-            patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector),
-        ):
-            spec.loader.exec_module(mp_proc)
-
-        # Also prove import mpii_processor itself works when pandas/tqdm are not installed in the host Python
-        saved_modules = {k: sys.modules.get(k) for k in ("mpii_processor", "pandas", "tqdm")}
+        saved_modules = {
+            k: sys.modules.pop(k)
+            for k in list(sys.modules)
+            if k == "mpii_processor" or k in ("pandas", "tqdm") or k.startswith(("pandas.", "tqdm."))
+        }
         try:
-            for k in ("mpii_processor", "pandas", "tqdm"):
-                sys.modules.pop(k, None)
             with (
                 patch.object(builtins, "__import__", side_effect=import_without_dataset_deps),
-                patch.dict(sys.modules, {"pandas": stub_pandas, "tqdm": stub_tqdm}),
                 patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector),
             ):
                 import mpii_processor as imported_mp_proc
                 assert imported_mp_proc.extract_gaze_features is gi.extract_gaze_features
+
+                mpii_path = GAZE_DIR / "mpii_processor.py"
+                spec = importlib.util.spec_from_file_location("mpii_processor_no_pandas", str(mpii_path))
+                assert spec is not None and spec.loader is not None
+                mp_proc = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mp_proc)
         finally:
-            for k, orig in saved_modules.items():
-                if orig is None:
+            for k in list(sys.modules):
+                if k == "mpii_processor" or k in ("pandas", "tqdm") or k.startswith(("pandas.", "tqdm.")):
                     sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = orig
+            sys.modules.update(saved_modules)
 
         # Verify mpii_processor reuses the exact same extract_gaze_features function from gaze_intent
         assert mp_proc.extract_gaze_features is gi.extract_gaze_features
@@ -609,6 +597,92 @@ class TestMockedGazeIntentPipeline:
         assert r_lost["detected"] == "0"
         assert r_lost["state"] == "0"
         assert float(r_lost["norm_x"]) == -1.0
+
+    def test_nonfinite_landmarks_pose_and_prediction_rejected_and_recovers(self, mocked_gaze_tracker):
+        tracker, stub = mocked_gaze_tracker
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        ts = 0
+
+        # Non-finite pose matrix directly raises ValueError in get_head_pose_angles
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            bad_pose = make_pose_matrix()
+            bad_pose[1, 2] = bad
+            with pytest.raises(ValueError):
+                get_head_pose_angles(bad_pose)
+        with pytest.raises(ValueError):
+            get_head_pose_angles(np.eye(2, dtype=np.float32))
+
+        # 1. Mid-calibration NaN resets incomplete calibration back to 0
+        for _ in range(10):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.ear_state.current_calibration_frames == 10
+
+        bad_lm = make_synthetic_landmarks()
+        bad_lm[468].x = float("nan")
+        stub.next_landmarks = bad_lm
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+        assert math.isnan(hy) and math.isnan(hp)
+        assert tracker.ear_state.current_calibration_frames == 0
+
+        # Fewer than 478 landmarks -> rejected cleanly without IndexError
+        stub.next_landmarks = make_synthetic_landmarks()[:477]
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+        # Complete full calibration after reset
+        stub.next_landmarks = make_synthetic_landmarks()
+        stub.next_pose = make_pose_matrix()
+        for _ in range(CALIBRATION_FRAMES):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+
+        # 2. Post-calibration valid -> invalid (NaN/+-Inf in landmark, pose, or predictor) -> valid recovery
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is not None and is_valid_output(ay, ap)
+
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            lm_corrupt = make_synthetic_landmarks()
+            lm_corrupt[33].y = bad
+            stub.next_landmarks = lm_corrupt
+            stub.next_pose = make_pose_matrix()
+            ts += 33
+            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+            assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+            stub.next_landmarks = make_synthetic_landmarks()
+            pose_corrupt = make_pose_matrix()
+            pose_corrupt[0, 0] = bad
+            stub.next_pose = pose_corrupt
+            ts += 33
+            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+            assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+        # Model predictor outputting NaN/+Inf is also rejected cleanly
+        class _BadModel:
+            def predict(self, _):
+                return np.array([[float("nan")]], dtype=np.float32)
+
+        orig_yaw_model = tracker.yaw_model
+        tracker.yaw_model = _BadModel()
+        stub.next_landmarks = make_synthetic_landmarks()
+        stub.next_pose = make_pose_matrix()
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+        tracker.yaw_model = orig_yaw_model
+
+        # Valid frame immediately recovers with calibration preserved
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+        assert state == 0 and lms is not None and is_valid_output(ay, ap)
+        assert math.isfinite(hy) and math.isfinite(hp)
 
 
 # ===========================================================================

@@ -1,12 +1,10 @@
 import os
 import cv2
 import numpy as np
-import pandas as pd
 import math
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from tqdm import tqdm
 
 from gaze_intent import extract_gaze_features
 
@@ -84,6 +82,9 @@ def process_mpiigaze(
          which aligns MediaPipe's asymmetric 3D face mesh prior with live selfie capture and reduces
          live vertical Pitch jitter (`Y_SD`) by ~39%.
     """
+    import pandas as pd
+    from tqdm import tqdm
+
     if not os.path.exists(DATASET_PATH):
         print(f"Error: Could not find dataset at {DATASET_PATH}")
         return

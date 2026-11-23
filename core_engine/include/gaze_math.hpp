@@ -63,11 +63,13 @@ namespace core {
     inline std::string formatGazeDiagCsvRow(const GazeDiagRow& d) {
         auto fmtVal = [](char* b, size_t n, double v) -> const char* {
             if (std::isnan(v)) return "nan";
+            if (std::isinf(v)) return v > 0 ? "inf" : "-inf";
             std::snprintf(b, n, "%.9g", v);
             return b;
         };
         char c_cap[32];
         if (std::isnan(d.capture_s)) std::snprintf(c_cap, sizeof c_cap, "nan");
+        else if (std::isinf(d.capture_s)) std::snprintf(c_cap, sizeof c_cap, "%s", d.capture_s > 0 ? "inf" : "-inf");
         else std::snprintf(c_cap, sizeof c_cap, "%.9f", d.capture_s);
 
         char b[27][32];
@@ -121,11 +123,11 @@ namespace core {
         }
 
         // lm: n x 3 floats = kFacePoints landmarks (normalised to the image) + the packed pose matrix (n == kPacked).
-        // n == 0 (or no matrix) means "no face" -> x = y = -1, state 0.
+        // n == 0 (or no matrix, or any non-finite input/intermediate/output) means "no face" -> x = y = -1, state 0.
         ModuleOut process(const float* lm, int n, int W, int H, GazeDiagRow* diag = nullptr) {
             ModuleOut out;
             out.ok = true;
-            if (!lm || n < kPacked) {
+            auto failInvalid = [&]() -> ModuleOut {
                 resetTrackingState();                               // EarFeatureState.reset_tracking_state()
                 markInvalid(out);                                   // x = y = -1, all four angles NaN
                 out.state = 0;
@@ -137,11 +139,21 @@ namespace core {
                     diag->norm_y = -1.0;
                 }
                 return out;
+            };
+
+            if (!lm || n < kPacked || W <= 0 || H <= 0) {
+                return failInvalid();
             }
             const float* pose = lm + 3 * kFacePoints;
+            if (!allFinite(lm, 3 * kFacePoints) || !allFinite(pose, 16)) {
+                return failInvalid();
+            }
 
             const double raw_l = ear(lm, kLeftEye, W, H);
             const double raw_r = ear(lm, kRightEye, W, H);
+            if (!std::isfinite(raw_l) || !std::isfinite(raw_r)) {
+                return failInvalid();
+            }
 
             if (!calibrated_) {                                     // 30-frame blink calibration
                 if (raw_l > kCalibEarEps && raw_r > kCalibEarEps) { // ignore corrupted / zero EAR frames (EarFeatureState.update)
@@ -182,17 +194,7 @@ namespace core {
                 return out;
             }
 
-            const double left = base_l_ > 0 ? raw_l / base_l_ : 0.0;
-            const double right = base_r_ > 0 ? raw_r / base_r_ : 0.0;
-            push(hist_l_, left);
-            push(hist_r_, right);
-            double l_min, l_var, r_min, r_var;
-            rolling(hist_l_, l_min, l_var);                         // over what the window holds so far (np.min / np.var)
-            rolling(hist_r_, r_min, r_var);
-            const float wf[kGazeFeatures] = { float(left), float(l_min), float(l_var), float(right), float(r_min), float(r_var) };
-            out.state = wink_ ? wink_->predict(wf) : 0;
-
-            // iris position, averaged over both eyes
+            // iris position + head pose (validated finite before updating/returning tracked state)
             const double l_ix = irisRatio(lm, 33, 133, 468, true);
             const double r_ix = irisRatio(lm, 362, 263, 473, true);
             const double sx = 0.5 * (l_ix + r_ix);
@@ -202,6 +204,10 @@ namespace core {
 
             double head_pitch, head_yaw, head_roll;
             headPose(pose, head_pitch, head_yaw, head_roll);
+            if (!std::isfinite(sx) || !std::isfinite(sy) ||
+                !std::isfinite(head_pitch) || !std::isfinite(head_yaw) || !std::isfinite(head_roll)) {
+                return failInvalid();
+            }
 
             const float gf[kPoseFeatures] = { float(sx), float(sy), float(head_pitch), float(head_yaw), float(head_roll) };
             const double rel_pitch = pitch_ ? pitch_->predict(gf) : 0.0;
@@ -210,6 +216,20 @@ namespace core {
             // absolute world gaze = eye-in-socket + head (raw absolute values, bypassing EMA to leave filtering to DSP)
             const double abs_pitch = rel_pitch + head_pitch;
             const double abs_yaw = rel_yaw + head_yaw;
+            if (!std::isfinite(rel_pitch) || !std::isfinite(rel_yaw) ||
+                !std::isfinite(abs_pitch) || !std::isfinite(abs_yaw)) {
+                return failInvalid();
+            }
+
+            const double left = base_l_ > 0 ? raw_l / base_l_ : 0.0;
+            const double right = base_r_ > 0 ? raw_r / base_r_ : 0.0;
+            push(hist_l_, left);
+            push(hist_r_, right);
+            double l_min, l_var, r_min, r_var;
+            rolling(hist_l_, l_min, l_var);                         // over what the window holds so far (np.min / np.var)
+            rolling(hist_r_, r_min, r_var);
+            const float wf[kGazeFeatures] = { float(left), float(l_min), float(l_var), float(right), float(r_min), float(r_var) };
+            out.state = wink_ ? wink_->predict(wf) : 0;
 
             setPointer(out, abs_yaw, abs_pitch);
             out.head_yaw_deg = head_yaw;
@@ -289,12 +309,32 @@ namespace core {
             if (!calibrated_) { calib_frames_ = 0; sum_l_ = 0.0; sum_r_ = 0.0; }
         }
 
-        static double clamp01(double v) { return std::max(0.0, std::min(1.0, v)); }
+        static bool allFinite(const float* p, int count) {
+            if (!p || count < 0) return false;
+            for (int i = 0; i < count; ++i) {
+                if (!std::isfinite(p[i])) return false;
+            }
+            return true;
+        }
+        static double clamp01(double v) {
+            if (!std::isfinite(v)) return -1.0;
+            return std::max(0.0, std::min(1.0, v));
+        }
         static void setPointer(ModuleOut& o, double yaw_deg, double pitch_deg) {
+            if (!std::isfinite(yaw_deg) || !std::isfinite(pitch_deg)) {
+                markInvalid(o);
+                return;
+            }
+            const double nx = clamp01(0.5 + yaw_deg / kSpanDeg);
+            const double ny = clamp01(0.5 - pitch_deg / kSpanDeg);
+            if (!std::isfinite(nx) || !std::isfinite(ny) || nx < 0.0 || ny < 0.0) {
+                markInvalid(o);
+                return;
+            }
             o.yaw_deg = yaw_deg;
             o.pitch_deg = pitch_deg;
-            o.x = float(clamp01(0.5 + yaw_deg / kSpanDeg));
-            o.y = float(clamp01(0.5 - pitch_deg / kSpanDeg));
+            o.x = float(nx);
+            o.y = float(ny);
         }
 
         // True 3D distance in pixels (same as Python's _get_3d_dist): MediaPipe's z is scaled like x, i.e. by the frame WIDTH.

@@ -229,6 +229,39 @@ def _pack_hand(result, diag=None, seq: int = 0, ts_ms: int = 0, mode: str = "") 
     return packed
 
 
+_FACE_N = 478           # expected face mesh + iris landmarks
+
+
+def pack_face(face_lms, pose_matrix):
+    """Validate and pack one face + 4x4 pose matrix. Returns (packed (484, 3) float32 or _EMPTY, diag dict).
+    Rejects (returns _EMPTY) unless there are >= 478 landmarks (uses first 478), a 16-element pose matrix,
+    and every landmark/pose entry is finite."""
+    n_face = len(face_lms) if face_lms else 0
+    pose_arr = np.asarray(pose_matrix, dtype=np.float32).reshape(-1) if pose_matrix is not None else np.empty(0, dtype=np.float32)
+    diag = {
+        "has_face": n_face > 0,
+        "has_pose": pose_arr.size > 0,
+        "n_face": n_face,
+        "pose_size": int(pose_arr.size),
+        "packed_n": 0,
+        "valid": False,
+        "reason": "",
+    }
+    if n_face != _FACE_N or pose_arr.size != 16:
+        diag["reason"] = "count"
+        return _EMPTY, diag
+    pts = _to_array(face_lms[:_FACE_N])
+    pose = np.zeros((_POSE_ROWS, 3), dtype=np.float32)
+    pose.reshape(-1)[:16] = pose_arr
+    packed = np.concatenate([pts, pose])
+    if not np.isfinite(packed).all():
+        diag["reason"] = "nonfinite"
+        return _EMPTY, diag
+    diag["packed_n"] = _FACE_N + _POSE_ROWS
+    diag["valid"] = True
+    return packed, diag
+
+
 class FaceLandmarkExtractor:
     """478 face-mesh points (468 mesh + 10 iris) + the head-pose matrix. Same MediaPipe settings as gaze_intent.py."""
 
@@ -249,10 +282,8 @@ class FaceLandmarkExtractor:
         result = self.detector.detect_for_video(mp_image, int(timestamp_ms))
         if not result.face_landmarks or not result.facial_transformation_matrixes:
             return _EMPTY
-        pts = _to_array(result.face_landmarks[0])
-        pose = np.zeros((_POSE_ROWS, 3), dtype=np.float32)
-        pose.reshape(-1)[:16] = np.asarray(result.facial_transformation_matrixes[0], dtype=np.float32).reshape(-1)
-        return np.concatenate([pts, pose])
+        packed, _ = pack_face(result.face_landmarks[0], result.facial_transformation_matrixes[0])
+        return packed
 
     def shutdown(self):
         if getattr(self, "detector", None) is not None:

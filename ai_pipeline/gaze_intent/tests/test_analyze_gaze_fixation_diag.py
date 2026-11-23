@@ -264,9 +264,17 @@ def test_wash_in_and_blink_plus_minus_2_frame_exclusion(tmp_path: Path):
     assert w["exclusions"]["nonneutral"] == 1
     assert w["exclusions"]["blink_pad"] == 4
     # Remaining settled frames: 60 - 15 - 5 = 40 frames, all completely clean and steady
+    # (the 5-frame blink+pad hole leaves a 200ms gap between surviving samples, so pass_gap fails)
     assert w["eligible_frames"] == 40
-    assert w["raw_x"]["pass_all"] is True
-    assert w["raw_y"]["pass_all"] is True
+    assert w["raw_x"]["pass_n"] is True
+    assert w["raw_x"]["pass_sd"] is True
+    assert w["raw_x"]["pass_range"] is True
+    assert w["raw_x"]["pass_slope"] is True
+    assert w["raw_x"]["max_gap_ms"] == pytest.approx(200.0, abs=1.0)
+    assert w["raw_x"]["pass_gap"] is False
+    assert w["raw_x"]["pass_all"] is False
+    assert w["raw_y"]["pass_gap"] is False
+    assert w["raw_y"]["pass_all"] is False
     assert w["raw_x"]["range"] < 1e-6
 
 

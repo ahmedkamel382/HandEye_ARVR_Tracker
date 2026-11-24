@@ -35,7 +35,7 @@ filters when the tray's Smoothing menu changes (`TrayOptions::on_settings_change
 | `app/` | `handeye_tray.exe`: system-tray app, settings, and calibration wizard. |
 | `capi/` | `os_integration_capi.dll`: a plain-C interface to `OsController` (used by the tester). |
 | `tester/` | **HandEye Tester**: `HandEyeTester.exe` + a test-bench UI for every part of the system. |
-| `tests/` | 100 library and tray tests, 9 C-interface tests and a latency benchmark (no GoogleTest needed). |
+| `tests/` | 110 library and tray tests, 10 C-interface tests and a latency benchmark (no GoogleTest needed). |
 
 ### Library files
 
@@ -235,9 +235,9 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Check | Result |
 | --- | --- |
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
-| `os_integration_tests` | 100 / 100 passed |
-| `os_integration_capi_tests` | 9 / 9 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 114 / 114 passed |
+| `os_integration_tests` | 110 / 110 passed |
+| `os_integration_capi_tests` | 10 / 10 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 125 / 125 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |
@@ -334,13 +334,21 @@ Other tools can drive the controller without C++ through `capi/osi_capi.h`
 ## Known limitations and next steps
 
 * **Uncalibrated gaze defaults & live verification (audit finding #1):** on
-  `exp/gaze-e3-e5-joint-candidate`, the stabilized ExtraTrees gaze models,
-  fixed vertical Y sign (`0.5 - |pitch|/60.0`), and centered default
-  `gaze_region` (`[0.25, 0.60, 0.75, 0.80]`) align all four gaze directions
-  with screen axes and place neutral pitch (`y ≈ 0.68–0.72`) inside the active
-  region instead of clamping to the top edge. Run the tray's
-  Calibrate > Gaze range wizard for per-user fit; live cued fixation and
-  wizard verification remain pending before merge to `first-full-working-demo`.
+  `exp/gaze-e3-e5-joint-candidate`, the gaze models, the fixed vertical Y sign
+  (`y = 0.5 - pitch / 60`) and the default `gaze_region`
+  (`[0.25, 0.58, 0.75, 0.82]`) align all four gaze directions with the screen
+  axes and keep a straight-ahead gaze inside the active region. Run the tray's
+  Calibrate > Gaze range wizard for a per-user fit; it saves
+  `gaze_calibrated = true`. Live cued fixation and wizard verification remain
+  pending before merge to `first-full-working-demo`.
+* **Settings saved before the Y-sign fix** are converted on load. A file is from
+  before the fix when it has neither `settings_version` nor `gaze_calibrated`.
+  Then an old placeholder (`0.3 0.3 0.7 0.7`, `0.25 0.25 0.75 0.75` or
+  `0.25 0.60 0.75 0.80`) becomes the current default with
+  `gaze_calibrated = false`, and any other gaze region gets y -> 1 - y (the same
+  pixel for the same pitch) with `gaze_calibrated = true`. New files are written
+  as `settings_version = 2`. An older build reading a version 2 file would map
+  gaze upside down, so do not mix builds from before and after this change.
 * **Gaze accuracy:** the estimate from `gaze_intent.py` is coarse, so gaze
   pointing is best for large targets. Hand pointing is the precise mode.
 * **Elevated windows:** Windows blocks injected input into apps running as

@@ -289,6 +289,26 @@ const std::vector<Field>& fields() {
                                      }, 0.0, 1000.0, true));
         }
 
+        f.push_back({"app", "settings_version",
+                     [](Settings& s, std::string_view text) -> std::string {
+                         text = trim(text);
+                         int value = 0;
+                         const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+                         if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+                             return "expected a whole number";
+                         }
+                         s.app.settings_version = value;
+                         return {};
+                     },
+                     [](const Settings& s) { return std::to_string(s.app.settings_version); },
+                     [](const Settings& s) -> std::string {
+                         if (s.app.settings_version < 1 || s.app.settings_version > kSettingsVersion) {
+                             return "settings_version " + std::to_string(s.app.settings_version) +
+                                    " is not supported by this version (newest: " +
+                                    std::to_string(kSettingsVersion) + ")";
+                         }
+                         return {};
+                     }});
         f.push_back(bool_field("app", "start_active",
                                [](Settings& s) -> bool& { return s.app.start_active; }));
         f.push_back(seconds_field("app", "physical_mouse_yield_seconds",
@@ -374,6 +394,7 @@ SettingsLoadResult parse_settings(std::string_view text) {
     }
     std::string section;
     std::size_t line_number = 0;
+    bool saw_version = false;
     bool saw_gaze_calibrated = false;
     bool saw_gaze_region = false;
     while (!text.empty()) {
@@ -412,6 +433,7 @@ SettingsLoadResult parse_settings(std::string_view text) {
                                       std::string(key));
             continue;
         }
+        saw_version = saw_version || (section == "app" && key == "settings_version");
         Settings candidate = result.settings;
         std::string problem = field->parse(candidate, value);
         if (problem.empty()) {
@@ -429,17 +451,35 @@ SettingsLoadResult parse_settings(std::string_view text) {
         }
         result.settings = candidate;
     }
-    // Safe legacy INI migration: upgrade old uncalibrated placeholder gaze regions to the current default,
-    // while preserving custom calibrated user regions when gaze_calibrated was not yet written.
-    if (result.error.empty() && !saw_gaze_calibrated && saw_gaze_region) {
-        const InputRegion& default_gaze = MappingSettings{}.gaze_region;
-        if (is_legacy_placeholder_gaze_region(result.settings.mapping.gaze_region) ||
-            same_region(result.settings.mapping.gaze_region, default_gaze)) {
-            result.settings.mapping.gaze_region = default_gaze;
-            result.settings.mapping.gaze_calibrated = false;
-        } else {
-            result.settings.mapping.gaze_calibrated = true;
+    // Which gaze Y convention the file was saved in. settings_version says so directly. Without it, a file that
+    // has gaze_calibrated came from a build after the Y-sign fix (version 2); anything else is from before (1).
+    const int version = saw_version ? result.settings.app.settings_version : (saw_gaze_calibrated ? 2 : 1);
+    if (result.error.empty() && saw_gaze_region) {
+        InputRegion& gaze = result.settings.mapping.gaze_region;
+        const InputRegion default_gaze = MappingSettings{}.gaze_region;
+        if (version < 2) {
+            if (is_legacy_placeholder_gaze_region(gaze)) {
+                gaze = default_gaze;
+                result.settings.mapping.gaze_calibrated = false;
+                result.migrated = "gaze_region was an old placeholder; the current default is used";
+            } else {
+                gaze.y_min = 1.0 - gaze.y_min; // same pixels for the same pitch under the corrected Y sign
+                gaze.y_max = 1.0 - gaze.y_max;
+                result.settings.mapping.gaze_calibrated = true;
+                result.migrated = "gaze_region was converted to the corrected vertical direction";
+            }
+        } else if (!result.settings.mapping.gaze_calibrated) {
+            // Current convention, not marked calibrated (false, or not written yet): a placeholder or the default is
+            // not a calibration. A custom region without the flag was fitted before the flag existed.
+            if (is_legacy_placeholder_gaze_region(gaze) || same_region(gaze, default_gaze)) {
+                gaze = default_gaze;
+            } else if (!saw_gaze_calibrated) {
+                result.settings.mapping.gaze_calibrated = true;
+            }
         }
+    }
+    if (result.error.empty()) {
+        result.settings.app.settings_version = kSettingsVersion;
     }
     return result;
 }

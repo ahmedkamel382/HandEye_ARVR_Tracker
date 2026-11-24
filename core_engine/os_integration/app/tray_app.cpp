@@ -190,6 +190,9 @@ bool TrayApp::initialize() {
     for (const auto& warning : loaded.warnings) {
         AppLog::warn("settings: " + warning);
     }
+    if (!loaded.migrated.empty()) {
+        AppLog::info("settings from an older version: " + loaded.migrated + " (saved with the next change)");
+    }
     settings_ = loaded.settings;
     if (!std::filesystem::exists(options_.settings_path)) {
         std::string error;

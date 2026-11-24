@@ -1062,7 +1062,8 @@ int main() {
     });
     // ---- R1: settings files ----
     run_test("settings_accept_utf8_bom", [] {
-        const auto loaded = parse_settings("\xEF\xBB\xBF[mapping]\ngaze_region = 0.71 0.33 0.29 0.08\n");
+        const auto loaded =
+            parse_settings("\xEF\xBB\xBF[mapping]\ngaze_region = 0.71 0.33 0.29 0.08\n[app]\nsettings_version = 2\n");
         require(loaded.warnings.empty(), "byte-order mark rejected");
         require_region(loaded.settings.mapping.gaze_region, {0.71, 0.33, 0.29, 0.08}, 1e-12);
     });
@@ -1519,6 +1520,48 @@ int main() {
     run_test("tray_invalid_reload_keeps_running_settings", osi_tray_tests::invalid_reload_keeps_running_settings);
 #endif
 
+    // ================================================================ settings written before the gaze Y-sign fix
+    // Version 1 files map y = 0.5 + pitch/60; version 2 maps y = 0.5 - pitch/60, so y_old = 1 - y_new.
+    run_test("settings_v1_placeholder_gaze_region_becomes_the_new_default", [] {
+        const auto loaded = parse_settings("[mapping]\ngaze_region = 0.3 0.3 0.7 0.7\n");
+        require(loaded.error.empty(), "old default rejected: " + loaded.error);
+        require_region(loaded.settings.mapping.gaze_region, Settings{}.mapping.gaze_region, 1e-12);
+        require(!loaded.migrated.empty(), "migration not reported");
+    });
+    run_test("settings_v1_calibrated_gaze_region_keeps_its_screen_mapping", [] {
+        // A region calibrated under the old sign: the same physical gaze must land on the same pixel.
+        const InputRegion old_region{0.62, 0.21, 0.36, 0.33};
+        const auto loaded = parse_settings("[mapping]\ngaze_region = 0.62 0.21 0.36 0.33\n");
+        const ScreenMapper mapper(kFullHd);
+        for (const double pitch : {-20.0, -13.0, -5.0, 3.0}) {
+            const double old_y = 0.5 + pitch / 60.0;
+            const double new_y = 0.5 - pitch / 60.0;
+            const PixelPoint before = mapper.map(old_region, {0.5, old_y});
+            const PixelPoint after = mapper.map(loaded.settings.mapping.gaze_region, {0.5, new_y});
+            require(before == after, "pitch " + std::to_string(pitch) + ": " + str(before) + " became " + str(after));
+        }
+    });
+    run_test("settings_v2_files_are_not_converted_again", [] {
+        Settings calibrated;
+        calibrated.mapping.gaze_region = {0.71, 0.28, 0.29, 0.62};
+        const std::string text = serialize_settings(calibrated);
+        require(text.find("settings_version = 2") != std::string::npos, "version not written");
+        for (int round = 0; round < 3; ++round) {
+            const auto loaded = parse_settings(text);
+            require(loaded.migrated.empty(), "a current file was converted");
+            require_region(loaded.settings.mapping.gaze_region, calibrated.mapping.gaze_region, 1e-12);
+        }
+    });
+    run_test("settings_v1_without_gaze_region_uses_the_new_default", [] {
+        const auto loaded = parse_settings("[mapping]\nhand_region = 0.1 0.1 0.9 0.9\n");
+        require_region(loaded.settings.mapping.gaze_region, Settings{}.mapping.gaze_region, 1e-12);
+        require_region(loaded.settings.mapping.hand_region, {0.1, 0.1, 0.9, 0.9}, 1e-12);
+    });
+    run_test("settings_from_a_newer_version_are_refused", [] {
+        const auto loaded = parse_settings("[app]\nsettings_version = 3\n");
+        require(!loaded.error.empty(), "a file from a newer version was accepted");
+    });
+
     // ================================================================ E3 + E5 joint gaze contract
     run_test("joint_default_gaze_region_avoids_edge_pinning_and_preserves_directions", [] {
         const Settings defaults;
@@ -1598,11 +1641,22 @@ int main() {
             require_region(loaded.settings.mapping.gaze_region, defaults.mapping.gaze_region, 1e-9);
         }
 
-        // Legacy INI with a custom fitted region (no gaze_calibrated key) stays calibrated=true.
+        // A custom fitted region with neither settings_version nor gaze_calibrated was saved before the Y-sign fix:
+        // it stays calibrated and is converted to the new convention (y -> 1 - y, same pixels for the same pitch).
         const auto custom = parse_settings("[mapping]\ngaze_region = 0.20 0.63 0.80 0.81\n");
         require(custom.warnings.empty(), "custom legacy INI generated warnings");
         require(custom.settings.mapping.gaze_calibrated, "legacy custom region lost calibrated flag");
-        require_region(custom.settings.mapping.gaze_region, {0.20, 0.63, 0.80, 0.81}, 1e-9);
+        require_region(custom.settings.mapping.gaze_region, {0.20, 0.37, 0.80, 0.19}, 1e-9);
+
+        // The same region saved by a build that already wrote gaze_calibrated is in the new convention: unchanged.
+        const auto current = parse_settings("[mapping]\ngaze_region = 0.20 0.63 0.80 0.81\ngaze_calibrated = true\n");
+        require(current.settings.mapping.gaze_calibrated, "calibrated flag lost");
+        require_region(current.settings.mapping.gaze_region, {0.20, 0.63, 0.80, 0.81}, 1e-9);
+
+        // Marked not calibrated but still holding an old placeholder: the current default applies.
+        const auto stale = parse_settings("[mapping]\ngaze_region = 0.3 0.3 0.7 0.7\ngaze_calibrated = false\n");
+        require(!stale.settings.mapping.gaze_calibrated, "placeholder marked calibrated");
+        require_region(stale.settings.mapping.gaze_region, defaults.mapping.gaze_region, 1e-9);
 
         // Explicit gaze_calibrated = true preserves even a region matching a placeholder.
         Settings explicit_cal;

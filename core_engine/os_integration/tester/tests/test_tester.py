@@ -1249,3 +1249,8 @@ def test_osi_capi_rejects_nonfinite_tracker_points_and_recovers(lib, bad):
         c.close()
 
 
+def test_old_placeholder_gaze_region_counts_as_uncalibrated(lib):
+    old = IniDoc(lib.default_settings_ini())
+    old.lines = [line for line in old.lines if not line.startswith("settings_version")]
+    old.set("mapping", "gaze_region", "0.3 0.3 0.7 0.7")
+    assert gaze_is_uncalibrated(old.text(), lib.default_settings_ini())

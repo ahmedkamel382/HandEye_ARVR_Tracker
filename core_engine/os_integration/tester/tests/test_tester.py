@@ -1050,3 +1050,83 @@ def test_middle_click_counts_in_the_accuracy_test(make_app, monkeypatch):
                    counters=tester_engine.Counters(middle_click=1))
     app._update_screen(snap)
     assert seen == [True]
+
+
+# ---------------------------------------------------------------- real mouse: gestures may pause, never resume
+
+class ClosedEyes:
+    """Eyes closed for the whole test (gaze state 3 = sustained closure)."""
+
+    def process(self, frame):
+        return GazeObs(point=(0.5, 0.5), state=3, face=True)
+
+    def close(self):
+        pass
+
+
+class Fist:
+    def process(self, frame):
+        return HandObs(point=(0.5, 0.5), state=2, tracking=TRACKED, status="DETECTED")
+
+    def close(self):
+        pass
+
+
+def run_for(engine, state, config, cv2, seconds):
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        time.sleep(0.015)
+        engine._step(state, config, cv2)
+
+
+def start_paused(state, config, active=False):
+    state.config = config
+    state.controller.set_active(active)
+    state.last_report = osi_capi.Report(active=active)
+
+
+@pytest.mark.parametrize("clicks", [True, False])
+def test_real_mouse_eye_closure_never_switches_output_on(worker, monkeypatch, clicks):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True, clicks=clicks)   # record-only controller: no real output
+    start_paused(state, config)
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)                         # closure onset is 1.0 s
+    assert not state.last_report.active
+
+
+def test_real_mouse_eye_closure_still_pauses(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True)
+    start_paused(state, config, active=True)                         # switched on with Activate
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active
+
+
+def test_simulation_eye_closure_still_resumes(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    config = replace(state.config, real_mouse=False)
+    start_paused(state, config)
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert state.last_report.active
+
+
+def test_real_mouse_fist_toggle_never_switches_output_on(worker, monkeypatch, lib):
+    engine, state, log, cv2 = worker("hand")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    doc = IniDoc(lib.default_settings_ini())
+    doc.set("gestures", "fist_action", "toggle_pause")
+    assert state.controller.apply_settings(doc.text()) is None
+    state.zone = IniDoc(doc.text())
+    config = replace(state.config, real_mouse=True)
+    start_paused(state, config)
+    state.hand = Fist()
+    run_for(engine, state, config, cv2, 0.8)                         # fist onset is 0.3 s
+    assert not state.last_report.active

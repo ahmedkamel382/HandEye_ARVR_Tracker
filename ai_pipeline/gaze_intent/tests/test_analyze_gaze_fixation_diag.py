@@ -881,3 +881,204 @@ def test_strict_protocol_wash_in_restarts_after_blink_or_gap(tmp_path: Path):
     assert w_str["raw_x"]["range"] < 1e-6
 
 
+def test_build_gaze_capture_command_optional_camera_mode():
+    exe = Path("C:/exe/core_engine.exe")
+    dsp = Path("C:/run/dsp_record")
+    diag = Path("C:/run/gaze_diag.csv")
+
+    base_cmd = ANALYZER.build_gaze_capture_command(exe, dsp, diag, 0, 50)
+    assert "--width" not in base_cmd
+    assert "--height" not in base_cmd
+    assert "--fps" not in base_cmd
+
+    hi_cmd = ANALYZER.build_gaze_capture_command(
+        exe, dsp, diag, 1, 45, width=1280, height=720, fps=60.0
+    )
+    assert hi_cmd[hi_cmd.index("--camera") + 1] == "1"
+    assert hi_cmd[hi_cmd.index("--width") + 1] == "1280"
+    assert hi_cmd[hi_cmd.index("--height") + 1] == "720"
+    assert hi_cmd[hi_cmd.index("--fps") + 1] == "60"
+
+    with pytest.raises(ValueError, match="--width"):
+        ANALYZER.build_gaze_capture_command(exe, dsp, diag, 0, 45, width=0)
+    with pytest.raises(ValueError, match="--height"):
+        ANALYZER.build_gaze_capture_command(exe, dsp, diag, 0, 45, height=-480)
+    with pytest.raises(ValueError, match="--fps"):
+        ANALYZER.build_gaze_capture_command(exe, dsp, diag, 0, 45, fps=0.0)
+
+
+def test_cued_capture_startup_delay_and_calibration_duration_do_not_shift_schedule(tmp_path: Path):
+    """Regression for ~3s pipe-buffer / startup-latency offset when first_frame_capture_s=2.2s and calib=2.0s."""
+    run_dir = tmp_path / "startup_calib_sync_run"
+    fake_exe = tmp_path / "fake_core_engine.exe"
+    fake_exe.write_text("stub", encoding="utf-8")
+
+    # Simulated core_engine timeline (relative to P.t0 = 0.0):
+    # - 0.0..2.2s: AI/MediaPipe init (no captured frames)
+    # - 2.2..4.2s: 30 calibration frames at ~15 FPS (state=-1)
+    # - 4.2..11.2s: active frames at 15 FPS; calib_ready fires on 2nd active status (~6.2s capture_s)
+    # - CENTER planned at [7.2, 9.2), LEFT at [9.7, 11.7)
+    seed_dir = tmp_path / "_seed_sync"
+    frames: List[Dict[str, Any]] = []
+    dt = 1.0 / 15.0
+    for i in range(30):
+        frames.append({"t_s": 2.2 + i * dt, "state": -1, "sx": 0.50, "sy": 0.0})
+    t_s = 4.2
+    while t_s < 14.0:
+        if 9.5 <= t_s < 12.2:
+            frames.append({"t_s": t_s, "state": 0, "sx": 0.38, "sy": 0.0, "head_yaw_deg": -10.0})
+        else:
+            frames.append({"t_s": t_s, "state": 0, "sx": 0.50, "sy": 0.0, "head_yaw_deg": 0.0})
+        t_s += dt
+    _write_synthetic_run(seed_dir, frames, y_sign_mult=-1.0)
+    trace_text = (seed_dir / "trace.txt").read_text(encoding="utf-8")
+    diag_text = (seed_dir / "gaze_diag.csv").read_text(encoding="utf-8")
+
+    helper = tmp_path / "delayed_startup_engine.py"
+    helper.write_text(
+        f"""
+import signal, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+assert args[args.index('--width') + 1] == '1280'
+assert args[args.index('--height') + 1] == '720'
+assert args[args.index('--fps') + 1] == '60'
+dsp_dir = Path(args[args.index('--dsp-record-dir') + 1])
+diag_csv = Path(args[args.index('--gaze-diag-log') + 1])
+dsp_dir.mkdir(parents=False, exist_ok=False)
+
+stop = False
+def _on_sig(signum, frame):
+    global stop
+    stop = True
+signal.signal(signal.SIGINT, _on_sig)
+if hasattr(signal, 'SIGBREAK'):
+    signal.signal(signal.SIGBREAK, _on_sig)
+
+# Pre-t0 camera measureFps delay (0.4s), then P.t0 starts here:
+time.sleep(0.4)
+p_t0 = time.monotonic()
+
+# Simulate Windows pipe buffering of OS: line before AI init completes:
+sys.stdout.write("OS: OS integration (dry run, mouse untouched). Starts PAUSED\\n")
+
+# AI startup latency = 2.2s, plus 1.0s before first 1Hz status flush (so first flush at P.t0 + 3.2s):
+status_points = [
+    (3.2, -1, 15),   # t=3.2s, still calibrating (frame 14 -> capture_s ~ 3.13s)
+    (4.2, 0,  31),   # t=4.2s, first active frame (#30) -> previous_valid=True
+    (5.2, 0,  46),   # t=5.2s, second active frame -> calib_ready fires (~5.2s)
+    (6.55, 0, 62),   # single noisy +0.3s scheduler jitter sample; outlier filter must keep trace_status_sync!
+    (7.2, 0,  76),
+    (8.2, 0,  91),
+    (9.2, 0,  106),
+    (10.2, 0, 121),
+    (11.2, 0, 136),
+]
+for dt_target, st, os_f in status_points:
+    while not stop and (time.monotonic() - p_t0) < dt_target:
+        time.sleep(0.01)
+    if stop:
+        break
+    sys.stdout.write(
+        f"cap  15 | ai  15 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | "
+        f"evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.50 s={{st}}) hand(0.00,0.00 s=0) | os frames {{os_f}}\\n"
+    )
+    sys.stdout.flush()
+
+deadline = time.monotonic() + 3.0
+while not stop and time.monotonic() < deadline:
+    time.sleep(0.01)
+
+(dsp_dir / "trace.txt").write_text({trace_text!r}, encoding="utf-8")
+(dsp_dir / "COMPLETE").write_text("ok\\n", encoding="utf-8")
+diag_csv.write_text({diag_text!r}, encoding="utf-8")
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    real_popen = ANALYZER.subprocess.Popen
+
+    def _spawn_helper(cmd: List[str], **kwargs: Any):
+        return real_popen([sys.executable, str(helper), *cmd[1:]], **kwargs)
+
+    with mock.patch.object(ANALYZER.subprocess, "Popen", side_effect=_spawn_helper):
+        rc = ANALYZER.main([
+            "--cued-capture",
+            "--exe", str(fake_exe),
+            "--run-dir", str(run_dir),
+            "--width", "1280",
+            "--height", "720",
+            "--fps", "60",
+            "--targets", "CENTER,LEFT",
+            "--hold-s", "2.5",
+            "--gap-s", "0.8",
+            "--no-audio",
+            "--yes",
+        ])
+
+    assert rc == 0
+    sched = json.loads((run_dir / "cued_schedule.json").read_text(encoding="utf-8"))
+    assert sched["time_sync_method"] == "trace_status_sync"
+    assert sched["width"] == 1280
+    assert sched["height"] == 720
+    assert sched["fps"] == 60.0
+    assert sched["first_frame_capture_s"] == pytest.approx(2.2, abs=0.05)
+    # calib_ready_s must sit near actual status #3 capture_s (~5.2s), NOT shifted by -3.2s or +2.2s
+    assert 4.9 <= sched["calib_ready_s"] <= 5.6
+
+    by_name = {t["name"]: t for t in sched["targets"]}
+    assert by_name["CENTER"]["target_start_s"] == pytest.approx(sched["calib_ready_s"] + 1.0, abs=0.1)
+    assert by_name["LEFT"]["target_start_s"] == pytest.approx(sched["calib_ready_s"] + 4.3, abs=0.1)
+
+    rep = json.loads((run_dir / "gaze_attribution_report.json").read_text(encoding="utf-8"))
+    assert rep["integrity"]["alignment_ok"] is True
+    wins = {w["window"]: w for w in rep["windows"]}
+    assert wins["CENTER"]["raw_x"]["pass_all"] is True
+    assert wins["LEFT"]["raw_x"]["pass_all"] is True
+    assert wins["LEFT"]["raw_x"]["mean"] < 0.25  # caught the shifted LEFT segment cleanly
+
+
+def test_cue_speaker_persistent_worker_single_spawn_and_cleanup():
+    # Disabled speaker must never spawn subprocesses
+    off_speaker = ANALYZER._CueSpeaker(enabled=False)
+    with mock.patch.object(ANALYZER.subprocess, "Popen") as popen_off:
+        off_speaker.start()
+        off_speaker.speak("Left")
+        off_speaker.close()
+    popen_off.assert_not_called()
+
+    if ANALYZER.os.name != "nt":
+        return
+
+    written_chunks: List[str] = []
+
+    class _RecordingStringIO(io.StringIO):
+        def write(self, s: str) -> int:
+            written_chunks.append(s)
+            return super().write(s)
+
+    fake_stdin = _RecordingStringIO()
+    fake_proc = mock.MagicMock()
+    fake_proc.stdin = fake_stdin
+    fake_proc.stdout = io.StringIO("WARM\n")
+    fake_proc.poll.return_value = None
+
+    with mock.patch.object(ANALYZER.subprocess, "Popen", return_value=fake_proc) as popen_on:
+        speaker = ANALYZER._CueSpeaker(enabled=True)
+        speaker.speak("Hold center for calibration.")  # buffered until WARM arrives
+        speaker.start()
+        speaker._thread.join(timeout=2)
+        speaker.speak("Ready.")
+        speaker.speak("Left")
+        speaker.speak("Right")
+        speaker.close()
+
+    assert popen_on.call_count == 1
+    assert fake_stdin.closed
+    lines = [ln for ln in "".join(written_chunks).splitlines() if ln]
+    assert lines == ["Hold center for calibration.", "Ready.", "Left", "Right", "__EXIT__"]
+    fake_proc.wait.assert_called_once()
+
+
+

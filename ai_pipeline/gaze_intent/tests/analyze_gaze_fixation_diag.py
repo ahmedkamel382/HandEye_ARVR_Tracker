@@ -386,8 +386,12 @@ def build_gaze_capture_command(
     diag_csv: Path,
     camera: int,
     seconds: int,
+    *,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[float] = None,
 ) -> List[str]:
-    return [
+    cmd = [
         str(exe),
         "--camera", str(camera),
         "--filter", "dsp",
@@ -398,6 +402,23 @@ def build_gaze_capture_command(
         "--dsp-record-dir", str(dsp_record_dir),
         "--gaze-diag-log", str(diag_csv),
     ]
+    if width is not None:
+        w = int(width)
+        if w <= 0:
+            raise ValueError(f"--width must be > 0, got {width}")
+        cmd.extend(["--width", str(w)])
+    if height is not None:
+        h = int(height)
+        if h <= 0:
+            raise ValueError(f"--height must be > 0, got {height}")
+        cmd.extend(["--height", str(h)])
+    if fps is not None:
+        fps_f = float(fps)
+        if not math.isfinite(fps_f) or fps_f <= 0.0:
+            raise ValueError(f"--fps must be finite and > 0, got {fps}")
+        fps_str = str(int(fps_f)) if fps_f.is_integer() else f"{fps_f:g}"
+        cmd.extend(["--fps", fps_str])
+    return cmd
 
 
 def _extract_trace_capture_times(trace_path: Path) -> List[float]:
@@ -426,8 +447,13 @@ def _resolve_capture_epoch_mono(
         if 1 <= os_frames <= len(trace_times)
     ]
     tail = cands[1:] if len(cands) >= 3 else cands
-    if len(tail) >= 2 and (max(tail) - min(tail)) <= 0.25:
-        return float(np.median(tail)), "trace_status_sync"
+    if len(tail) >= 2:
+        med = float(np.median(tail))
+        inliers = [c for c in tail if abs(c - med) <= 0.25]
+        if len(inliers) >= 2 and len(inliers) * 2 >= len(tail):
+            return float(np.median(inliers)), "trace_status_sync"
+    if len(cands) == 1:
+        return float(cands[0]), "trace_status_sync_single"
     fallback = epoch_mono if epoch_mono is not None else launch_mono
     return fallback, "console_os_fallback"
 
@@ -1260,9 +1286,126 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+class _CueSpeaker:
+    """Persistent pre-warmed Windows SAPI speech worker for sub-50ms target audio cues."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled and os.name == "nt")
+        self._proc: Optional[subprocess.Popen[str]] = None
+        self._ready = threading.Event()
+        self._lock = threading.Lock()
+        self._pending: Optional[str] = None
+        self._closed = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not self.enabled or self._proc is not None:
+            return
+        try:
+            ps = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            script = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                "$s.Rate = 3; "
+                "$s.Speak(''); "
+                "Write-Output 'WARM'; "
+                "[Console]::Out.Flush(); "
+                "while ($null -ne ($line = [Console]::In.ReadLine())) { "
+                "  if ($line -eq '__EXIT__') { break } "
+                "  $s.SpeakAsyncCancelAll(); "
+                "  $null = $s.SpeakAsync($line); "
+                "} "
+                "$s.SpeakAsyncCancelAll(); "
+                "$s.Dispose()"
+            )
+            self._proc = subprocess.Popen(
+                [str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self._thread = threading.Thread(target=self._wait_warm, daemon=True)
+            self._thread.start()
+        except Exception:
+            self._proc = None
+
+    def _wait_warm(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                if line.strip() == "WARM":
+                    self._ready.set()
+                    with self._lock:
+                        pending = self._pending
+                        self._pending = None
+                    if pending and not self._closed:
+                        self._write_line(pending)
+                    break
+        except Exception:
+            pass
+
+    def _write_line(self, text: str) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None or proc.poll() is not None:
+            return
+        clean = text.replace("\r", " ").replace("\n", " ").strip()
+        if not clean:
+            return
+        try:
+            proc.stdin.write(clean + "\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
+
+    def speak(self, text: str) -> None:
+        if not self.enabled or self._closed:
+            return
+        if self._ready.is_set():
+            with self._lock:
+                self._write_line(text)
+        else:
+            with self._lock:
+                self._pending = text
+
+    def close(self) -> None:
+        self._closed = True
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None and proc.poll() is None:
+                proc.stdin.write("__EXIT__\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+
 def _speak_cue_async(text: str, enabled: bool) -> None:
     if not enabled or os.name != "nt":
         return
+
     def _worker() -> None:
         try:
             ps = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -1270,6 +1413,7 @@ def _speak_cue_async(text: str, enabled: bool) -> None:
             cmd = (
                 "Add-Type -AssemblyName System.Speech; "
                 "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                "$s.Rate = 3; "
                 f"$s.Speak('{safe_txt}'); $s.Dispose()"
             )
             subprocess.run(
@@ -1279,6 +1423,7 @@ def _speak_cue_async(text: str, enabled: bool) -> None:
             )
         except Exception:
             pass
+
     threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -1295,6 +1440,9 @@ def run_cued_capture(
     yes: bool,
     readiness_timeout_s: float = 30.0,
     dsp_record_dir: Optional[Path] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    fps: Optional[float] = None,
 ) -> Path:
     run_dir = run_dir.resolve()
     diag_csv = diag_csv.resolve()
@@ -1318,7 +1466,9 @@ def run_cued_capture(
             "DSP recorder capacity at 60 FPS.",
             flush=True,
         )
-    cmd = build_gaze_capture_command(exe, dsp_dir, diag_csv, camera, seconds)
+    cmd = build_gaze_capture_command(
+        exe, dsp_dir, diag_csv, camera, seconds, width=width, height=height, fps=fps
+    )
 
     print(f"This command WILL open camera {camera} in safe --os log --no-hand --filter dsp mode (NO mouse control).")
     print("Command:", " ".join(cmd))
@@ -1334,6 +1484,9 @@ def run_cued_capture(
     diag_parent = diag_csv.parent
     if diag_parent != dsp_dir and dsp_dir not in diag_parent.parents:
         diag_parent.mkdir(parents=True, exist_ok=True)
+
+    speaker = _CueSpeaker(enabled=audio)
+    speaker.start()
 
     clock = time.monotonic
     launch_mono = clock()
@@ -1386,8 +1539,12 @@ def run_cued_capture(
         if gate.feed(line, rx_time):
             if epoch_mono is None:
                 epoch_mono = (gate.first_status_time - 1.0) if gate.first_status_time is not None else launch_mono
-            print(f"[Cued Capture] Calibration ready at capture_s~={gate.calib_ready_time - epoch_mono:.2f}s", flush=True)
-            _speak_cue_async("Calibration ready.", audio)
+            print(
+                f"[Cued Capture] Calibration ready (+{gate.calib_ready_time - launch_mono:.2f}s since launch); "
+                "starting target cues...",
+                flush=True,
+            )
+            speaker.speak("Ready.")
 
     def _drain_inbox() -> None:
         while True:
@@ -1398,14 +1555,13 @@ def run_cued_capture(
             _handle_line(line, rx_time)
 
     print("[Cued Capture] Hold steady neutral gaze for initial calibration...", flush=True)
-    _speak_cue_async("Hold still facing center for calibration.", audio)
+    speaker.speak("Hold center for calibration.")
 
     try:
         while proc.poll() is None:
             now = clock()
             _drain_inbox()
 
-            t_base_live = epoch_mono if epoch_mono is not None else launch_mono
             if gate.calib_ready_time is None:
                 if now - launch_mono > readiness_timeout_s:
                     raise RuntimeError("Timed out waiting for live calibrated gaze readiness (state=0)")
@@ -1415,10 +1571,12 @@ def run_cued_capture(
                     item = plan[next_idx]
                     if rel_ready >= item["offset_from_ready_start_s"]:
                         active_idx = next_idx
-                        t_start_s = now - t_base_live
                         msg = f"Look at {item['name']} and hold still."
-                        print(f"[CUE START t={t_start_s:.2f}s] {msg}", flush=True)
-                        _speak_cue_async(f"Look {item['name'].lower()}.", audio)
+                        print(
+                            f"[CUE START +{rel_ready:.2f}s from ready | wall=+{now - launch_mono:.2f}s] {msg}",
+                            flush=True,
+                        )
+                        speaker.speak(item["name"].capitalize())
                         raw_targets.append({
                             "name": item["name"],
                             "start_mono": now,
@@ -1427,15 +1585,18 @@ def run_cued_capture(
                 elif active_idx is not None:
                     item = plan[active_idx]
                     if rel_ready >= item["offset_from_ready_end_s"]:
-                        t_end_s = now - t_base_live
                         raw_targets[active_idx]["end_mono"] = now
-                        print(f"[CUE END   t={t_end_s:.2f}s] Done {item['name']}.", flush=True)
+                        print(
+                            f"[CUE END   +{rel_ready:.2f}s from ready | wall=+{now - launch_mono:.2f}s] "
+                            f"Done {item['name']}.",
+                            flush=True,
+                        )
                         active_idx = None
                         next_idx += 1
                         if next_idx >= len(plan):
                             all_targets_done_at = now
                             print("[Cued Capture] All targets complete; finishing capture cleanly...", flush=True)
-                            _speak_cue_async("All targets complete.", audio)
+                            speaker.speak("Complete.")
                 elif all_targets_done_at is not None and not stop_sent and (now - all_targets_done_at) >= 1.5:
                     stop_sent = True
                     sig = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT) if os.name == "nt" else signal.SIGINT
@@ -1465,6 +1626,7 @@ def run_cued_capture(
                 proc.stdout.close()
             except Exception:
                 pass
+        speaker.close()
 
     tail_list = list(console_tail)
     if proc.returncode != 0:
@@ -1474,6 +1636,7 @@ def run_cued_capture(
 
     trace_times = _extract_trace_capture_times(dsp_dir / "trace.txt")
     t_base, sync_method = _resolve_capture_epoch_mono(status_samples, trace_times, epoch_mono, launch_mono)
+    calib_ready_s = round(gate.calib_ready_time - t_base, 4)
     scheduled_targets = [
         {
             "name": t["name"],
@@ -1487,15 +1650,29 @@ def run_cued_capture(
         "command": cmd,
         "dsp_record_dir": str(dsp_dir),
         "diag_csv": str(diag_csv),
+        "camera": camera,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "audio_cues_enabled": bool(audio),
         "time_sync_method": sync_method,
+        "first_frame_capture_s": round(float(trace_times[0]), 4) if trace_times else None,
         "gaze_filter": GAZE_FILTER_SPEC,
         "wash_in_s": DEFAULT_CUED_WASH_IN_S,
         "blink_pad_frames": DEFAULT_BLINK_PAD_FRAMES,
-        "calib_ready_s": round(gate.calib_ready_time - t_base, 4),
+        "calib_ready_s": calib_ready_s,
         "targets": scheduled_targets,
     }
     sched_path = run_dir / "cued_schedule.json"
     sched_path.write_text(json.dumps(schedule_payload, indent=2), encoding="utf-8")
+    wins_summary = ", ".join(
+        f"{t['name']}=[{t['target_start_s']:.3f}, {t['target_end_s']:.3f})"
+        for t in scheduled_targets
+    )
+    print(
+        f"[Cued Capture] Synced schedule ({sync_method}): calib_ready_s={calib_ready_s:.4f}s | {wins_summary}",
+        flush=True,
+    )
     return sched_path
 
 
@@ -1522,6 +1699,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--cued-capture", action="store_true", help="Launch safe cued core_engine.exe capture (--os log --no-hand --filter dsp) then analyze")
     ap.add_argument("--exe", type=Path, default=DEFAULT_ENGINE_EXE, help="Path to core_engine.exe for --cued-capture")
     ap.add_argument("--camera", type=int, default=0, help="Camera index for --cued-capture")
+    ap.add_argument("--width", type=int, default=None, help="Optional camera capture width for --cued-capture (forwarded to core_engine.exe)")
+    ap.add_argument("--height", type=int, default=None, help="Optional camera capture height for --cued-capture (forwarded to core_engine.exe)")
+    ap.add_argument("--fps", type=float, default=None, help="Optional camera capture FPS for --cued-capture (forwarded to core_engine.exe)")
     ap.add_argument("--targets", type=str, default=",".join(DEFAULT_CUED_TARGETS), help="Comma-separated cued targets")
     ap.add_argument("--hold-s", type=float, default=10.0, help="Seconds per cued target (default: 10.0)")
     ap.add_argument("--gap-s", type=float, default=2.0, help="Transition gap seconds between targets (default: 2.0)")
@@ -1533,6 +1713,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error("Specify either --windows or --auto-windows, not both.")
     if args.blink_pad_frames < 0:
         ap.error("--blink-pad-frames must be >= 0")
+    if args.width is not None and args.width <= 0:
+        ap.error("--width must be > 0")
+    if args.height is not None and args.height <= 0:
+        ap.error("--height must be > 0")
+    if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0.0):
+        ap.error("--fps must be > 0")
 
     run_dir = args.run_dir.resolve()
     out_json = (args.out_json or (run_dir / "gaze_attribution_report.json")).resolve()
@@ -1556,6 +1742,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             gap_s=args.gap_s,
             audio=not args.no_audio,
             yes=args.yes,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
         )
 
     resolved_dsp_dir, resolved_diag_csv, auto_sched_path = resolve_run_paths(

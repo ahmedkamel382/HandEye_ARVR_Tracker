@@ -55,6 +55,7 @@ MODES: Dict[str, Mode] = {m.key: m for m in [
 ]}
 
 HAND_STATES = {0: "neutral", 1: "pinch", 2: "fist"}
+HAND_FIST, EYES_CLOSED = 2, 3
 EYE_STATES = {-1: "calibrating", 0: "neutral", 1: "left wink", 2: "right wink", 3: "eyes closed"}
 TRACKING_NAMES = {osi_capi.TRACKED: "tracked", osi_capi.HELD: "held", osi_capi.LOST: "lost"}
 
@@ -796,17 +797,25 @@ class TesterEngine:
 
         # Inputs for Engineer 5's OsController: always pass raw states so wink/blink cursor lock and
         # closure-pause stay active even when config.clicks is False (OsController suppresses clicks cleanly).
+        # Real mouse: only Activate (button or Space) switches output on. A gesture that toggles pause may still pause,
+        # but while output is paused it is withheld, so it can never switch the real mouse on by itself.
+        no_resume = config.real_mouse and not state.last_report.active
         hand_in = None
         if mode.hand:
             point, tracking = state.hand_smoother.apply(hand.point, hand.tracking, t)
             hand_state = hand.state if mode.hand == "gesture" else 0
+            if no_resume and hand_state == HAND_FIST and state.zone.get("gestures", "fist_action") == "toggle_pause":
+                hand_state = 0
             hand_in = osi_capi.TrackerInput(point, hand_state, tracking)
         gaze_in = None
         if mode.gaze:
             gaze_tracking = osi_capi.TRACKED if gaze.point is not None else osi_capi.LOST
             point, tracking = (state.gaze_smoother.apply(gaze.point, gaze_tracking, t) if mode.gaze == "pointer"
                                else (None, osi_capi.LOST))
-            gaze_in = osi_capi.TrackerInput(point, gaze.state, tracking)
+            eye_state = gaze.state
+            if no_resume and eye_state == EYES_CLOSED:
+                eye_state = 0
+            gaze_in = osi_capi.TrackerInput(point, eye_state, tracking)
 
         controller = state.controller
         yielding = False

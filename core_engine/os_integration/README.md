@@ -168,6 +168,7 @@ available.
 | A cursor move is refused | It is not counted as sent. The target stays owed, also if tracking is lost: it is retried, and no press or click is sent until Windows accepts it. A drop waits up to 0.3 s for its move, then releases where the cursor is. |
 | The tester changes mode or output | It releases held buttons before loading anything, keeps retrying refused releases (camera mode included) and releases after 0.5 s without camera frames. A watchdog thread does this, and handles Esc and Stop, even while a camera read is blocked. |
 | A saved Activate turns the real mouse on | The tester accepts Activate only for the configuration that is already running; Start, Stop and any option change cancel it. |
+| A gesture turns the real mouse on | In the tester's Real mouse mode, eye closure (and a fist set to `toggle_pause`) can pause the output but never resume it; only Activate or Space does. Simulation and the tray keep hands-free resume. |
 | A broken settings file loses calibration | A file with errors is never saved over (tester and tray) or reloaded. Saves edit the file as it is at that moment and keep `<file>.bak`. A UTF-8 byte-order mark is accepted. |
 | A button stays stuck down | Buttons are released on pause, inhibit, settings change, stale input (0.5 s without frames), controller destruction and app exit. A release Windows **refuses** keeps the button tracked as held and is retried every frame and every 250 ms by the tray, with a warning, until Windows accepts it; a click whose release was dropped is detected (`ClickResult::PressedOnly`) and released the same way (team tracker item #8). |
 | Fighting the user's real mouse | A low-level hook detects **physical** mouse input (not injected input) and yields control for 1.5 s. |
@@ -237,7 +238,7 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
 | `os_integration_tests` | 110 / 110 passed |
 | `os_integration_capi_tests` | 10 / 10 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 125 / 125 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 130 / 130 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |

@@ -1334,3 +1334,47 @@ def test_real_mouse_fist_toggle_never_switches_output_on(worker, monkeypatch, li
     state.hand = Fist()
     run_for(engine, state, config, cv2, 0.8)                         # fist onset is 0.3 s
     assert not state.last_report.active
+
+
+def test_real_mouse_clicks_disabled_keeps_blink_lock_pauses_and_never_resumes(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True, clicks=False)   # keep worker's record-only controller
+    start_paused(state, config, active=True)
+    state.controller.set_clicks_enabled(config.clicks)
+
+    gaze_seq = iter([
+        *([GazeObs(point=(0.50, 0.77), state=0, face=True)] * 6),
+        *([GazeObs(point=(0.95, 0.05), state=1, face=True)] * 10),   # left wink with noisy coordinates
+    ])
+
+    class _SeqGaze:
+        def process(self, frame):
+            return next(gaze_seq, GazeObs(point=(0.50, 0.77), state=0, face=True))
+
+        def close(self):
+            pass
+
+    state.gaze = _SeqGaze()
+    for _ in range(6):
+        time.sleep(0.015)
+        engine._step(state, config, cv2)
+    base_cursor = state.last_report.cursor
+    assert base_cursor is not None
+
+    # During wink with real_mouse=True and clicks=False: blink lock freezes cursor and emits zero clicks.
+    for _ in range(10):
+        time.sleep(0.015)
+        engine._step(state, config, cv2)
+        assert state.last_report.cursor == base_cursor
+    assert state.controller.count(osi_capi.EVENT_CLICK) == 0
+
+    # 1 s eye closure pauses active real-mouse output even with clicks=False, then never resumes it.
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active
+    assert state.controller.count(osi_capi.EVENT_CLICK) == 0
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active
+

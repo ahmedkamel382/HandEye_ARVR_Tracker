@@ -48,6 +48,17 @@ struct TrayAppTestAccess {
     void reload() { app_.reload_settings(); }
     double wink() const { return app_.settings_.gestures.wink_onset_seconds; }
     bool event_posted() const { return app_.release_event_posted_.load(); }
+    bool active() { return app_.controller_->active(); }
+    void pause() { app_.controller_->set_active(false); }
+    void eyes(EyeState eye, int count) {
+        for (int i = 0; i < count; ++i) {
+            FramePayload frame;
+            frame.timestamp_seconds = t_;
+            frame.gaze = {NormalizedPoint{0.5, 0.5}, static_cast<std::int32_t>(eye)};
+            app_.submit_frame(frame);
+            t_ += 1.0 / 32.0;
+        }
+    }
     bool pending() const { return app_.controller_->release_pending(); }
 
     RecordingInputSink* sink = nullptr;
@@ -218,6 +229,18 @@ void release_event_rearms_for_each_stuck_episode() {
         access.timer_retry();
         require(!access.pending() && !access.event_posted(), "flag not cleared after the release");
     }
+}
+
+void eye_closure_never_resumes_the_tray() {
+    test_log();
+    TrayApp app(GetModuleHandleW(nullptr), TrayOptions{});
+    TrayAppTestAccess access(app);
+    access.pause();
+    for (int round = 0; round < 3; ++round) {
+        access.eyes(EyeState::SustainedClosure, 45);
+        access.eyes(EyeState::Neutral, 10);
+    }
+    require(!access.active(), "eye closure resumed the tray");
 }
 
 } // namespace osi_tray_tests

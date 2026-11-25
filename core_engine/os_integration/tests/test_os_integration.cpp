@@ -31,6 +31,7 @@ void release_event_rearms_for_each_stuck_episode();
 void menu_change_keeps_external_edits();
 void invalid_file_is_never_overwritten();
 void invalid_reload_keeps_running_settings();
+void eye_closure_never_resumes_the_tray();
 } // namespace osi_tray_tests
 #endif
 
@@ -842,7 +843,8 @@ int main() {
         c.update(hand_frame(t, kCentre));
         require(count(sink, SinkEvent::Kind::Move) == 1, "no move after inhibition ended");
     });
-    run_test("controller_eye_closure_resumes_hands_free", [] {
+    // ---- activation policy: gestures may pause, but only an explicit command resumes ----
+    run_test("controller_eye_closure_never_resumes", [] {
         RecordingInputSink sink;
         OsController c(unit_regions(), kFullHd, sink);
         double t = 0.0;
@@ -850,12 +852,73 @@ int main() {
             c.update(gaze_frame(t, kCentre));
         }
         bool toggled = false;
-        for (int i = 0; i < 40 && !toggled; ++i, t += kDt) {
-            require(sink.events.empty(), "input sent while paused");
-            toggled = c.update(gaze_frame(t, kCentre, EyeState::SustainedClosure)).pause_toggled;
+        for (int round = 0; round < 3; ++round) {       // repeated closures, separated by open eyes
+            for (int i = 0; i < 45; ++i, t += kDt) {
+                toggled |= c.update(gaze_frame(t, kCentre, EyeState::SustainedClosure)).pause_toggled;
+            }
+            for (int i = 0; i < 10; ++i, t += kDt) {
+                c.update(gaze_frame(t, kCentre));
+            }
         }
-        require(toggled && c.active(), "closure did not resume control");
-        require(count(sink, SinkEvent::Kind::Click) == 0, "closure clicked");
+        require(!c.active() && !toggled, "a gesture resumed control");
+        require(sink.events.empty(), "input sent while paused");
+    });
+    run_test("controller_fist_toggle_never_resumes", [] {
+        Settings settings = unit_regions();
+        settings.gestures.fist_action = FistAction::TogglePause;
+        RecordingInputSink sink;
+        OsController c(settings, kFullHd, sink);
+        double t = 0.0;
+        for (int round = 0; round < 3; ++round) {
+            for (int i = 0; i < 20; ++i, t += kDt) {
+                c.update(hand_frame(t, kCentre, HandGesture::Fist));
+            }
+            for (int i = 0; i < 10; ++i, t += kDt) {
+                c.update(hand_frame(t, kCentre));
+            }
+        }
+        require(!c.active() && sink.events.empty(), "a fist resumed control");
+    });
+    run_test("controller_gestures_still_pause", [] {
+        Settings settings = unit_regions();
+        settings.gestures.fist_action = FistAction::TogglePause;
+        for (int which = 0; which < 2; ++which) {
+            RecordingInputSink sink;
+            OsController c(settings, kFullHd, sink);
+            c.set_active(true);
+            double t = 0.0;
+            bool paused = false;
+            for (int i = 0; i < 45; ++i, t += kDt) {
+                const FrameReport r = c.update(which == 0 ? gaze_frame(t, kCentre, EyeState::SustainedClosure)
+                                                          : hand_frame(t, kCentre, HandGesture::Fist));
+                paused |= r.pause_toggled && !r.active;
+            }
+            require(paused && !c.active(), which == 0 ? "eye closure did not pause" : "fist did not pause");
+            for (int i = 0; i < 60; ++i, t += kDt) {   // keep closing: the next toggle must not resume
+                c.update(which == 0 ? gaze_frame(t, kCentre, EyeState::SustainedClosure)
+                                    : hand_frame(t, kCentre, HandGesture::Fist));
+            }
+            require(!c.active(), "held gesture resumed control");
+        }
+    });
+    run_test("controller_paused_survives_every_reset_path", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        double t = 0.0;
+        c.update(hand_frame(t, kCentre));
+        c.apply_settings(unit_regions());                              // settings reload, clock restart
+        c.set_screen_geometry(kFullHd);                                // display change
+        c.set_inhibited(true);                                         // wizard, physical mouse
+        c.set_inhibited(false);
+        for (int i = 0; i < 10; ++i) {
+            t += kDt;
+            c.update(hand_frame_tracking(t, kCentre, HandGesture::Pinch, i % 2 ? TrackerState::Held
+                                                                                : TrackerState::Lost));
+        }
+        require(!c.active() && sink.events.empty(), "a reset path switched control on");
+        c.set_active(true);                                            // the explicit command still works
+        c.update(hand_frame(t + kDt, kCentre));
+        require(c.active() && count(sink, SinkEvent::Kind::Move) == 1, "explicit activation failed");
     });
     run_test("controller_rejects_bad_timestamps", [] {
         RecordingInputSink sink;
@@ -1517,6 +1580,7 @@ int main() {
     run_test("tray_menu_change_keeps_external_edits", osi_tray_tests::menu_change_keeps_external_edits);
     run_test("tray_invalid_file_is_never_overwritten", osi_tray_tests::invalid_file_is_never_overwritten);
     run_test("tray_invalid_reload_keeps_running_settings", osi_tray_tests::invalid_reload_keeps_running_settings);
+    run_test("tray_eye_closure_never_resumes", osi_tray_tests::eye_closure_never_resumes_the_tray);
 #endif
 
     std::cout << "SUMMARY passed=" << passes << " failed=" << failures << '\n';

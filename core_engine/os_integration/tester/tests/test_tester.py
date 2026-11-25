@@ -1108,13 +1108,13 @@ def test_real_mouse_eye_closure_still_pauses(worker, monkeypatch):
     assert not state.last_report.active
 
 
-def test_simulation_eye_closure_still_resumes(worker, monkeypatch):
+def test_simulation_eye_closure_never_resumes_either(worker, monkeypatch):
     engine, state, log, cv2 = worker("gaze")
     config = replace(state.config, real_mouse=False)
     start_paused(state, config)
     state.gaze = ClosedEyes()
     run_for(engine, state, config, cv2, 1.6)
-    assert state.last_report.active
+    assert not state.last_report.active                              # the controller itself never resumes
 
 
 def test_real_mouse_fist_toggle_never_switches_output_on(worker, monkeypatch, lib):
@@ -1130,3 +1130,102 @@ def test_real_mouse_fist_toggle_never_switches_output_on(worker, monkeypatch, li
     state.hand = Fist()
     run_for(engine, state, config, cv2, 0.8)                         # fist onset is 0.3 s
     assert not state.last_report.active
+
+
+# ============================================================ Engineer 4 DSP contract through the Tester gate
+# The Tester feeds Engineer 4's real filter (os_integration_capi.dll) through Smoother, as core feeds it through
+# freshness_gate.hpp. Timing rules: dt >= 1 us accepted, dt > 250 ms re-initialises, dt == 250 ms does not.
+
+def fresh_gate(lib):
+    filt = lib.smoothing_filter(1.2, 4.0, 1.0)                     # Engineer 4's hand parameters
+    if filt is None:
+        pytest.skip("built without dsp_filter")
+    return Smoother(filt)
+
+
+def test_dsp_exactly_250_ms_keeps_history_and_longer_reinitialises(lib):
+    kept, reset = fresh_gate(lib), fresh_gate(lib)
+    for gate in (kept, reset):
+        gate.apply((0.2, 0.2), TRACKED, 1.0)
+    point, _ = kept.apply((0.8, 0.8), TRACKED, 1.25)               # exactly 0.25 s later (exact in binary)
+    assert point != (0.8, 0.8) and 0.2 < point[0] < 0.8, "a 250 ms gap must not reset the filter"
+    point, _ = reset.apply((0.8, 0.8), TRACKED, 1.2500001)         # strictly more than 0.25 s
+    assert point == (0.8, 0.8), "a gap over 250 ms must re-initialise to the new observation"
+
+
+def test_dsp_minimum_interval_is_one_microsecond(lib):
+    accepted, rejected = fresh_gate(lib), fresh_gate(lib)
+    for gate in (accepted, rejected):
+        gate.apply((0.2, 0.2), TRACKED, 0.0)
+    assert accepted.apply((0.8, 0.8), TRACKED, 1e-6)[1] == TRACKED   # exactly 1 us: accepted
+    assert rejected.apply((0.8, 0.8), TRACKED, 0.5e-6) == ((0.2, 0.2), HELD), "under 1 us must replay as held"
+
+
+def test_dsp_held_does_not_advance_the_filter(lib):
+    with_held, without = fresh_gate(lib), fresh_gate(lib)
+    for gate in (with_held, without):
+        gate.apply((0.2, 0.2), TRACKED, 0.0)
+        gate.apply((0.4, 0.4), TRACKED, 0.033)
+    assert with_held.apply((0.9, 0.9), HELD, 0.066)[1] == HELD
+    assert with_held.apply((0.5, 0.5), TRACKED, 0.1) == without.apply((0.5, 0.5), TRACKED, 0.1)
+
+
+def test_dsp_lost_clears_and_the_first_sample_after_recovery_is_unsmoothed(lib):
+    gate = fresh_gate(lib)
+    gate.apply((0.2, 0.2), TRACKED, 0.0)
+    gate.apply((0.4, 0.4), TRACKED, 0.033)
+    assert gate.apply(None, LOST, 0.066) == (None, LOST)
+    assert gate.apply((0.7, 0.3), HELD, 0.1) == (None, LOST), "a held frame after loss has nothing to replay"
+    assert gate.apply((0.7, 0.3), TRACKED, 0.133) == ((0.7, 0.3), TRACKED)
+
+
+def test_dsp_zero_zero_is_a_valid_coordinate(lib):
+    gate = fresh_gate(lib)
+    assert gate.apply((0.0, 0.0), TRACKED, 0.0) == ((0.0, 0.0), TRACKED)
+    assert gate.apply((0.0, 0.0), HELD, 0.033) == ((0.0, 0.0), HELD)
+
+
+def test_dsp_rejected_coordinates_never_become_published_or_cached(lib):
+    gate = fresh_gate(lib)
+    gate.apply((0.2, 0.3), TRACKED, 1.0)
+    for bad in [(math.nan, 0.5), (math.inf, 0.5), (0.5, -math.inf)]:
+        assert gate.apply(bad, TRACKED, 2.0) == (None, LOST)
+        assert gate.apply(bad, HELD, 2.1) == (None, LOST)
+    assert gate.apply((0.9, 0.9), TRACKED, 0.5) == ((0.9, 0.9), TRACKED)    # history cleared: an earlier time is fresh
+    gate2 = fresh_gate(lib)
+    gate2.apply((0.2, 0.3), TRACKED, 1.0)
+    assert gate2.apply((0.9, 0.8), TRACKED, 1.0) == ((0.2, 0.3), HELD)    # duplicate time: never the raw point
+    assert gate2.apply((0.9, 0.8), HELD, 1.1) == ((0.2, 0.3), HELD)
+
+
+def test_dsp_hand_and_gaze_channels_are_independent(lib):
+    hand, gaze = fresh_gate(lib), Smoother(lib.smoothing_filter(0.8, 6.0, 1.5))   # Engineer 4's gaze parameters
+    for gate in (hand, gaze):
+        gate.apply((0.2, 0.2), TRACKED, 0.0)
+        gate.apply((0.4, 0.4), TRACKED, 0.033)
+    reference = Smoother(lib.smoothing_filter(0.8, 6.0, 1.5))
+    reference.apply((0.2, 0.2), TRACKED, 0.0)
+    reference.apply((0.4, 0.4), TRACKED, 0.033)
+    hand.apply(None, LOST, 0.066)                                   # the hand is lost ...
+    assert gaze.apply((0.5, 0.5), TRACKED, 0.066) == reference.apply((0.5, 0.5), TRACKED, 0.066)   # ... gaze unaffected
+
+
+# ============================================================ C interface compatibility
+
+def test_library_refuses_a_dll_of_another_version(lib, monkeypatch):
+    monkeypatch.setattr(osi_capi, "EXPECTED_VERSION", lib.version + 1)
+    with pytest.raises(RuntimeError, match="rebuild"):
+        osi_capi.OsiLibrary(lib.path)
+
+
+def test_library_uses_the_dll_named_by_the_launcher(lib, monkeypatch, tmp_path):
+    monkeypatch.setenv("OSI_CAPI_DLL", str(lib.path))
+    assert osi_capi.find_dll(tmp_path) == lib.path
+    monkeypatch.setenv("OSI_CAPI_DLL", str(tmp_path / "missing.dll"))
+    assert osi_capi.find_dll(tmp_path) is None                      # no out/build under tmp_path either
+
+
+def test_library_reports_a_missing_dll_clearly(monkeypatch, tmp_path):
+    monkeypatch.setattr(osi_capi, "find_dll", lambda start=None: None)
+    with pytest.raises(FileNotFoundError, match="os_integration_capi.dll"):
+        osi_capi.OsiLibrary()

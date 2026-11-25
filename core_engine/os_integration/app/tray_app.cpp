@@ -517,11 +517,9 @@ LRESULT TrayApp::handle(UINT message, WPARAM wparam, LPARAM lparam) {
             break;
         case GesturePause:
             AppLog::info("control paused by sustained eye closure");
-            notify(L"Control paused", L"Eyes closed. Close them again for a second to resume.");
+            notify(L"Control paused", L"Press Ctrl+Alt+P or use the tray menu to resume.");
             break;
-        case GestureResume:
-            AppLog::info("control resumed by sustained eye closure");
-            notify(L"Control resumed", L"Eyes closed. Close them again for a second to pause.");
+        case GestureResume: // not posted any more: gestures cannot resume control
             break;
         case ReleaseBlocked:
             retry_stuck_buttons();

@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -121,6 +122,7 @@ struct Config {
     bool        use_hand = true;
     int         hand_roi = 0;               // 0 = off. N = feed the hand model an NxN crop (experimental)
     bool        preview = false;            // debug window drawn by the AI thread
+    std::string target_zone;                // optional preview overlay: left | center | right (empty = none)
     std::string ai_root = core::paths::kAiPipelineDir;
     std::string site    = core::paths::kPySiteDir;
     std::string gaze_models;                // folder with gesture_model.dll, gaze_pitch.dll, gaze_yaw.dll (default <ai-root>/gaze_intent/models)
@@ -340,8 +342,47 @@ void captureThread(cv::VideoCapture& cap, Pipeline& P, bool paced, double fps) {
 }
 
 // -------------------------------------------------------------- AI thread ---
-void drawPreview(const cv::Mat& rgb, const core::TrackingResult& r, cv::Mat& bgr) {
+void drawPreview(const cv::Mat& rgb, const core::TrackingResult& r, cv::Mat& bgr,
+                 const std::string& target_zone) {
     cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+
+    // Preview-only positioning guide. Normalised coordinates are in the same
+    // mirrored frame as the landmarks and the CSV edge-margin measurements.
+    if (!target_zone.empty()) {
+        const int w = bgr.cols, h = bgr.rows;
+        cv::rectangle(bgr, cv::Point(int(0.10 * w), int(0.10 * h)),
+                      cv::Point(int(0.90 * w), int(0.90 * h)),
+                      cv::Scalar(0, 200, 0), 2);                       // 10% safe frame
+
+        double x0 = 0.10, x1 = 0.90;
+        if (target_zone == "left")        x1 = 1.0 / 3.0;
+        else if (target_zone == "center") { x0 = 1.0 / 3.0; x1 = 2.0 / 3.0; }
+        else if (target_zone == "right")  x0 = 2.0 / 3.0;
+
+        const cv::Point zone_tl(int(x0 * w), int(0.10 * h));
+        const cv::Point zone_br(int(x1 * w), int(0.90 * h));
+        cv::rectangle(bgr, zone_tl, zone_br, cv::Scalar(0, 255, 255), 3); // selected third
+        const char* label = target_zone == "left" ? "TARGET LEFT" :
+                            (target_zone == "center" ? "TARGET CENTER" : "TARGET RIGHT");
+        cv::putText(bgr, label, cv::Point(zone_tl.x + 6, zone_tl.y + 24),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
+    }
+
+    // Actual hand bbox from the current frame's 21 image landmarks (same values as the
+    // Python diagnostic CSV). Outline only; drawn before the red fingertip dot.
+    if (r.hand.bbox_valid) {
+        const int w = bgr.cols, h = bgr.rows;
+        const auto px = [w](float v) { return std::clamp(int(v * w), 0, w - 1); };
+        const auto py = [h](float v) { return std::clamp(int(v * h), 0, h - 1); };
+        const cv::Point tl(px(r.hand.bbox_l), py(r.hand.bbox_t));
+        const cv::Point br(px(r.hand.bbox_r), py(r.hand.bbox_b));
+        cv::rectangle(bgr, tl, br, cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
+        char bb[48];
+        std::snprintf(bb, sizeof bb, "bbox cx=%.2f", (r.hand.bbox_l + r.hand.bbox_r) * 0.5f);
+        cv::putText(bgr, bb, cv::Point(std::max(0, std::min(tl.x, w - 110)), std::max(tl.y - 6, 14)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+    }
+
     if (r.gaze.state == -1)
         cv::putText(bgr, "GAZE CALIBRATING - keep both eyes open", {10, 54}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 200, 255}, 2);
     if (r.gaze.detected())
@@ -479,13 +520,40 @@ void aiBody(Pipeline& P) {
             if (!cfg.dsp_record_dir.empty()) r.hand_landmarks = n;
             hand_failed.tracking_state = core::TrackingState::Lost;
             r.hand = (n >= 0) ? handn.process(hand_pts.data(), n) : hand_failed;
+
+            // Preview-only: derive the same normalised bbox the Python diagnostic writes,
+            // straight from THIS frame's 21 image landmarks. No clamping of bad values.
+            if (cfg.preview && n == core::kHandPacked) {
+                float bx_l = 1.0f, bx_t = 1.0f, bx_r = 0.0f, bx_b = 0.0f;
+                bool bbox_ok = true;
+                const float eps = 1e-6f;
+                for (int i = 0; i < core::kHandPoints; ++i) {
+                    const float x = hand_pts[3 * i];
+                    const float y = hand_pts[3 * i + 1];
+                    if (!std::isfinite(x) || !std::isfinite(y) ||
+                        x < -eps || x > 1.0f + eps || y < -eps || y > 1.0f + eps) {
+                        bbox_ok = false;
+                        break;
+                    }
+                    bx_l = std::min(bx_l, x);
+                    bx_t = std::min(bx_t, y);
+                    bx_r = std::max(bx_r, x);
+                    bx_b = std::max(bx_b, y);
+                }
+                if (bbox_ok && bx_r > bx_l && bx_b > bx_t) {
+                    r.hand.bbox_l = bx_l; r.hand.bbox_t = bx_t;
+                    r.hand.bbox_r = bx_r; r.hand.bbox_b = bx_b;
+                    r.hand.bbox_valid = true;
+                }
+            }
+
             hand_valid = r.hand.detected();
             if (hand_valid) { last_hx = r.hand.x; last_hy = r.hand.y; }
             r.hand_ms = usBetween(t_h, Clock::now()) / 1000.0;
         }
 
         if (cfg.preview) {
-            drawPreview(frame, r, preview_bgr);
+            drawPreview(frame, r, preview_bgr, cfg.target_zone);
             if ((cv::waitKey(1) & 0xFF) == 'q') g_run.store(false);
         }
         P.pool.release(pkt.slot);                              // slot is reusable immediately
@@ -534,6 +602,7 @@ void usage() {
 "core_engine - camera -> hand/gaze trackers -> filter -> OS output\n\n"
 "source:   --camera N | --video FILE | --width W --height H --fps F\n"
 "loop:     --pool N (frames in flight, default 8) | --process-all | --seconds N | --preview\n"
+"          --target-zone left|center|right (preview-only positioning overlay)\n"
 "modules:  --no-gaze | --no-hand | --hand-roi N (experimental crop) | --gaze-models DIR (default <ai-root>/gaze_intent/models)\n"
 "          --hand-forest auto|treelite|sklearn | --hand-model FILE.pkl (default assets/hand_gesture_rf.pkl)\n"
 "          --gaze-diag-log FILE.csv (optional per-frame gaze diagnostic CSV; disabled by default)\n"
@@ -624,6 +693,7 @@ Config parseArgs(int argc, char** argv, bool& ok) {
         else if (a == "--no-hand")        c.use_hand = false;
         else if (a == "--hand-roi")       c.hand_roi = std::max(0, std::atoi(next()));
         else if (a == "--preview")        c.preview = true;
+        else if (a == "--target-zone")    c.target_zone = next();
         else if (a == "--ai-root")        c.ai_root = next();
         else if (a == "--site")           c.site = next();
         else if (a == "--gaze-models")    c.gaze_models = next();
@@ -651,6 +721,9 @@ Config parseArgs(int argc, char** argv, bool& ok) {
             else { std::fprintf(stderr, "--hand-anchor must be tip, knuckle or mid\n"); ok = false; }
         } else if (a == "--help" || a == "-h") { usage(); ok = false; }
         else { std::fprintf(stderr, "Unknown option: %s (try --help)\n", a.c_str()); ok = false; }
+    }
+    if (!c.target_zone.empty() && c.target_zone != "left" && c.target_zone != "center" && c.target_zone != "right") {
+        std::fprintf(stderr, "--target-zone must be left, center or right\n"); ok = false;
     }
     if (c.hand_forest != "auto" && c.hand_forest != "treelite" && c.hand_forest != "sklearn") {
         std::fprintf(stderr, "--hand-forest must be auto, treelite or sklearn\n"); ok = false;

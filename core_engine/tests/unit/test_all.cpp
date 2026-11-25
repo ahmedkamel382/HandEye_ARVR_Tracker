@@ -950,6 +950,133 @@ static void t_gate_chain_matches_observation_only_filter() {
     CHECK(gate.counters().filter_updates == uint64_t(tracked_seen));          // one update per observation, none for HELD
 }
 
+// P1 #4: Non-finite landmarks, pose matrices, or model outputs in GazeNative / OneEuroPoint / FreshnessGate
+// never become fresh pointers, reset incomplete state cleanly, and recover on the next valid frame.
+static void t_gaze_nonfinite_never_fresh_and_recovers() {
+    const float bad_vals[3] = {
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+    };
+    const double bad_doubles[3] = {
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+
+    // 1. Mid-calibration corruption resets calibration count to 0 and outputs NaN / invalid pointer.
+    {
+        GazeRig r;
+        FacePts open(0.30, 0.30);
+        for (int i = 0; i < 10; ++i) r.run(open);
+        CHECK(!r.g.calibrated());
+
+        FacePts bad_lm = open;
+        bad_lm.p[3 * 468] = bad_vals[0];
+        GazeDiagRow diag;
+        ModuleOut mo = r.g.process(bad_lm.p.data(), bad_lm.count(), FacePts::W, FacePts::H, &diag);
+        CHECK(!mo.detected() && mo.state == 0 && all_angles_nan(mo));
+        CHECK(diag.detected == 0 && diag.state == 0 && diag.norm_x == -1.0 && diag.norm_y == -1.0);
+        CHECK(!r.g.calibrated());
+
+        // Calibration restarts cleanly from 0: 29 good frames remain uncalibrated, 30th completes.
+        for (int i = 0; i < 29; ++i) r.run(open);
+        CHECK(!r.g.calibrated());
+        r.run(open);
+        CHECK(r.g.calibrated());
+    }
+
+    // 2. Post-calibration: NaN / +-Inf in landmarks, pose matrix, and regressor outputs + recovery.
+    {
+        GazeRig r;
+        OneEuroPoint flt(1.0, 8.0, 1.0);
+        FreshnessGate gate;
+        FacePts open(0.30, 0.30), wink(0.075, 0.30);
+        r.calibrate(open);
+        r.run(wink);                                                   // seed EAR rolling history
+
+        double t = 1.0;
+        GazeDiagRow ok_diag;
+        ModuleOut ok0 = r.g.process(open.p.data(), open.count(), FacePts::W, FacePts::H, &ok_diag);
+        CHECK(ok0.detected() && gate.update(ok0, flt, true, t += 0.02).has_value());
+
+        for (float b : bad_vals) {
+            FacePts bad_lm = open;
+            bad_lm.p[3 * 33] = b;                                      // NaN/Inf in eye corner landmark
+            GazeDiagRow diag;
+            ModuleOut m1 = r.g.process(bad_lm.p.data(), bad_lm.count(), FacePts::W, FacePts::H, &diag);
+            CHECK(!m1.detected() && m1.state == 0 && all_angles_nan(m1));
+            CHECK(!gate.update(m1, flt, true, t += 0.02).has_value());
+
+            FacePts bad_pose = open;
+            bad_pose.p[3 * GazeNative::kFacePoints + 0] = b;           // NaN/Inf in pose matrix
+            ModuleOut m2 = r.g.process(bad_pose.p.data(), bad_pose.count(), FacePts::W, FacePts::H, &diag);
+            CHECK(!m2.detected() && m2.state == 0 && all_angles_nan(m2));
+            CHECK(!gate.update(m2, flt, true, t += 0.02).has_value());
+        }
+
+        // Regressor returning NaN / +-Inf must also reject and emit an invalid GazeNative result
+        for (double bd : bad_doubles) {
+            r.yaw_out = bd;
+            GazeDiagRow diag;
+            ModuleOut m3 = r.g.process(open.p.data(), open.count(), FacePts::W, FacePts::H, &diag);
+            CHECK(!m3.detected() && m3.state == 0 && all_angles_nan(m3));
+            CHECK(!gate.update(m3, flt, true, t += 0.02).has_value());
+        }
+        r.yaw_out = 0.0;
+
+        // Post-loss recovery: calibration baseline preserved, stale wink history cleared, DSP recovers cleanly
+        CHECK(r.g.calibrated());
+        ModuleOut rec = r.g.process(open.p.data(), open.count(), FacePts::W, FacePts::H);
+        CHECK(rec.detected() && std::isfinite(rec.x) && std::isfinite(rec.y));
+        CHECK_NEAR(r.wink_in[1], 1.0, 1e-4);
+        CHECK(gate.update(rec, flt, true, t += 0.02).has_value());
+    }
+
+    // 3. OneEuroPoint::update & FreshnessGate reject NaN / +-Inf directly and recover
+    {
+        OneEuroPoint flt(1.0, 8.0, 1.0);
+        double x = 0.5, y = 0.5;
+        CHECK(flt.update(x, y, 0.1) == FilterOutcome::Ok);
+        for (double bd : bad_doubles) {
+            double bx = bd, by = 0.5;
+            CHECK(flt.update(bx, by, 0.2) == FilterOutcome::Invalid);
+            bx = 0.5; by = bd;
+            CHECK(flt.update(bx, by, 0.3) == FilterOutcome::Invalid);
+        }
+        double rx = 0.25, ry = 0.75;
+        CHECK(flt.update(rx, ry, 0.4) == FilterOutcome::Ok);
+        CHECK_NEAR(rx, 0.25, 1e-12);
+
+        FreshnessGate gate;
+        ModuleOut bad_untracked;
+        bad_untracked.ok = true;
+        bad_untracked.x = std::numeric_limits<float>::infinity();
+        bad_untracked.y = 0.5f;
+        CHECK(!gate.update(bad_untracked, flt, true, 0.5).has_value());
+        CHECK(!gate.update(bad_untracked, flt, false, 0.6).has_value());
+
+        ModuleOut good_untracked;
+        good_untracked.ok = true;
+        good_untracked.x = 0.6f;
+        good_untracked.y = 0.4f;
+        auto recovered = gate.update(good_untracked, flt, true, 0.7);
+        CHECK(recovered.has_value());
+        CHECK_NEAR(recovered->x, 0.6, 1e-6);
+    }
+
+    // 4. formatGazeDiagCsvRow writes unambiguous tokens for nan / inf / -inf
+    {
+        GazeDiagRow r;
+        r.capture_s = std::numeric_limits<double>::infinity();
+        r.sx = -std::numeric_limits<double>::infinity();
+        r.sy = std::numeric_limits<double>::quiet_NaN();
+        const auto cols = split_csv(formatGazeDiagCsvRow(r));
+        CHECK(cols.size() == 32);
+        CHECK(cols[2] == "inf" && cols[7] == "-inf" && cols[10] == "nan");
+    }
+}
+
 int main() {
     struct T { const char* name; void (*fn)(); };
     const T tests[] = {
@@ -961,6 +1088,7 @@ int main() {
         { "hand: TRACKED / HELD / LOST transitions", t_hand_tracking_state_transitions },
         { "hand: anchors, clamp, geometric fallback", t_hand_anchor_clamp_and_fallback },
         { "NEW B: non-finite landmark never fresh", t_nonfinite_never_fresh },
+        { "P1 #4: gaze/filter/gate non-finite + recovery", t_gaze_nonfinite_never_fresh_and_recovers },
         { "gaze: calibration + feature vector", t_gaze_calibration_and_features },
         { "gaze: no face + recalibrate", t_gaze_no_face_and_recalibrate },
         { "gaze: calibration ignores zero EAR", t_gaze_calibration_ignores_zero_ear },

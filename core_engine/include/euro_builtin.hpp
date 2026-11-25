@@ -75,6 +75,18 @@ public:
         x = fx_.filter(x, t_sec);
         y = fy_.filter(y, t_sec);
     }
+    FilterOutcome update(double& x, double& y, double t_sec) override {
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(t_sec)) {
+            reset();
+            return FilterOutcome::Invalid;
+        }
+        filter(x, y, t_sec);
+        if (!std::isfinite(x) || !std::isfinite(y)) {
+            reset();
+            return FilterOutcome::Invalid;
+        }
+        return FilterOutcome::Ok;
+    }
 private:
     OneEuro fx_, fy_;
 };

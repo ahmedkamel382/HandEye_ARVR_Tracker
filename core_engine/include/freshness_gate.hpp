@@ -95,6 +95,7 @@ private:
                     return std::nullopt;
             }
         }
+        if (!std::isfinite(x) || !std::isfinite(y)) return lose(flt);
         cache_ = GatedPoint{std::min(1.0, std::max(0.0, x)), std::min(1.0, std::max(0.0, y))};
         had_ = true;
         return cache_;

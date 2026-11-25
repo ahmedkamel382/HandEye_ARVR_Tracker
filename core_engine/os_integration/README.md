@@ -237,7 +237,7 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
 | `os_integration_tests` | 100 / 100 passed |
 | `os_integration_capi_tests` | 9 / 9 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 114 / 114 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 131 / 131 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |
@@ -313,6 +313,12 @@ project's `.venv` (`setup.bat`).
   for MJPG like the engine. A label lists any option that differs, unsaved
   tuning included. The tester runs the
   Python trackers, so its timings are **not** core_engine's latency.
+* **Input validation** follows the engine's bridge: a hand result needs exactly
+  21 image and 21 world landmarks, all finite (`landmark_extractors.pack_hand`),
+  otherwise the tracker sees "no hand". A face result needs 478 finite points and
+  a finite 4-by-4 head pose. The tester and native bridge check the same
+  packed float32 coordinates before tracking. Rejections are
+  counted under Live data > Invalid landmarks.
 * **Smoothing** follows `freshness_gate.hpp`: a rejected timestamp replays the
   last filtered point as Held, an invalid input publishes nothing.
 * Run it without the launcher: `.venv\Scripts\python.exe core_engine\os_integration\tester\handeye_tester.py`.

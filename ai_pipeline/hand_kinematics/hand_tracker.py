@@ -263,12 +263,26 @@ class HandTracker:
 
     @staticmethod
     def _parse(result) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """MediaPipe result -> (world points (21,3), image landmarks (21,2) normalized) or None."""
-        points = result_to_points(result)
-        if points is None or not result.hand_landmarks:
+        """MediaPipe result -> (world points (21,3), image landmarks (21,2) normalized) or None.
+
+        Invalid payloads are rejected here, at the single boundary used by both the
+        primary VIDEO detector and ROI recovery. This is the Tester-side equivalent of
+        the native Core Engine 21+21 / finite-input safeguard: a malformed 20+22 split
+        or a non-finite coordinate must never become a fresh cursor coordinate (for
+        example an Infinity clipped to X = 1.0 by the cursor clamp below).
+        """
+        img = result.hand_landmarks
+        wld = result.hand_world_landmarks
+        if not img or not wld or len(img[0]) != 21 or len(wld[0]) != 21:
             return None
-        lm_xy = np.array([[p.x, p.y] for p in result.hand_landmarks[0]], dtype=np.float64)
-        return points, lm_xy
+        points = result_to_points(result)
+        image_xyz = np.array([[p.x, p.y, p.z] for p in img[0]], dtype=np.float64)
+        if points is None or points.shape != (21, 3) or image_xyz.shape != (21, 3):
+            return None
+        with np.errstate(over="ignore", invalid="ignore"):
+            if not np.isfinite(points.astype(np.float32)).all() or not np.isfinite(image_xyz.astype(np.float32)).all():
+                return None
+        return points, image_xyz[:, :2]
 
     def _roi_recover(self, rgb: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Re-detect on a crop around the last known hand; returns full-frame-mapped landmarks."""

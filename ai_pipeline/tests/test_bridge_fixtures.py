@@ -64,3 +64,45 @@ def test_diag_on_off_equivalence():   # HAND_LANDMARK_DIAG writer must not chang
         a = le._pack_hand(R(i, wl)); b = le._pack_hand(R(i, wl), w, 1, 1, "VIDEO")
         assert a.shape == b.shape and np.array_equal(a, b, equal_nan=True)
     w.close(); assert os.path.getsize(path) > 0
+
+
+# ---- [Engineer 1] Face packing validation & non-finite rejection ----
+
+def test_pack_face_valid_and_malformed_counts():
+    pose = np.eye(4, dtype=np.float32)
+    packed, diag = le.pack_face(lms(478), pose)
+    assert packed.shape == (484, 3) and packed.dtype == np.float32
+    assert diag["valid"] and diag["packed_n"] == 484
+    assert np.isfinite(packed).all()
+
+    # Too few landmarks or missing pose -> empty (0, 3)
+    for bad_face, bad_pose in (
+        (lms(477), pose),
+        ([], pose),
+        (None, pose),
+        (lms(478), None),
+        (lms(478), np.eye(3, dtype=np.float32)),
+        (lms(478), np.ones((2, 8), dtype=np.float32)),
+        (lms(479), pose),
+    ):
+        p, d = le.pack_face(bad_face, bad_pose)
+        assert p.shape == (0, 3) and not d["valid"] and d["packed_n"] == 0
+
+
+def test_pack_face_rejects_nonfinite_and_recovers():
+    pose = np.eye(4, dtype=np.float32)
+    for bad_val in (float("nan"), float("inf"), float("-inf")):
+        for coord in ("x", "y", "z"):
+            face = lms(478)
+            setattr(face[468], coord, bad_val)
+            p, d = le.pack_face(face, pose)
+            assert p.shape == (0, 3) and d["reason"] == "nonfinite" and not d["valid"]
+
+        bad_pose = np.eye(4, dtype=np.float32)
+        bad_pose[2, 1] = bad_val
+        p, d = le.pack_face(lms(478), bad_pose)
+        assert p.shape == (0, 3) and d["reason"] == "nonfinite" and not d["valid"]
+
+    # Next clean frame recovers immediately
+    p, d = le.pack_face(lms(478), pose)
+    assert p.shape == (484, 3) and d["valid"] and d["packed_n"] == 484

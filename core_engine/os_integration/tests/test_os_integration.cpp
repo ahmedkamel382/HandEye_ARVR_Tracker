@@ -1402,31 +1402,76 @@ int main() {
         require(bad.targets.size() == 5 && std::isfinite(bad.targets[2].error_u),
                 "rejected fit lost its per-target results");
     });
-    run_test("calibration_samples_csv_reproduces_the_fit_exactly", [] {
-        const auto observations = synthetic_observations(InputRegion{0.268, 0.646, 0.783, 0.753}, 5, 0.01, 2);
-        std::istringstream csv(observations_csv(observations));
+    // Reads observations_csv() back: target_index,target_u,target_v,x,y; empty x,y = a target without samples.
+    static const auto read_samples_csv = [](const std::string& text) {
+        std::istringstream csv(text);
         std::string line;
         std::getline(csv, line);
-        require(line == "target_u,target_v,x,y", "header changed");
+        require(line == "target_index,target_u,target_v,x,y", "header changed: " + line);
         std::vector<TargetObservation> reread;
         while (std::getline(csv, line)) {
-            double u, v, x, y;
-            char c1 = 0, c2 = 0, c3 = 0;
             std::istringstream fields(line);
-            require(static_cast<bool>(fields >> u >> c1 >> v >> c2 >> x >> c3 >> y) && c1 == ',' && c2 == ',' &&
-                        c3 == ',',
+            std::size_t k = 0;
+            double u = 0, v = 0;
+            char c1 = 0, c2 = 0, c3 = 0;
+            require(static_cast<bool>(fields >> k >> c1 >> u >> c2 >> v >> c3) && c1 == ',' && c2 == ',' && c3 == ',',
                     "bad line: " + line);
-            if (reread.empty() || reread.back().target.u != u || reread.back().target.v != v) {
+            require(k == reread.size() || k + 1 == reread.size(), "targets out of order: " + line);
+            if (k == reread.size()) {
                 reread.push_back({CalibrationTarget{u, v}, {}});
             }
+            std::string rest;
+            std::getline(fields, rest);
+            if (rest == ",") {
+                continue; // the target had no sample
+            }
+            std::istringstream xy(rest);
+            double x = 0, y = 0;
+            char c4 = 0;
+            require(static_cast<bool>(xy >> x >> c4 >> y) && c4 == ',', "bad sample: " + line);
             reread.back().samples.push_back({x, y});
         }
+        return reread;
+    };
+    run_test("calibration_samples_csv_reproduces_the_fit_exactly", [] {
+        const auto observations = synthetic_observations(InputRegion{0.268, 0.646, 0.783, 0.753}, 5, 0.01, 2);
+        const auto reread = read_samples_csv(observations_csv(observations));
         const auto a = fit_input_region(observations), b = fit_input_region(reread);
         require(a.fit && b.fit, "fit failed");
         require(a.fit->rms_error == b.fit->rms_error && a.fit->region.x_min == b.fit->region.x_min &&
                     a.fit->region.y_min == b.fit->region.y_min && a.fit->region.x_max == b.fit->region.x_max &&
                     a.fit->region.y_max == b.fit->region.y_max,
                 "the saved samples do not reproduce the fit bit for bit");
+    });
+    run_test("calibration_keeps_the_evidence_of_every_rejection", [] {
+        const auto good = synthetic_observations(InputRegion{0.268, 0.646, 0.783, 0.753}, 5, 0.01, 2);
+        // A computed fit above the limit: no accepted fit, but its region and RMS are kept.
+        auto inconsistent = good;
+        for (NormalizedPoint& p : inconsistent[2].samples) {
+            p.x += 0.3;
+        }
+        const auto over = fit_input_region(inconsistent);
+        require(!over.fit && over.computed && over.computed->rms_error > RegionFitOptions{}.max_rms_error,
+                "a rejected computed fit lost its numbers");
+        // A fit that never existed: a target without usable samples. Every target is still kept, in order.
+        auto empty = good;
+        empty[3].samples.clear();
+        const auto none = fit_input_region(empty);
+        require(!none.fit && !none.computed, "a fit was reported although it could not be computed");
+        require(none.targets.size() == good.size(), "targets after the empty one were lost");
+        require(none.targets[3].index == 3 && none.targets[3].samples == 0 && std::isnan(none.targets[3].median_x),
+                "the empty target is not recorded as empty");
+        require(none.targets[4].samples == good[4].samples.size(), "a later target lost its samples");
+        // The CSV keeps the empty target too, and reading it back gives the same observations.
+        const auto reread = read_samples_csv(observations_csv(empty));
+        require(reread.size() == empty.size() && reread[3].samples.empty() &&
+                    reread[4].samples.size() == empty[4].samples.size(),
+                "the CSV lost a target");
+        // Non-finite samples are kept in the CSV as they were measured (and ignored by the fit).
+        auto odd = good;
+        odd[0].samples.push_back({std::numeric_limits<double>::infinity(), 0.5});
+        require(observations_csv(odd).find("inf,0.5") != std::string::npos, "a non-finite sample was dropped");
+        require(fit_input_region(odd).targets[0].samples == good[0].samples.size(), "a non-finite sample was used");
     });
     run_test("calibration_recovers_region", [] {
         const InputRegion truth{0.3, 0.25, 0.7, 0.65};

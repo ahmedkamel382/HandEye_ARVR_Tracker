@@ -366,9 +366,10 @@ class Smoother:
 
     def apply(self, point, tracking: int, t: float) -> Tuple[Optional[Tuple[float, float]], int]:
         """(point to publish, TRACKED / HELD / LOST)."""
-        # ModuleOut::detected() is x >= 0 && y >= 0: False for NaN, True for +Inf. A HELD sample is not a new
-        # observation, so its coordinates are never used: the cached point is replayed, whatever they are (also
-        # +-Inf). Only a TRACKED sample's coordinates are checked, and a non-finite one ends tracking like core does.
+        # freshness_gate.hpp, rule for rule. ModuleOut::detected() is x >= 0 && y >= 0: False for NaN and -Inf
+        # (they end tracking even on a HELD sample), True for +Inf. A HELD sample that counts as detected is not a
+        # new observation, so its coordinates are not used: the cached point is replayed (also for +Inf). A TRACKED
+        # sample's coordinates must be finite; a non-finite one ends tracking.
         detected = point is not None and point[0] >= 0 and point[1] >= 0
         if not detected or tracking not in (osi_capi.TRACKED, osi_capi.HELD):
             return self._lose()
@@ -385,6 +386,8 @@ class Smoother:
             if status != osi_capi.FILTER_OK:
                 self.last, self._has_history = None, False  # the filter reset itself
                 return None, osi_capi.LOST
+        if not (math.isfinite(output[0]) and math.isfinite(output[1])):
+            return self._lose()     # core's defensive check after the filter; FILTER_OK always gives a finite point
         self.last = (min(1.0, max(0.0, output[0])), min(1.0, max(0.0, output[1])))
         self._has_history = True
         return self.last, osi_capi.TRACKED

@@ -81,11 +81,16 @@ std::array<CalibrationTarget, 5> default_calibration_targets() noexcept {
 }
 
 std::string observations_csv(const std::vector<TargetObservation>& observations) {
-    std::string csv = "target_u,target_v,x,y\n";
-    char line[128];
-    for (const TargetObservation& o : observations) {
+    std::string csv = "target_index,target_u,target_v,x,y\n";
+    char line[160];
+    for (std::size_t k = 0; k < observations.size(); ++k) {
+        const TargetObservation& o = observations[k];
+        if (o.samples.empty()) {
+            std::snprintf(line, sizeof(line), "%zu,%.17g,%.17g,,\n", k, o.target.u, o.target.v);
+            csv += line;
+        }
         for (const NormalizedPoint& p : o.samples) {
-            std::snprintf(line, sizeof(line), "%.17g,%.17g,%.17g,%.17g\n", o.target.u, o.target.v, p.x, p.y);
+            std::snprintf(line, sizeof(line), "%zu,%.17g,%.17g,%.17g,%.17g\n", k, o.target.u, o.target.v, p.x, p.y);
             csv += line;
         }
     }
@@ -100,7 +105,8 @@ RegionFitResult fit_input_region(const std::vector<TargetObservation>& observati
         return result;
     }
 
-    std::vector<double> us, vs, xs, ys;
+    // Every target is recorded first, also one without usable samples, so a failed calibration keeps its evidence.
+    const double unknown = std::numeric_limits<double>::quiet_NaN();
     for (std::size_t k = 0; k < observations.size(); ++k) {
         std::vector<double> x, y;
         for (const NormalizedPoint& p : observations[k].samples) {
@@ -109,18 +115,20 @@ RegionFitResult fit_input_region(const std::vector<TargetObservation>& observati
                 y.push_back(p.y);
             }
         }
-        if (x.size() < std::max<std::size_t>(1, options.min_samples_per_target)) {
-            result.error = "Target " + std::to_string(k + 1) + " got only " +
-                           std::to_string(x.size()) +
+        result.targets.push_back({k, observations[k].target, x.size(), x.empty() ? unknown : median(x),
+                                  y.empty() ? unknown : median(y), unknown, unknown});
+    }
+    std::vector<double> us, vs, xs, ys;
+    for (const TargetFit& t : result.targets) {
+        if (t.samples < std::max<std::size_t>(1, options.min_samples_per_target)) {
+            result.error = "Target " + std::to_string(t.index + 1) + " got only " + std::to_string(t.samples) +
                            " tracked frames. Keep your hand or face visible to the camera.";
             return result;
         }
-        us.push_back(observations[k].target.u);
-        vs.push_back(observations[k].target.v);
-        xs.push_back(median(x));
-        ys.push_back(median(y));
-        const double unknown = std::numeric_limits<double>::quiet_NaN(); // known once both axes are fitted
-        result.targets.push_back({observations[k].target, x.size(), xs.back(), ys.back(), unknown, unknown});
+        us.push_back(t.target.u);
+        vs.push_back(t.target.v);
+        xs.push_back(t.median_x);
+        ys.push_back(t.median_y);
     }
 
     const auto fx = fit_line(us, xs);
@@ -148,6 +156,7 @@ RegionFitResult fit_input_region(const std::vector<TargetObservation>& observati
     const double rms = std::sqrt(squared / static_cast<double>(us.size()));
 
     const InputRegion region{fx->offset, fy->offset, fx->offset + fx->slope, fy->offset + fy->slope};
+    result.computed = RegionFit{region, rms}; // kept for the evidence, also if rejected below
     if (!is_valid_region(region)) {
         result.error = "The measured range is implausible; please try again.";
         return result;

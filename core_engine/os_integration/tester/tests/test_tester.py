@@ -7,6 +7,7 @@ Needs a built os_integration_capi.dll (out/build/...); those tests skip without 
 
 import csv
 import math
+import random
 import sys
 import threading
 import time
@@ -659,6 +660,46 @@ def test_held_sample_with_non_finite_coordinates_follows_the_core_gate(dsp_filte
             assert after == (0.4, 0.4)      # history cleared (or no filter): the first sample is unsmoothed
         if filt:
             filt.reset()
+
+
+def test_smoother_drops_a_non_finite_filter_output_like_core():
+    """freshness_gate.hpp checks the point again after FilterOutcome::Ok and calls lose() (which resets the filter)
+    if it is not finite. The C API never returns such a point (next test); the Tester still applies core's rule."""
+    class InfiniteOk(FakeFilter):
+        def update(self, point, t):
+            self.calls.append(point)
+            return osi_capi.FILTER_OK, (math.inf, point[1])
+    f = InfiniteOk()
+    s = Smoother(f)
+    s._has_history = True                       # as after an earlier published point
+    assert s.apply((0.2, 0.4), TRACKED, 0.0) == (None, LOST)
+    assert f.calls[-1] is None, "the filter was not reset"
+    assert s.apply((0.2, 0.4), HELD, 0.1) == (None, LOST), "nothing may be replayed"
+
+
+@pytest.mark.parametrize("params", [(1.2, 4.0, 1.0), (0.8, 6.0, 1.5)], ids=["hand", "gaze"])
+def test_filter_ok_always_returns_a_finite_point_inside_the_screen(lib, params):
+    """The C API guarantee the Smoother relies on: FILTER_OK always comes with a finite point in [0, 1]."""
+    filt = lib.smoothing_filter(*params)
+    if filt is None:
+        pytest.skip("built without dsp_filter")
+    g = random.Random(7)
+    t = 0.0
+    oks = 0
+    try:
+        for i in range(20000):
+            q = g.random()
+            t += 1e-6 if q < 0.05 else 0.2501 if q < 0.08 else 1e6 if q < 0.081 else g.uniform(0.001, 0.05)
+            v = g.random()
+            x = g.choice([-1e300, -1.0, 0.0, 1.0, 2.0, 1e300]) if v < 0.1 else g.uniform(-0.2, 1.2)
+            status, point = filt.update((x, g.uniform(0.0, 1.0)), t)
+            if status == osi_capi.FILTER_OK:
+                oks += 1
+                assert math.isfinite(point[0]) and math.isfinite(point[1]), (i, x, t, point)
+                assert 0.0 <= point[0] <= 1.0 and 0.0 <= point[1] <= 1.0, (i, x, t, point)
+    finally:
+        filt.close()
+    assert oks > 15000
 
 
 def test_held_without_smoothing_replays_the_last_observation():

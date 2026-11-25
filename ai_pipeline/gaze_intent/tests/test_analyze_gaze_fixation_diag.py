@@ -1081,4 +1081,230 @@ def test_cue_speaker_persistent_worker_single_spawn_and_cleanup():
     fake_proc.wait.assert_called_once()
 
 
+def test_strict_and_default_wash_in_anchor_at_target_start_s(tmp_path: Path):
+    """Frame arrival offset after target_start_s must not drop the first post-wash-in frame."""
+    run_dir = tmp_path / "wash_anchor"
+    start_s = 10.681
+    end_s = 16.681
+    frames: List[Dict[str, Any]] = []
+    # First frame arrives 25 ms after target_start_s (10.706s), mimicking real webcam alignment;
+    # at 30 Hz (0.034s/step), step 14 lands at 11.182s (just past 10.681 + 0.5 = 11.181s,
+    # before 10.706 + 0.5 = 11.206s).
+    t = 10.706
+    for i in range(60):
+        frames.append({"t_s": t + i * 0.034, "sx": 0.50, "sy": 0.0})
+
+    diag_csv = _write_synthetic_run(run_dir, frames, y_sign_mult=-1.0)
+    sched_path = run_dir / "cued_schedule.json"
+    sched_path.write_text(json.dumps({
+        "schema_version": 1,
+        "targets": [{"name": "CENTER", "target_start_s": start_s, "target_end_s": end_s}],
+    }), encoding="utf-8")
+
+    expected_ge_eff = sum(1 for fr in frames if start_s <= fr["t_s"] < end_s and fr["t_s"] >= start_s + 0.5)
+    assert frames[14]["t_s"] == pytest.approx(11.182, abs=1e-6)
+
+    for extra_flag, tag in (([], "def"), (["--strict-protocol-wash-in"], "strict")):
+        out_json = tmp_path / f"{tag}.json"
+        rc = ANALYZER.main([
+            "--run-dir", str(run_dir),
+            "--diag-csv", str(diag_csv),
+            "--cued-schedule", str(sched_path),
+            "--wash-in-s", "0.5",
+            *extra_flag,
+            "--out-json", str(out_json),
+            "--out-md", str(tmp_path / f"{tag}.md"),
+        ])
+        assert rc == 0
+        rep = json.loads(out_json.read_text(encoding="utf-8"))
+        w = rep["windows"][0]
+        assert w["eligible_frames"] == expected_ge_eff
+        assert w["exclusions"]["wash_in"] == 14
+
+
+def test_pre_cue_plan_prompts_and_schedule_metadata(tmp_path: Path):
+    plan = ANALYZER.build_cued_target_plan(
+        targets=["CENTER", "LEFT", "RIGHT"], hold_s=6.0, gap_s=4.0, initial_settle_s=1.0, pre_cue_s=2.5
+    )
+    assert [p["offset_from_ready_start_s"] for p in plan] == pytest.approx([1.0, 11.0, 21.0])
+    assert [p["offset_from_ready_end_s"] for p in plan] == pytest.approx([7.0, 17.0, 27.0])
+    assert plan[0]["offset_from_ready_pre_cue_s"] == pytest.approx(0.25)
+    assert plan[1]["offset_from_ready_pre_cue_s"] == pytest.approx(8.5)
+    assert plan[2]["offset_from_ready_pre_cue_s"] == pytest.approx(18.5)
+
+    off_plan = ANALYZER.build_cued_target_plan(
+        targets=["CENTER", "LEFT"], hold_s=6.0, gap_s=4.0, pre_cue_s=0.0
+    )
+    assert all(p["offset_from_ready_pre_cue_s"] is None for p in off_plan)
+
+    short_gap_plan = ANALYZER.build_cued_target_plan(
+        targets=["CENTER", "LEFT"], hold_s=2.0, gap_s=0.5, pre_cue_s=2.5
+    )
+    assert all(p["offset_from_ready_pre_cue_s"] is None for p in short_gap_plan)
+
+    run_dir = tmp_path / "precue_run"
+    fake_exe = tmp_path / "core_engine.exe"
+    fake_exe.write_text("stub", encoding="utf-8")
+
+    frames: List[Dict[str, Any]] = []
+    for i in range(30):
+        frames.append({"t_s": i * 0.033333, "state": -1, "sx": 0.5, "sy": 0.0})
+    for i in range(30, 540):
+        t_s = i * 0.033333
+        if 11.0 <= t_s < 15.0:
+            frames.append({"t_s": t_s, "sx": 0.38, "sy": 0.0, "head_yaw_deg": -10.0})
+        else:
+            frames.append({"t_s": t_s, "sx": 0.50, "sy": 0.0, "head_yaw_deg": 0.0})
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 100.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, dt: float) -> None:
+            self.now += dt
+
+    fake_clock = FakeClock()
+    spoken_prompts: List[str] = []
+
+    class FakeSpeaker:
+        def __init__(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+        def start(self) -> None:
+            pass
+
+        def speak(self, text: str) -> None:
+            spoken_prompts.append(text)
+
+        def close(self) -> None:
+            pass
+
+    class FakeProc:
+        def __init__(self, cmd: List[str], **_kwargs: Any) -> None:
+            dsp_dir = Path(cmd[cmd.index("--dsp-record-dir") + 1])
+            diag_csv_path = Path(cmd[cmd.index("--gaze-diag-log") + 1])
+            _write_synthetic_run(dsp_dir, frames, y_sign_mult=-1.0, diag_csv=diag_csv_path)
+            self.returncode = 0
+            self.stdout = io.StringIO(
+                "OS: log\n"
+                "cap 30 | ai 30 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.50 s=0) hand(0.00,0.00 s=0) | os frames 35\n"
+                "cap 30 | ai 30 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.50 s=0) hand(0.00,0.00 s=0) | os frames 65\n"
+            )
+
+        def poll(self):
+            return None if fake_clock.now < 125.0 else 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    with (
+        mock.patch.object(ANALYZER, "_CueSpeaker", FakeSpeaker),
+        mock.patch.object(ANALYZER.subprocess, "Popen", side_effect=FakeProc),
+        mock.patch.object(ANALYZER.time, "monotonic", side_effect=fake_clock.monotonic),
+        mock.patch.object(ANALYZER.time, "sleep", side_effect=fake_clock.sleep),
+    ):
+        sched_path = ANALYZER.run_cued_capture(
+            exe=fake_exe,
+            run_dir=run_dir,
+            diag_csv=run_dir / "gaze_diag.csv",
+            camera=0,
+            targets=["CENTER", "LEFT"],
+            hold_s=4.0,
+            gap_s=4.0,
+            pre_cue_s=2.5,
+            audio=True,
+            yes=True,
+        )
+
+    assert "Prepare: move eyes to CENTER now." in spoken_prompts
+    assert "Prepare: move eyes to LEFT now." in spoken_prompts
+    assert spoken_prompts.index("Prepare: move eyes to LEFT now.") < spoken_prompts.index("Hold left.")
+
+    sched = json.loads(sched_path.read_text(encoding="utf-8"))
+    assert sched["pre_cue_s"] == pytest.approx(2.5)
+    assert len(sched["targets"]) == 2
+    t_center, t_left = sched["targets"]
+    assert t_left["target_start_s"] - t_center["target_end_s"] == pytest.approx(4.0, abs=0.05)
+    assert t_left["target_start_s"] - t_left["pre_cue_s"] == pytest.approx(2.5, abs=0.05)
+    for tgt in sched["targets"]:
+        for key in ("pre_cue_wall_s", "pre_cue_dispatch_ms", "cue_start_wall_s", "cue_start_dispatch_ms", "cue_end_wall_s"):
+            assert tgt[key] is not None and math.isfinite(float(tgt[key]))
+
+
+def test_requested_vs_delivered_fps_and_low_fps_warning(tmp_path: Path, capsys):
+    # 1. High cadence (~30 FPS) with requested fps=60 -> no low-FPS warning
+    run_hi = tmp_path / "hi_fps"
+    frames_hi = _make_target_segment(1.0, 90, 1.0 / 30.0, sx=0.50, sy=0.0)
+    diag_hi = _write_synthetic_run(run_hi, frames_hi, y_sign_mult=-1.0)
+    (run_hi / "cued_schedule.json").write_text(json.dumps({
+        "schema_version": 1,
+        "fps": 60.0,
+        "targets": [{"name": "CENTER", "target_start_s": 1.0, "target_end_s": 4.0}],
+    }), encoding="utf-8")
+    assert ANALYZER.main(["--run-dir", str(run_hi), "--diag-csv", str(diag_hi)]) == 0
+    out_hi = capsys.readouterr().out
+    assert "LOW DELIVERED FPS WARNING" not in out_hi
+    rep_hi = json.loads((run_hi / "gaze_attribution_report.json").read_text(encoding="utf-8"))
+    assert rep_hi["cadence"]["requested_fps"] == pytest.approx(60.0)
+    assert rep_hi["cadence"]["delivered_fps_overall"] == pytest.approx(30.0, abs=0.2)
+    assert rep_hi["cadence"]["low_fps_warning"] is False
+    assert rep_hi["windows"][0]["delivered_fps"] == pytest.approx(30.0, abs=0.2)
+
+    # 2. Low cadence (~15 FPS) -> visible low-FPS warning in JSON, MD, and stdout
+    run_lo = tmp_path / "lo_fps"
+    frames_lo = _make_target_segment(1.0, 45, 1.0 / 15.0, sx=0.50, sy=0.0)
+    diag_lo = _write_synthetic_run(run_lo, frames_lo, y_sign_mult=-1.0)
+    (run_lo / "cued_schedule.json").write_text(json.dumps({
+        "schema_version": 1,
+        "fps": 60.0,
+        "targets": [{"name": "CENTER", "target_start_s": 1.0, "target_end_s": 4.0}],
+    }), encoding="utf-8")
+    assert ANALYZER.main(["--run-dir", str(run_lo), "--diag-csv", str(diag_lo)]) == 0
+    out_lo = capsys.readouterr().out
+    assert "LOW DELIVERED FPS WARNING" in out_lo
+    rep_lo = json.loads((run_lo / "gaze_attribution_report.json").read_text(encoding="utf-8"))
+    assert rep_lo["cadence"]["requested_fps"] == pytest.approx(60.0)
+    assert rep_lo["cadence"]["delivered_fps_overall"] == pytest.approx(15.0, abs=0.2)
+    assert rep_lo["cadence"]["low_fps_warning"] is True
+    assert rep_lo["cadence"]["low_fps_windows"] == ["CENTER"]
+    md_lo = (run_lo / "gaze_attribution_report.md").read_text(encoding="utf-8")
+    assert "LOW DELIVERED FPS WARNING" in md_lo
+    assert "requested_fps=60.00" in md_lo
+
+
+def test_vertical_up_down_cued_direction_report(tmp_path: Path):
+    run_dir = tmp_path / "vert_dir"
+    frames: List[Dict[str, Any]] = []
+    frames.extend(_make_target_segment(1.0, 45, 0.033, sx=0.50, sy=0.00))
+    frames.extend(_make_target_segment(3.0, 45, 0.033, sx=0.50, sy=-0.25))
+    frames.extend(_make_target_segment(5.0, 45, 0.033, sx=0.50, sy=+0.05))
+    diag_csv = _write_synthetic_run(run_dir, frames, y_sign_mult=-1.0)
+    (run_dir / "cued_schedule.json").write_text(json.dumps({
+        "schema_version": 1,
+        "targets": [
+            {"name": "CENTER", "target_start_s": 1.0, "target_end_s": 2.5},
+            {"name": "UP", "target_start_s": 3.0, "target_end_s": 4.5},
+            {"name": "DOWN", "target_start_s": 5.0, "target_end_s": 6.5},
+        ],
+    }), encoding="utf-8")
+
+    assert ANALYZER.main(["--run-dir", str(run_dir), "--diag-csv", str(diag_csv)]) == 0
+    rep = json.loads((run_dir / "gaze_attribution_report.json").read_text(encoding="utf-8"))
+    dirs = {d["comparison"]: d for d in rep["directions"]}
+    assert "VERTICAL_UP_TO_DOWN" in dirs
+    vd = dirs["VERTICAL_UP_TO_DOWN"]
+    assert vd["delta_raw_y_mean"] > 0.10
+    assert vd["delta_raw_y_median"] > 0.10
+    assert vd["delta_raw_y_fixed_sign_mean"] > 0.10
+    assert vd["delta_sy_mean"] > 0.25
+    assert vd["delta_abs_pitch_mean"] < -5.0
+    md = (run_dir / "gaze_attribution_report.md").read_text(encoding="utf-8")
+    assert "VERTICAL_UP_TO_DOWN" in md
+    assert "Δabs_pitch=" in md
 

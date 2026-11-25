@@ -63,6 +63,8 @@ MAX_FRESH_GAP_MS = 100.0
 COORD_TOL = 1e-6
 DEFAULT_CUED_WASH_IN_S = 0.5
 DEFAULT_BLINK_PAD_FRAMES = 2
+DEFAULT_PRE_CUE_S = 2.5
+LOW_DELIVERED_FPS_WARN_THRESHOLD = 25.0
 DEFAULT_CUED_TARGETS = ("CENTER", "LEFT", "RIGHT", "UP", "DOWN")
 GAZE_FILTER_SPEC = "0.8,6,1.5"
 
@@ -352,16 +354,29 @@ class GazeReadinessGate:
         return became_ready
 
 
+def _compute_cadence_fps(timestamps_s: Sequence[float]) -> Optional[float]:
+    if len(timestamps_s) < 2:
+        return None
+    span_s = float(timestamps_s[-1]) - float(timestamps_s[0])
+    if not math.isfinite(span_s) or span_s <= 0.0:
+        return None
+    return float(len(timestamps_s) - 1) / span_s
+
+
 def build_cued_target_plan(
     targets: Sequence[str] = DEFAULT_CUED_TARGETS,
     hold_s: float = 10.0,
     gap_s: float = 2.0,
     initial_settle_s: float = 1.0,
+    pre_cue_s: float = DEFAULT_PRE_CUE_S,
 ) -> List[Dict[str, Any]]:
     if hold_s <= DEFAULT_CUED_WASH_IN_S:
         raise ValueError("hold_s must exceed 0.5s wash-in")
     if gap_s < 0.0 or initial_settle_s < 0.0:
         raise ValueError("gap_s and initial_settle_s must be non-negative")
+    if not math.isfinite(pre_cue_s) or pre_cue_s < 0.0:
+        raise ValueError("pre_cue_s must be finite and non-negative")
+    effective_gap_pre_cue = min(float(pre_cue_s), max(0.0, float(gap_s) - 0.5)) if pre_cue_s > 0.0 else 0.0
     plan: List[Dict[str, Any]] = []
     cursor = initial_settle_s
     for idx, raw_name in enumerate(targets):
@@ -370,9 +385,20 @@ def build_cued_target_plan(
             raise ValueError("Empty target name in cued plan")
         start_rel = cursor
         end_rel = start_rel + hold_s
+        if idx == 0:
+            lead_s = (
+                min(effective_gap_pre_cue, max(0.0, float(initial_settle_s) - 0.25))
+                if (effective_gap_pre_cue > 0.0 and gap_s > 0.0 and initial_settle_s > 0.0)
+                else 0.0
+            )
+        else:
+            lead_s = effective_gap_pre_cue
+        pre_cue_rel = (start_rel - lead_s) if lead_s > 0.0 else None
         plan.append({
             "index": idx,
             "name": name,
+            "pre_cue_lead_s": lead_s,
+            "offset_from_ready_pre_cue_s": pre_cue_rel,
             "offset_from_ready_start_s": start_rel,
             "offset_from_ready_end_s": end_rel,
         })
@@ -923,28 +949,46 @@ def analyze_window(
             return "unpublished"
         return None
 
+    raw_win_times = [float(r["capture_s"]) for _, r in in_raw_win]
+    win_delivered_fps = _compute_cadence_fps(raw_win_times)
+    win_duration_s = float(end_s - start_s)
+    win_delivered_fps_by_duration = (float(len(in_raw_win)) / win_duration_s) if win_duration_s > 0.0 else None
+
     if strict_protocol_wash_in:
         total_frames_in_window = len(in_raw_win)
-        clean_since_s: Optional[float] = None
-        prev_cap_s: Optional[float] = None
+        # Anchor the initial wash-in countdown to target_start_s so frame-arrival latency
+        # inside [start_s, end_s) never shifts the initial boundary by an extra frame;
+        # interior exclusions or >100 ms gaps still restart wash_in_s from recovery.
+        wash_until_s: Optional[float] = eff_start_s if wash_in_s > 0.0 else None
+        prev_cap_s: Optional[float] = start_s
+        saw_clean = False
         for idx, r in in_raw_win:
             cap_s = float(r["capture_s"])
             reason = _exclusion_reason(idx, r)
             if reason is not None:
                 exclusions[reason] += 1
-                clean_since_s = None
+                wash_until_s = None
+                saw_clean = False
             else:
-                if clean_since_s is None or (
+                gap_exceeded = (
                     prev_cap_s is not None and (cap_s - prev_cap_s) * 1000.0 > MAX_FRESH_GAP_MS
-                ):
-                    clean_since_s = cap_s
-                if wash_in_s > 0.0 and (cap_s - clean_since_s) + 1e-9 < wash_in_s:
+                )
+                if not saw_clean and wash_until_s is not None and not gap_exceeded:
+                    pass
+                elif not saw_clean or gap_exceeded:
+                    wash_until_s = (cap_s + wash_in_s) if wash_in_s > 0.0 else None
+                saw_clean = True
+                if wash_until_s is not None and (cap_s + 1e-9) < wash_until_s:
                     exclusions["wash_in"] += 1
                 else:
                     eligible.append(r)
             prev_cap_s = cap_s
     else:
-        in_win_indexed = [(i, r) for i, r in in_raw_win if r["capture_s"] >= eff_start_s]
+        in_win_indexed = [
+            (i, r)
+            for i, r in in_raw_win
+            if (wash_in_s <= 0.0 or (r["capture_s"] + 1e-9) >= eff_start_s)
+        ]
         exclusions["wash_in"] = len(in_raw_win) - len(in_win_indexed)
         total_frames_in_window = len(in_win_indexed)
         for idx, r in in_win_indexed:
@@ -962,8 +1006,12 @@ def analyze_window(
             "wash_in_s": wash_in_s,
             "strict_protocol_wash_in": strict_protocol_wash_in,
             "blink_pad_frames": blink_pad_frames,
+            "total_frames_in_raw_window": len(in_raw_win),
             "total_frames_in_window": total_frames_in_window,
             "eligible_frames": 0,
+            "delivered_fps": win_delivered_fps,
+            "delivered_fps_by_duration": win_delivered_fps_by_duration,
+            "eligible_fps": None,
             "exclusions": exclusions,
             "raw_x": _compute_axis_metrics(np.empty(0), np.empty(0)),
             "raw_y": _compute_axis_metrics(np.empty(0), np.empty(0)),
@@ -1053,6 +1101,7 @@ def analyze_window(
             "range": float(np.max(vals) - np.min(vals)),
         }
 
+    win_eligible_fps = _compute_cadence_fps(times.tolist())
     res: Dict[str, Any] = {
         "window": name,
         "raw_interval_s": [start_s, end_s],
@@ -1060,8 +1109,12 @@ def analyze_window(
         "wash_in_s": wash_in_s,
         "strict_protocol_wash_in": strict_protocol_wash_in,
         "blink_pad_frames": blink_pad_frames,
+        "total_frames_in_raw_window": len(in_raw_win),
         "total_frames_in_window": total_frames_in_window,
         "eligible_frames": len(eligible),
+        "delivered_fps": win_delivered_fps,
+        "delivered_fps_by_duration": win_delivered_fps_by_duration,
+        "eligible_fps": win_eligible_fps,
         "max_eligible_gap_ms": float(np.max(np.diff(times) * 1000.0)) if len(times) >= 2 else 0.0,
         "exclusions": exclusions,
         "raw_x": raw_x_stats,
@@ -1119,6 +1172,8 @@ def compute_direction_checks(windows_res: Sequence[Dict[str, Any]]) -> List[Dict
     checks: List[Dict[str, Any]] = []
 
     def _find_match(substr: str) -> Optional[Dict[str, Any]]:
+        if substr in by_name:
+            return by_name[substr]
         for k, v in by_name.items():
             if substr in k:
                 return v
@@ -1173,11 +1228,16 @@ def compute_direction_checks(windows_res: Sequence[Dict[str, Any]]) -> List[Dict
 
 def format_markdown_report(report: Dict[str, Any]) -> str:
     integ = report["integrity"]
+    cadence = report.get("cadence") or {}
     artifact_dir = integ.get("artifact_dir") or integ["run_dir"]
     dsp_dir = integ.get("dsp_record_dir") or integ["run_dir"]
     run_line = f"- **Run directory:** `{artifact_dir}`"
     if dsp_dir != artifact_dir:
         run_line += f" | **DSP recorder dir:** `{dsp_dir}`"
+    req_fps = cadence.get("requested_fps")
+    deliv_fps = cadence.get("delivered_fps_overall")
+    req_fps_str = f"{req_fps:.2f}" if req_fps is not None else "unspecified"
+    deliv_fps_str = f"{deliv_fps:.2f}" if deliv_fps is not None else "n/a"
     lines = [
         "# Gaze Fixation Stability, Attribution & A/B Shadow Replay Report",
         "",
@@ -1188,11 +1248,18 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
             "> **INVALID RUN / FAILED ALIGNMENT & INTEGRITY CHECKS.** Do not use metrics below as valid qualification evidence.",
             "",
         ])
+    if cadence.get("low_fps_warning"):
+        lines.extend([
+            "> [!WARNING]",
+            f"> **LOW DELIVERED FPS WARNING:** delivered=`{deliv_fps_str}` FPS (< `{cadence.get('low_fps_threshold', LOW_DELIVERED_FPS_WARN_THRESHOLD):.1f}` FPS, low windows=`{cadence.get('low_fps_windows')}`); check room lighting / webcam auto-exposure.",
+            "",
+        ])
     lines.extend([
         "## 1. Alignment & Integrity",
         f"- **Alignment & integrity verdict:** **{'VALID (`alignment_ok=True`)' if integ.get('alignment_ok') else 'INVALID (`alignment_ok=False`)'}**",
         run_line,
         f"- **Diag CSV:** `{integ['diag_csv']}` (`{integ['diag_rows']}` rows, `{integ['diag_columns']}` columns)",
+        f"- **Cadence (`{cadence.get('delivered_fps_formula', '(N - 1) / (last_capture_s - first_capture_s)')}`):** `requested_fps={req_fps_str}`, `delivered_fps_overall={deliv_fps_str}`, `capture_span_s={cadence.get('capture_span_s')}`, `max_frame_gap_ms={cadence.get('max_frame_gap_ms')}`, `low_fps_warning={cadence.get('low_fps_warning', False)}`",
         f"- **Recorder markers:** `COMPLETE={integ['complete_marker_present']}`, `INCOMPLETE_absent={integ['incomplete_marker_absent']}`, `overflow={integ['overflow']}`, `config_changes={integ['config_changes']}`, `complete={integ['complete_flag']}`",
         f"- **DSP config (E4REC BEGIN):** `min_cutoff={integ['trace_header'].get('min_cutoff')}`, `beta={integ['trace_header'].get('beta')}`, `derivative_cutoff={integ['trace_header'].get('derivative_cutoff')}`",
         f"- **1:1 Alignment (`COORD_TOL={integ.get('coord_tol', COORD_TOL):.1e}`):** `frame_id_mismatches={integ['frame_id_mismatches']}`, `ts_ms_mismatches={integ.get('ts_ms_mismatches', 0)}`, `capture_s_mismatches={integ['capture_s_mismatches']}` (`max_diff={integ['max_abs_capture_s_diff']:.3e} s`), `state_mismatches={integ['state_mismatches']}`, `norm_mismatches=({integ.get('norm_x_mismatches', 0)}, {integ.get('norm_y_mismatches', 0)})`, `max_delta_norm=({integ['max_abs_delta_norm_x']:.3e}, {integ['max_abs_delta_norm_y']:.3e})`, `logged_y_sign={integ['logged_y_sign']}`",
@@ -1209,11 +1276,17 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
     lines += ["", "## 2. Raw Fixation Stability & Attribution by Window"]
     for w in report["windows"]:
         wash_mode = "strict-protocol" if w.get("strict_protocol_wash_in") else "window-start"
+        w_fps = w.get("delivered_fps")
+        w_fps_str = f"{w_fps:.2f} FPS" if w_fps is not None else "n/a"
         lines.append(
             f"### Window `{w['window']}` ([{w['interval_s'][0]:.3f}s, {w['interval_s'][1]:.3f}s), "
             f"wash_in={w.get('wash_in_s', 0.0):.2f}s ({wash_mode}), blink_pad=+-{w.get('blink_pad_frames', 0)}f)"
         )
-        lines.append(f"- Frames in window: `{w['total_frames_in_window']}`, Eligible (`state=0, detected=1`): `{w['eligible_frames']}`, Exclusions: `{w['exclusions']}`")
+        lines.append(
+            f"- Delivered FPS: `{w_fps_str}` (raw window frames: `{w.get('total_frames_in_raw_window', w['total_frames_in_window'])}`), "
+            f"Frames in window: `{w['total_frames_in_window']}`, Eligible (`state=0, detected=1`): `{w['eligible_frames']}`, "
+            f"Exclusions: `{w['exclusions']}`"
+        )
         if w["eligible_frames"] == 0:
             lines.append("- **No eligible frames in window.**")
             continue
@@ -1272,9 +1345,11 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
             lines.append(
                 f"- **{d['comparison']}** (`{d['window_a']}` -> `{d['window_b']}`): "
                 f"`Δraw_x={d['delta_raw_x_mean']:+.5f}`, `Δraw_y(logged)={d['delta_raw_y_mean']:+.5f}`, "
+                f"`Δraw_y_median={d['delta_raw_y_median']:+.5f}`, "
                 f"`Δraw_y(fixed)={d['delta_raw_y_fixed_sign_mean']:+.5f}`, "
                 f"`Δsx={d['delta_sx_mean']:+.5f}`, `Δsy={d['delta_sy_mean']:+.5f}`, "
-                f"`Δrel_yaw={d['delta_rel_yaw_mean']:+.3f}°`, `Δrel_pitch={d['delta_rel_pitch_mean']:+.3f}°`"
+                f"`Δrel_yaw={d['delta_rel_yaw_mean']:+.3f}°`, `Δrel_pitch={d['delta_rel_pitch_mean']:+.3f}°`, "
+                f"`Δabs_pitch={d['delta_abs_pitch_mean']:+.3f}°`"
             )
             if "candidate_delta_raw_x_mean" in d:
                 lines.append(
@@ -1443,6 +1518,7 @@ def run_cued_capture(
     width: Optional[int] = None,
     height: Optional[int] = None,
     fps: Optional[float] = None,
+    pre_cue_s: float = DEFAULT_PRE_CUE_S,
 ) -> Path:
     run_dir = run_dir.resolve()
     diag_csv = diag_csv.resolve()
@@ -1457,7 +1533,9 @@ def run_cued_capture(
             f"Recorder output directory already exists (use a fresh --run-dir or --dsp-record-dir): {dsp_dir}"
         )
 
-    plan = build_cued_target_plan(targets=targets, hold_s=hold_s, gap_s=gap_s, initial_settle_s=1.0)
+    plan = build_cued_target_plan(
+        targets=targets, hold_s=hold_s, gap_s=gap_s, initial_settle_s=1.0, pre_cue_s=pre_cue_s
+    )
     total_target_s = plan[-1]["offset_from_ready_end_s"] + 2.0
     seconds = int(math.ceil(total_target_s + min(readiness_timeout_s, 15.0)))
     if total_target_s > 65.0:
@@ -1522,6 +1600,7 @@ def run_cued_capture(
     epoch_mono: Optional[float] = None
     next_idx = 0
     active_idx: Optional[int] = None
+    pre_cue_state: Optional[Dict[str, Any]] = None
     raw_targets: List[Dict[str, Any]] = []
     status_samples: List[Tuple[int, float]] = []
     console_tail: "collections.deque[str]" = collections.deque(maxlen=200)
@@ -1569,19 +1648,44 @@ def run_cued_capture(
                 rel_ready = now - gate.calib_ready_time
                 if active_idx is None and next_idx < len(plan):
                     item = plan[next_idx]
-                    if rel_ready >= item["offset_from_ready_start_s"]:
-                        active_idx = next_idx
-                        msg = f"Look at {item['name']} and hold still."
+                    pre_cue_off = item["offset_from_ready_pre_cue_s"]
+                    if (
+                        pre_cue_state is None
+                        and pre_cue_off is not None
+                        and rel_ready >= pre_cue_off
+                        and rel_ready < item["offset_from_ready_start_s"]
+                    ):
+                        pc_t0 = clock()
+                        prep_msg = f"Prepare: move eyes to {item['name']} now."
                         print(
-                            f"[CUE START +{rel_ready:.2f}s from ready | wall=+{now - launch_mono:.2f}s] {msg}",
+                            f"[PRE-CUE   +{rel_ready:.2f}s from ready | wall=+{pc_t0 - launch_mono:.2f}s] {prep_msg}",
                             flush=True,
                         )
-                        speaker.speak(item["name"].capitalize())
+                        speaker.speak(prep_msg)
+                        pc_t1 = clock()
+                        pre_cue_state = {
+                            "pre_cue_mono": pc_t0,
+                            "pre_cue_dispatch_ms": round((pc_t1 - pc_t0) * 1000.0, 3),
+                        }
+                    if rel_ready >= item["offset_from_ready_start_s"]:
+                        active_idx = next_idx
+                        st_t0 = clock()
+                        msg = f"Hold {item['name']} still."
+                        print(
+                            f"[CUE START +{rel_ready:.2f}s from ready | wall=+{st_t0 - launch_mono:.2f}s] {msg}",
+                            flush=True,
+                        )
+                        speaker.speak(f"Hold {item['name'].lower()}.")
+                        st_t1 = clock()
                         raw_targets.append({
                             "name": item["name"],
-                            "start_mono": now,
+                            "pre_cue_mono": pre_cue_state["pre_cue_mono"] if pre_cue_state else None,
+                            "pre_cue_dispatch_ms": pre_cue_state["pre_cue_dispatch_ms"] if pre_cue_state else None,
+                            "start_mono": st_t0,
+                            "cue_start_dispatch_ms": round((st_t1 - st_t0) * 1000.0, 3),
                             "end_mono": None,
                         })
+                        pre_cue_state = None
                 elif active_idx is not None:
                     item = plan[active_idx]
                     if rel_ready >= item["offset_from_ready_end_s"]:
@@ -1637,11 +1741,18 @@ def run_cued_capture(
     trace_times = _extract_trace_capture_times(dsp_dir / "trace.txt")
     t_base, sync_method = _resolve_capture_epoch_mono(status_samples, trace_times, epoch_mono, launch_mono)
     calib_ready_s = round(gate.calib_ready_time - t_base, 4)
+    effective_gap_pre_cue = min(float(pre_cue_s), max(0.0, float(gap_s) - 0.5)) if pre_cue_s > 0.0 else 0.0
     scheduled_targets = [
         {
             "name": t["name"],
+            "pre_cue_s": round(float(t["pre_cue_mono"]) - t_base, 4) if t["pre_cue_mono"] is not None else None,
+            "pre_cue_wall_s": round(float(t["pre_cue_mono"]) - launch_mono, 4) if t["pre_cue_mono"] is not None else None,
+            "pre_cue_dispatch_ms": t["pre_cue_dispatch_ms"],
             "target_start_s": round(float(t["start_mono"]) - t_base, 4),
+            "cue_start_wall_s": round(float(t["start_mono"]) - launch_mono, 4),
+            "cue_start_dispatch_ms": t["cue_start_dispatch_ms"],
             "target_end_s": round(float(t["end_mono"]) - t_base, 4),
+            "cue_end_wall_s": round(float(t["end_mono"]) - launch_mono, 4),
         }
         for t in raw_targets
     ]
@@ -1654,6 +1765,8 @@ def run_cued_capture(
         "width": width,
         "height": height,
         "fps": fps,
+        "requested_pre_cue_s": pre_cue_s,
+        "pre_cue_s": effective_gap_pre_cue,
         "audio_cues_enabled": bool(audio),
         "time_sync_method": sync_method,
         "first_frame_capture_s": round(float(trace_times[0]), 4) if trace_times else None,
@@ -1705,6 +1818,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--targets", type=str, default=",".join(DEFAULT_CUED_TARGETS), help="Comma-separated cued targets")
     ap.add_argument("--hold-s", type=float, default=10.0, help="Seconds per cued target (default: 10.0)")
     ap.add_argument("--gap-s", type=float, default=2.0, help="Transition gap seconds between targets (default: 2.0)")
+    ap.add_argument(
+        "--pre-cue-s",
+        type=float,
+        default=DEFAULT_PRE_CUE_S,
+        help="Seconds before each target start to announce eye-movement prep prompt (capped to gap_s - 0.5; 0 to disable; default: 2.5)",
+    )
     ap.add_argument("--no-audio", action="store_true", help="Disable spoken TTS cues during --cued-capture")
     ap.add_argument("--yes", action="store_true", help="Skip interactive confirmation prompt for --cued-capture")
     args = ap.parse_args(argv)
@@ -1719,6 +1838,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error("--height must be > 0")
     if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0.0):
         ap.error("--fps must be > 0")
+    if not math.isfinite(args.pre_cue_s) or args.pre_cue_s < 0.0:
+        ap.error("--pre-cue-s must be finite and >= 0")
 
     run_dir = args.run_dir.resolve()
     out_json = (args.out_json or (run_dir / "gaze_attribution_report.json")).resolve()
@@ -1745,6 +1866,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             width=args.width,
             height=args.height,
             fps=args.fps,
+            pre_cue_s=args.pre_cue_s,
         )
 
     resolved_dsp_dir, resolved_diag_csv, auto_sched_path = resolve_run_paths(
@@ -1800,8 +1922,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ]
     directions = compute_direction_checks(windows_res)
 
+    all_cap_times = [float(r["capture_s"]) for r in rows if math.isfinite(r["capture_s"])]
+    delivered_fps_overall = _compute_cadence_fps(all_cap_times)
+    capture_span_s = (
+        float(all_cap_times[-1] - all_cap_times[0])
+        if len(all_cap_times) >= 2
+        else 0.0
+    )
+    max_frame_gap_ms = (
+        float(np.max(np.diff(np.array(all_cap_times, dtype=np.float64)) * 1000.0))
+        if len(all_cap_times) >= 2
+        else 0.0
+    )
+    raw_req_fps = cued_meta.get("fps") if isinstance(cued_meta, dict) else args.fps
+    requested_fps = float(raw_req_fps) if raw_req_fps is not None else None
+    low_fps_windows = [
+        w["window"]
+        for w in windows_res
+        if w.get("delivered_fps") is not None and w["delivered_fps"] < LOW_DELIVERED_FPS_WARN_THRESHOLD
+    ]
+    low_fps_overall = (
+        delivered_fps_overall is not None
+        and delivered_fps_overall < LOW_DELIVERED_FPS_WARN_THRESHOLD
+    )
+    low_fps_warning = bool(low_fps_overall or low_fps_windows)
+    cadence = {
+        "requested_fps": requested_fps,
+        "delivered_fps_overall": delivered_fps_overall,
+        "delivered_fps_formula": "(N - 1) / (last_capture_s - first_capture_s)",
+        "low_fps_threshold": LOW_DELIVERED_FPS_WARN_THRESHOLD,
+        "low_fps_warning": low_fps_warning,
+        "low_fps_windows": low_fps_windows,
+        "total_rows": len(rows),
+        "capture_span_s": capture_span_s,
+        "max_frame_gap_ms": max_frame_gap_ms,
+    }
+
     report = {
         "integrity": integrity,
+        "cadence": cadence,
         "deployed_models": dep_inv,
         "candidate_models": cand_inv,
         "cued_schedule": cued_meta,
@@ -1843,14 +2002,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"nonfinite={integrity['nonfinite_errors']} y_sign={integrity['logged_y_sign']} "
         f"max_dnorm=({integrity['max_abs_delta_norm_x']:.3e}, {integrity['max_abs_delta_norm_y']:.3e})"
     )
+    req_fps_disp = f"{requested_fps:.2f}" if requested_fps is not None else "unspecified"
+    deliv_fps_disp = f"{delivered_fps_overall:.2f}" if delivered_fps_overall is not None else "n/a"
+    print(
+        f"Cadence: requested_fps={req_fps_disp} | delivered_fps={deliv_fps_disp} "
+        f"(span={capture_span_s:.2f}s, max_gap={max_frame_gap_ms:.1f}ms)"
+    )
+    if low_fps_warning:
+        fps_note = deliv_fps_disp if low_fps_overall else f"windows={low_fps_windows}"
+        print(
+            f"LOW DELIVERED FPS WARNING: {fps_note} < {LOW_DELIVERED_FPS_WARN_THRESHOLD:.0f} FPS; "
+            "check room lighting / webcam auto-exposure"
+        )
     for w in windows_res:
         if w["eligible_frames"] == 0:
             print(f"[{w['window']}] NO ELIGIBLE FRAMES (total={w['total_frames_in_window']})")
             continue
         rx, ry = w["raw_x"], w["raw_y"]
         vd = w["variance_decomposition"]
+        w_fps_disp = f"{w['delivered_fps']:.2f}" if w.get("delivered_fps") is not None else "n/a"
         print(
-            f"[{w['window']}] n={rx['n']} | "
+            f"[{w['window']}] n={rx['n']} fps={w_fps_disp} | "
             f"raw_x: mean={rx['mean']:.5f} SD={rx['pop_sd']:.6f} rng={rx['range']:.6f} |slope|={abs(rx['ols_slope_per_s']):.6f} gap={rx['max_gap_ms']:.1f}ms [{'PASS' if rx['pass_all'] else 'FAIL'}] | "
             f"raw_y: mean={ry['mean']:.5f} SD={ry['pop_sd']:.6f} rng={ry['range']:.6f} |slope|={abs(ry['ols_slope_per_s']):.6f} gap={ry['max_gap_ms']:.1f}ms [{'PASS' if ry['pass_all'] else 'FAIL'}]"
         )

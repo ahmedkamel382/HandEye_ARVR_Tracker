@@ -1132,6 +1132,9 @@ class ScriptedDetector:
     def detect(self, image):
         return SimpleNamespace(hand_landmarks=[], hand_world_landmarks=[], handedness=[])
 
+    def close(self):
+        pass
+
 
 # ---------------------------------------------------------------- real mouse: gestures may pause, never resume
 

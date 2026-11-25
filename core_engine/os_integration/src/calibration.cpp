@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace osi {
 namespace {
@@ -79,6 +80,18 @@ std::array<CalibrationTarget, 5> default_calibration_targets() noexcept {
     return {{{0.5, 0.5}, {0.12, 0.12}, {0.88, 0.12}, {0.88, 0.88}, {0.12, 0.88}}};
 }
 
+std::string observations_csv(const std::vector<TargetObservation>& observations) {
+    std::string csv = "target_u,target_v,x,y\n";
+    char line[128];
+    for (const TargetObservation& o : observations) {
+        for (const NormalizedPoint& p : o.samples) {
+            std::snprintf(line, sizeof(line), "%.17g,%.17g,%.17g,%.17g\n", o.target.u, o.target.v, p.x, p.y);
+            csv += line;
+        }
+    }
+    return csv;
+}
+
 RegionFitResult fit_input_region(const std::vector<TargetObservation>& observations,
                                  const RegionFitOptions& options) {
     RegionFitResult result;
@@ -106,6 +119,8 @@ RegionFitResult fit_input_region(const std::vector<TargetObservation>& observati
         vs.push_back(observations[k].target.v);
         xs.push_back(median(x));
         ys.push_back(median(y));
+        const double unknown = std::numeric_limits<double>::quiet_NaN(); // known once both axes are fitted
+        result.targets.push_back({observations[k].target, x.size(), xs.back(), ys.back(), unknown, unknown});
     }
 
     const auto fx = fit_line(us, xs);
@@ -127,6 +142,8 @@ RegionFitResult fit_input_region(const std::vector<TargetObservation>& observati
         const double du = (xs[k] - fx->offset) / fx->slope - us[k];
         const double dv = (ys[k] - fy->offset) / fy->slope - vs[k];
         squared += du * du + dv * dv;
+        result.targets[k].error_u = du;
+        result.targets[k].error_v = dv;
     }
     const double rms = std::sqrt(squared / static_cast<double>(us.size()));
 

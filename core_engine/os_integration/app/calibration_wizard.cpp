@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
+#include <fstream>
 
 namespace osi::app {
 namespace {
@@ -357,9 +359,43 @@ void CalibrationWizard::tick() {
 
 void CalibrationWizard::complete_range() {
     const RegionFitResult result = fit_input_region(observations_);
+    const char* kind = kind_ == WizardKind::HandRange ? "hand" : "gaze";
+    // The raw samples go next to the log, so the fit can be recomputed exactly; the log keeps the per-target summary.
+    const std::filesystem::path log = AppLog::path();
+    if (!log.empty()) {
+        char stamp[32] = "unknown";
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        if (localtime_s(&local, &now) == 0) {
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local);
+        }
+        const auto file = log.parent_path() / (std::string("calibration_") + kind + "_" + stamp + ".csv");
+        std::ofstream out(file, std::ios::binary);
+        out << observations_csv(observations_);
+        if (out.flush()) {
+            AppLog::info("calibration samples saved to " + to_utf8(file.wstring()));
+        } else {
+            AppLog::warn("calibration samples could not be saved to " + to_utf8(file.wstring()));
+        }
+    }
+    for (const TargetFit& t : result.targets) {   // enough to reproduce the error figure from the log
+        char line[220];
+        std::snprintf(line, sizeof(line),
+                      "%s calibration target (%.2f, %.2f): %zu samples, median input (%.6f, %.6f), error (%+.6f, %+.6f)",
+                      kind, t.target.u, t.target.v, t.samples, t.median_x, t.median_y, t.error_u, t.error_v);
+        AppLog::info(line);
+    }
     if (!result.fit) {
+        AppLog::info(std::string(kind) + " calibration rejected: " + result.error);
         fail(to_wide(result.error));
         return;
+    }
+    {
+        const InputRegion& r = result.fit->region;
+        char line[200];
+        std::snprintf(line, sizeof(line), "%s calibration fit: region %.6f %.6f %.6f %.6f, rms %.6f (limit %.2f)", kind,
+                      r.x_min, r.y_min, r.x_max, r.y_max, result.fit->rms_error, RegionFitOptions{}.max_rms_error);
+        AppLog::info(line);
     }
     result_settings_ = settings_;
     InputRegion& region = kind_ == WizardKind::HandRange ? result_settings_.mapping.hand_region

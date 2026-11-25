@@ -39,9 +39,21 @@ struct RegionFit {
     double rms_error;
 };
 
+// One target after the fit: what was measured, and how far its median lands
+// from the target (screen fractions). rms_error is sqrt(mean(error_u^2 + error_v^2)).
+struct TargetFit {
+    CalibrationTarget target;
+    std::size_t samples;   // finite samples used
+    double median_x;       // median raw input
+    double median_y;
+    double error_u;        // where the median maps minus the target, horizontally (NaN if the fit stopped earlier)
+    double error_v;
+};
+
 struct RegionFitResult {
     std::optional<RegionFit> fit;
-    std::string error; // user-facing reason when fit is empty
+    std::string error;              // user-facing reason when fit is empty
+    std::vector<TargetFit> targets; // every target with enough samples, also for a rejected fit
 };
 
 struct RegionFitOptions {
@@ -51,6 +63,9 @@ struct RegionFitOptions {
 
 RegionFitResult fit_input_region(const std::vector<TargetObservation>& observations,
                                  const RegionFitOptions& options = {});
+
+// Every sample of every target as CSV (target_u,target_v,x,y; full precision), so a fit can be recomputed exactly.
+std::string observations_csv(const std::vector<TargetObservation>& observations);
 
 // ------------------------------------------------------------ blink timing
 //

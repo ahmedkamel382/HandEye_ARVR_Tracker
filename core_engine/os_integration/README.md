@@ -314,6 +314,12 @@ project's `.venv` (`setup.bat`).
   for MJPG like the engine. A label lists any option that differs, unsaved
   tuning included. The tester runs the
   Python trackers, so its timings are **not** core_engine's latency.
+* **Input validation** follows the engine's bridge: a hand result needs exactly
+  21 image and 21 world landmarks, all finite (`landmark_extractors.pack_hand`),
+  otherwise the tracker sees "no hand". A face result needs 478 finite points and
+  a finite 4-by-4 head pose. The tester and native bridge check the same
+  packed float32 coordinates before tracking. Rejections are
+  counted under Live data > Invalid landmarks.
 * **Smoothing** follows `freshness_gate.hpp`: a rejected timestamp replays the
   last filtered point as Held, an invalid input publishes nothing.
 * Run it without the launcher: `.venv\Scripts\python.exe core_engine\os_integration\tester\handeye_tester.py`.

@@ -176,20 +176,16 @@ def get_head_pose_angles(matrix) -> Tuple[float, float, float]:
     return angles
 
 
-def _landmarks_and_pose_finite(landmarks, pose_matrix, min_landmarks: int = 478) -> bool:
-    if landmarks is None or len(landmarks) < min_landmarks or pose_matrix is None:
+def _landmarks_and_pose_finite(landmarks, pose_matrix) -> bool:
+    if landmarks is None or len(landmarks) != 478 or pose_matrix is None:
         return False
     try:
-        for idx in range(min_landmarks):
-            lm = landmarks[idx]
-            if not (math.isfinite(float(lm.x)) and math.isfinite(float(lm.y)) and math.isfinite(float(lm.z))):
-                return False
-        mat = np.asarray(pose_matrix, dtype=np.float64)
-        if mat.ndim < 2 or mat.shape[0] < 3 or mat.shape[1] < 3 or not np.all(np.isfinite(mat)):
-            return False
-    except (AttributeError, TypeError, ValueError):
+        with np.errstate(over="ignore", invalid="ignore"):
+            coords = np.asarray([(p.x, p.y, p.z) for p in landmarks], dtype=np.float32)
+            mat = np.asarray(pose_matrix, dtype=np.float32)
+        return mat.shape == (4, 4) and np.isfinite(mat).all() and np.isfinite(coords).all()
+    except (AttributeError, OverflowError, TypeError, ValueError):
         return False
-    return True
 
 
 def extract_gaze_features(landmarks, pose_matrix) -> Tuple[float, float, float, float, float]:

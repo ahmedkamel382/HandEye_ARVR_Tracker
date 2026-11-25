@@ -17,6 +17,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -224,6 +225,7 @@ class Counters:
     pauses: int = 0
     frames: int = 0
     refused: int = 0
+    invalid_input: int = 0          # landmark results the engine would reject too
 
 
 @dataclass
@@ -256,7 +258,7 @@ class Snapshot:
 def prepare_ai_imports() -> None:
     """Make the teammates' modules importable without changing them."""
     os.environ.setdefault("AI_PIPELINE_ROOT", str(AI_ROOT))
-    for sub in ("hand_kinematics", "gaze_intent"):
+    for sub in ("hand_kinematics", "gaze_intent", "bridge"):
         path = str(AI_ROOT / sub)
         if path not in sys.path:
             sys.path.insert(0, path)
@@ -266,6 +268,74 @@ def prepare_ai_imports() -> None:
         (Path(sys.prefix) / "Library" / "bin").mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
+
+
+_NO_HAND = SimpleNamespace(hand_landmarks=[], hand_world_landmarks=[], handedness=[])
+_NO_FACE = SimpleNamespace(face_landmarks=[], facial_transformation_matrixes=[], face_blendshapes=[])
+
+
+class _ValidatingDetector:
+    """Sits between MediaPipe and a teammate's tracker, which stays unchanged. A result core_engine would not
+    accept reaches the tracker as "nothing detected", exactly what the engine's tracker receives in that case."""
+
+    def __init__(self, inner, accept: Callable[[object], bool], nothing):
+        self._inner, self._accept, self._nothing = inner, accept, nothing
+        self.rejected = 0
+
+    def _check(self, result):
+        if self._accept(result):
+            return result
+        self.rejected += 1
+        return self._nothing
+
+    def detect_for_video(self, image, timestamp_ms):
+        return self._check(self._inner.detect_for_video(image, timestamp_ms))
+
+    def detect(self, image):
+        return self._check(self._inner.detect(image))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _hand_accepted(result) -> bool:
+    """ai_pipeline/bridge/landmark_extractors.pack_hand, the rule core_engine uses: exactly 21 image and 21 world
+    landmarks, all finite. No hand at all passes through unchanged."""
+    from landmark_extractors import pack_hand
+    image = result.hand_landmarks[0] if getattr(result, "hand_landmarks", None) else None
+    world = result.hand_world_landmarks[0] if getattr(result, "hand_world_landmarks", None) else None
+    if image is None and world is None:
+        return True
+    return pack_hand(image, world)[1]["valid"]
+
+
+def _face_accepted(result) -> bool:
+    """Use the same packed face and pose representation as the native bridge."""
+    from landmark_extractors import pack_face
+    faces = getattr(result, "face_landmarks", None)
+    if not faces:
+        return True
+    matrices = getattr(result, "facial_transformation_matrixes", None)
+    if matrices is None or len(matrices) == 0 or np.shape(matrices[0]) != (4, 4):
+        return False
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            return pack_face(faces[0], matrices[0])[1]["valid"]
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return False
+
+
+def _guard(tracker, names, accept, nothing) -> List[_ValidatingDetector]:
+    guards = []
+    for name in names:
+        inner = getattr(tracker, name, None)
+        if inner is not None:
+            guard = _ValidatingDetector(inner, accept, nothing)
+            setattr(tracker, name, guard)
+            guards.append(guard)
+    if not guards:
+        raise RuntimeError(f"{type(tracker).__name__} has no detector to validate: update the tester")
+    return guards
 
 
 class HandSource:
@@ -278,6 +348,11 @@ class HandSource:
         else:
             from hand_tracker import HandTracker
             self.tracker = HandTracker(enable_lowlight=config.lowlight, enable_roi_recovery=config.roi_recovery)
+        self._guards = _guard(self.tracker, ("detector", "roi_detector", "_detector"), _hand_accepted, _NO_HAND)
+
+    @property
+    def rejected(self) -> int:
+        return sum(g.rejected for g in self._guards)
 
     def process(self, bgr: np.ndarray) -> HandObs:
         start = time.perf_counter()
@@ -328,6 +403,7 @@ class GazeSource:
         import gaze_intent
         self.module = gaze_intent
         self.tracker = gaze_intent.GazeIntent()
+        self._guards = _guard(self.tracker, ("detector",), _face_accepted, _NO_FACE)
         self._start = time.perf_counter()
         self._last_ms = -1
 
@@ -346,6 +422,10 @@ class GazeSource:
             )
         obs.ms = (time.perf_counter() - start) * 1000.0
         return obs
+
+    @property
+    def rejected(self) -> int:
+        return sum(g.rejected for g in self._guards)
 
     def close(self) -> None:
         try:
@@ -681,6 +761,7 @@ class TesterEngine:
         hand_key = (mode.hand, config.lowlight, config.roi_recovery, round(config.index_alpha, 3)) if mode.hand else None
         if hand_key != state.hand_key:
             if state.hand:
+                state.rejected_seen -= _rejected(state.hand)
                 state.hand.close()
             state.hand = None
             if mode.hand:
@@ -690,6 +771,7 @@ class TesterEngine:
             state.hand_key = hand_key
         if bool(mode.gaze) != (state.gaze is not None):
             if state.gaze:
+                state.rejected_seen -= _rejected(state.gaze)
                 state.gaze.close()
                 state.gaze = None
             if mode.gaze:
@@ -912,10 +994,20 @@ class TesterEngine:
         elif state.release_warned and not report.release_pending:
             self.event("Windows accepted the button release")
         state.release_warned = report.release_pending
+        rejected = _rejected(state.hand, state.gaze)
+        if rejected > state.rejected_seen:
+            if c.invalid_input == 0:
+                self.event("Rejected invalid landmarks from MediaPipe, as core_engine does (counted in Live data)")
+            c.invalid_input += rejected - state.rejected_seen
+        state.rejected_seen = rejected
         if mode.hand:
             state.track_history.append(hand.tracking)
         elif mode.gaze:
             state.track_history.append(osi_capi.TRACKED if gaze.face else osi_capi.LOST)
+
+
+def _rejected(*sources) -> int:
+    return sum(getattr(source, "rejected", 0) for source in sources if source is not None)
 
 
 def _changes_control(old: TesterConfig, new: TesterConfig) -> bool:
@@ -974,10 +1066,12 @@ class _WorkerState:
         self.release_warned = False
         self.trail: Deque[Tuple[float, float]] = deque(maxlen=40)
         self.counters = Counters()
+        self.rejected_seen = 0
         self.track_history: Deque[int] = deque(maxlen=150)
 
     def reset_stats(self):
         self.counters = Counters()
+        self.rejected_seen = _rejected(self.hand, self.gaze)
         self.track_history.clear()
         self.trail.clear()
 

@@ -714,6 +714,93 @@ class TestMockedGazeIntentPipeline:
         assert math.isclose(ay, -2.5, abs_tol=1e-4)
 
 
+    def test_nonfinite_landmarks_pose_and_prediction_rejected_and_recovers(self, mocked_gaze_tracker):
+        tracker, stub = mocked_gaze_tracker
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        ts = 0
+
+        # Non-finite pose matrix directly raises ValueError in get_head_pose_angles
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            bad_pose = make_pose_matrix()
+            bad_pose[1, 2] = bad
+            with pytest.raises(ValueError):
+                get_head_pose_angles(bad_pose)
+        with pytest.raises(ValueError):
+            get_head_pose_angles(np.eye(2, dtype=np.float32))
+
+        # 1. Mid-calibration NaN resets incomplete calibration back to 0
+        for _ in range(10):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.ear_state.current_calibration_frames == 10
+
+        bad_lm = make_synthetic_landmarks()
+        bad_lm[468].x = float("nan")
+        stub.next_landmarks = bad_lm
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+        assert math.isnan(hy) and math.isnan(hp)
+        assert tracker.ear_state.current_calibration_frames == 0
+
+        # Fewer than 478 landmarks -> rejected cleanly without IndexError
+        stub.next_landmarks = make_synthetic_landmarks()[:477]
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+        # Complete full calibration after reset
+        stub.next_landmarks = make_synthetic_landmarks()
+        stub.next_pose = make_pose_matrix()
+        for _ in range(CALIBRATION_FRAMES):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+
+        # 2. Post-calibration valid -> invalid (NaN/+-Inf in landmark, pose, or predictor) -> valid recovery
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is not None and is_valid_output(ay, ap)
+
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            lm_corrupt = make_synthetic_landmarks()
+            lm_corrupt[33].y = bad
+            stub.next_landmarks = lm_corrupt
+            stub.next_pose = make_pose_matrix()
+            ts += 33
+            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+            assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+            stub.next_landmarks = make_synthetic_landmarks()
+            pose_corrupt = make_pose_matrix()
+            pose_corrupt[0, 0] = bad
+            stub.next_pose = pose_corrupt
+            ts += 33
+            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+            assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+        # Model predictor outputting NaN/+Inf is also rejected cleanly
+        class _BadModel:
+            def predict(self, _):
+                return np.array([[float("nan")]], dtype=np.float32)
+
+        orig_yaw_model = tracker.yaw_model
+        tracker.yaw_model = _BadModel()
+        stub.next_landmarks = make_synthetic_landmarks()
+        stub.next_pose = make_pose_matrix()
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+        tracker.yaw_model = orig_yaw_model
+
+        # Valid frame immediately recovers with calibration preserved
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+        assert state == 0 and lms is not None and is_valid_output(ay, ap)
+        assert math.isfinite(hy) and math.isfinite(hp)
+
+
 # ===========================================================================
 # Pillar 4: Coordinate Mapping & Calibration Math (gaze_intent.py & run_gaze.py)
 # ===========================================================================

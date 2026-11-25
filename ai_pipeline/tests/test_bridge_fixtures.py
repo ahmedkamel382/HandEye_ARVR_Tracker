@@ -82,6 +82,8 @@ def test_pack_face_valid_and_malformed_counts():
         (None, pose),
         (lms(478), None),
         (lms(478), np.eye(3, dtype=np.float32)),
+        (lms(478), np.ones((2, 8), dtype=np.float32)),
+        (lms(479), pose),
     ):
         p, d = le.pack_face(bad_face, bad_pose)
         assert p.shape == (0, 3) and not d["valid"] and d["packed_n"] == 0
@@ -104,4 +106,3 @@ def test_pack_face_rejects_nonfinite_and_recovers():
     # Next clean frame recovers immediately
     p, d = le.pack_face(lms(478), pose)
     assert p.shape == (484, 3) and d["valid"] and d["packed_n"] == 484
-

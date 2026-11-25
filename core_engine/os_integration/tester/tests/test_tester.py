@@ -6,6 +6,7 @@ Needs a built os_integration_capi.dll (out/build/...); those tests skip without 
 """
 
 import csv
+import gc
 import math
 import sys
 import threading
@@ -716,6 +717,89 @@ def test_run_checks_dialog_can_be_closed_early(make_app, tk_root, monkeypatch, c
         assert "ALL CHECKS PASSED" in text.get("1.0", "end")
 
 
+def _pending_timers(tk_root):
+    return set(tk_root.tk.splitlist(tk_root.tk.call("after", "info")))
+
+
+@pytest.mark.parametrize("schedule", ["startup", "run_checks", "tuning_edit"])
+def test_closing_the_window_cancels_its_tk_timers(make_app, tk_root, monkeypatch, schedule):
+    """Root cause of the intermittent test_run_checks_dialog_can_be_closed_early failure.
+
+    Destroying a window deletes its Python callbacks but leaves their Tcl `after` timers pending. Tkinter names a
+    callback after the memory address of a temporary object plus the function name ('<lambda>' for the patched
+    tick), so a later callback can be given the same name - for example a Scrollable `lambda e:` binding. When the
+    stale timer fires it calls that binding with no event argument (TypeError). The test that pumps the event loop
+    for 0.8 s is the one that runs the stale timers of earlier tests, hence the rare failure there.
+    Here the address reuse is simulated, so the failure is deterministic."""
+    monkeypatch.setattr(tester_app, "system_checks", lambda *a, **k: [(True, "fake check", "")])
+    before = _pending_timers(tk_root)
+    app = make_app()
+    if schedule == "run_checks":
+        app.run_checks()
+    elif schedule == "tuning_edit":
+        app._tuning_changed()
+    mine = _pending_timers(tk_root) - before
+    assert mine, "the app scheduled no timer, so this test checks nothing"
+
+    errors = []
+    monkeypatch.setattr(tk_root, "report_callback_exception", lambda *info: errors.append(info[1]))
+    app.root.destroy()
+    stale = _pending_timers(tk_root) & mine
+    for timer in stale:     # what address reuse does: a new event handler takes the stale timer's command name
+        name = tk_root.tk.splitlist(tk_root.tk.call("after", "info", timer))[0]
+        tk_root.tk.createcommand(name, tk.CallWrapper(lambda e: None, None, tk_root).__call__)
+        tk_root.tk.call("after", "cancel", timer)
+        tk_root.tk.call("after", 0, name)
+    for _ in range(5):
+        tk_root.update()
+    assert not stale and not errors, f"timers left running after the window closed: {sorted(stale)} {errors}"
+
+
+def test_no_timer_is_scheduled_after_the_window_closed(make_app, tk_root):
+    """A callback that runs during or after teardown must not start a timer that nothing would cancel."""
+    app = make_app()
+    app.root.destroy()
+    before = _pending_timers(tk_root)
+    assert app._after(10, lambda: None) is None
+    app._tuning_changed()                     # e.g. a slider trace firing late
+    assert _pending_timers(tk_root) == before and not app._timers
+
+
+
+def test_destroyed_windows_leave_no_tk_garbage_for_a_worker_thread(lib, tk_root, monkeypatch, request):
+    """CI: the Tk variables of destroyed Tester windows were freed by a garbage collection that happened to run on a
+    worker thread, where Tkinter raises "main thread is not in main loop". conftest.py now collects after every test
+    on the main thread. This reproduces the hazard, then shows that a main-thread collection leaves nothing behind."""
+    assert "collect_tk_garbage_on_the_main_thread" in request.fixturenames, "conftest.py no longer collects"
+    monkeypatch.setattr(tester_app.TesterApp, "tick", lambda self: None)
+    errors = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda info: errors.append(info.exc_value))
+
+    def leave_a_destroyed_app():
+        window = tk.Toplevel(tk_root)
+        window.withdraw()
+        tester_app.TesterApp(window, lib, lambda text: None)
+        window.destroy()
+
+    def collect_on_a_worker_thread():
+        worker = threading.Thread(target=gc.collect)
+        worker.start()
+        worker.join()
+
+    gc.collect()
+    gc.disable()                                    # only the explicit collections below may run
+    try:
+        leave_a_destroyed_app()
+        collect_on_a_worker_thread()
+        assert errors and all(isinstance(e, RuntimeError) for e in errors), "setup: the hazard did not reproduce"
+        errors.clear()
+        leave_a_destroyed_app()
+        gc.collect()                                # what the conftest fixture does after every test
+        collect_on_a_worker_thread()
+        assert not errors, errors[:3]
+    finally:
+        gc.enable()
+
 # ---------------------------------------------------------------- Space shortcut
 
 @pytest.mark.parametrize("widget, active, toggles", [
@@ -1088,6 +1172,18 @@ class ScriptedDetector:
         pass
 
 
+# ---------------------------------------------------------------- real mouse: gestures may pause, never resume
+
+class ClosedEyes:
+    """Eyes closed for the whole test (gaze state 3 = sustained closure)."""
+
+    def process(self, frame):
+        return GazeObs(point=(0.5, 0.5), state=3, face=True)
+
+    def close(self):
+        pass
+
+
 @pytest.fixture
 def scripted_mediapipe(monkeypatch):
     tester_engine.prepare_ai_imports()
@@ -1173,3 +1269,170 @@ def test_invalid_face_input_never_becomes_a_gaze_point(scripted_mediapipe, label
     assert observations[39].point is not None, "setup: no gaze point after calibration"
     assert observations[40].point is None, f"{label} produced a gaze point"
     assert not observations[40].face
+
+
+class Fist:
+    def process(self, frame):
+        return HandObs(point=(0.5, 0.5), state=2, tracking=TRACKED, status="DETECTED")
+
+    def close(self):
+        pass
+
+
+def run_for(engine, state, config, cv2, seconds):
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        time.sleep(0.015)
+        engine._step(state, config, cv2)
+
+
+def start_paused(state, config, active=False):
+    state.config = config
+    state.controller.set_active(active)
+    state.last_report = osi_capi.Report(active=active)
+
+
+@pytest.mark.parametrize("clicks", [True, False])
+def test_real_mouse_eye_closure_never_switches_output_on(worker, monkeypatch, clicks):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True, clicks=clicks)   # record-only controller: no real output
+    start_paused(state, config)
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)                         # closure onset is 1.0 s
+    assert not state.last_report.active
+
+
+def test_real_mouse_eye_closure_still_pauses(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True)
+    start_paused(state, config, active=True)                         # switched on with Activate
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active
+
+
+def test_simulation_eye_closure_never_resumes_either(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    config = replace(state.config, real_mouse=False)
+    start_paused(state, config)
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active                              # the controller itself never resumes
+
+
+def test_real_mouse_fist_toggle_never_switches_output_on(worker, monkeypatch, lib):
+    engine, state, log, cv2 = worker("hand")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    doc = IniDoc(lib.default_settings_ini())
+    doc.set("gestures", "fist_action", "toggle_pause")
+    assert state.controller.apply_settings(doc.text()) is None
+    state.zone = IniDoc(doc.text())
+    config = replace(state.config, real_mouse=True)
+    start_paused(state, config)
+    state.hand = Fist()
+    run_for(engine, state, config, cv2, 0.8)                         # fist onset is 0.3 s
+    assert not state.last_report.active
+
+
+# ============================================================ Engineer 4 DSP contract through the Tester gate
+# The Tester feeds Engineer 4's real filter (os_integration_capi.dll) through Smoother, as core feeds it through
+# freshness_gate.hpp. Timing rules: dt >= 1 us accepted, dt > 250 ms re-initialises, dt == 250 ms does not.
+
+def fresh_gate(lib):
+    filt = lib.smoothing_filter(1.2, 4.0, 1.0)                     # Engineer 4's hand parameters
+    if filt is None:
+        pytest.skip("built without dsp_filter")
+    return Smoother(filt)
+
+
+def test_dsp_exactly_250_ms_keeps_history_and_longer_reinitialises(lib):
+    kept, reset = fresh_gate(lib), fresh_gate(lib)
+    for gate in (kept, reset):
+        gate.apply((0.2, 0.2), TRACKED, 1.0)
+    point, _ = kept.apply((0.8, 0.8), TRACKED, 1.25)               # exactly 0.25 s later (exact in binary)
+    assert point != (0.8, 0.8) and 0.2 < point[0] < 0.8, "a 250 ms gap must not reset the filter"
+    point, _ = reset.apply((0.8, 0.8), TRACKED, 1.2500001)         # strictly more than 0.25 s
+    assert point == (0.8, 0.8), "a gap over 250 ms must re-initialise to the new observation"
+
+
+def test_dsp_minimum_interval_is_one_microsecond(lib):
+    accepted, rejected = fresh_gate(lib), fresh_gate(lib)
+    for gate in (accepted, rejected):
+        gate.apply((0.2, 0.2), TRACKED, 0.0)
+    assert accepted.apply((0.8, 0.8), TRACKED, 1e-6)[1] == TRACKED   # exactly 1 us: accepted
+    assert rejected.apply((0.8, 0.8), TRACKED, 0.5e-6) == ((0.2, 0.2), HELD), "under 1 us must replay as held"
+
+
+def test_dsp_held_does_not_advance_the_filter(lib):
+    with_held, without = fresh_gate(lib), fresh_gate(lib)
+    for gate in (with_held, without):
+        gate.apply((0.2, 0.2), TRACKED, 0.0)
+        gate.apply((0.4, 0.4), TRACKED, 0.033)
+    assert with_held.apply((0.9, 0.9), HELD, 0.066)[1] == HELD
+    assert with_held.apply((0.5, 0.5), TRACKED, 0.1) == without.apply((0.5, 0.5), TRACKED, 0.1)
+
+
+def test_dsp_lost_clears_and_the_first_sample_after_recovery_is_unsmoothed(lib):
+    gate = fresh_gate(lib)
+    gate.apply((0.2, 0.2), TRACKED, 0.0)
+    gate.apply((0.4, 0.4), TRACKED, 0.033)
+    assert gate.apply(None, LOST, 0.066) == (None, LOST)
+    assert gate.apply((0.7, 0.3), HELD, 0.1) == (None, LOST), "a held frame after loss has nothing to replay"
+    assert gate.apply((0.7, 0.3), TRACKED, 0.133) == ((0.7, 0.3), TRACKED)
+
+
+def test_dsp_zero_zero_is_a_valid_coordinate(lib):
+    gate = fresh_gate(lib)
+    assert gate.apply((0.0, 0.0), TRACKED, 0.0) == ((0.0, 0.0), TRACKED)
+    assert gate.apply((0.0, 0.0), HELD, 0.033) == ((0.0, 0.0), HELD)
+
+
+def test_dsp_rejected_coordinates_never_become_published_or_cached(lib):
+    gate = fresh_gate(lib)
+    gate.apply((0.2, 0.3), TRACKED, 1.0)
+    for bad in [(math.nan, 0.5), (math.inf, 0.5), (0.5, -math.inf)]:
+        assert gate.apply(bad, TRACKED, 2.0) == (None, LOST)
+        assert gate.apply(bad, HELD, 2.1) == (None, LOST)
+    assert gate.apply((0.9, 0.9), TRACKED, 0.5) == ((0.9, 0.9), TRACKED)    # history cleared: an earlier time is fresh
+    gate2 = fresh_gate(lib)
+    gate2.apply((0.2, 0.3), TRACKED, 1.0)
+    assert gate2.apply((0.9, 0.8), TRACKED, 1.0) == ((0.2, 0.3), HELD)    # duplicate time: never the raw point
+    assert gate2.apply((0.9, 0.8), HELD, 1.1) == ((0.2, 0.3), HELD)
+
+
+def test_dsp_hand_and_gaze_channels_are_independent(lib):
+    hand, gaze = fresh_gate(lib), Smoother(lib.smoothing_filter(0.8, 6.0, 1.5))   # Engineer 4's gaze parameters
+    for gate in (hand, gaze):
+        gate.apply((0.2, 0.2), TRACKED, 0.0)
+        gate.apply((0.4, 0.4), TRACKED, 0.033)
+    reference = Smoother(lib.smoothing_filter(0.8, 6.0, 1.5))
+    reference.apply((0.2, 0.2), TRACKED, 0.0)
+    reference.apply((0.4, 0.4), TRACKED, 0.033)
+    hand.apply(None, LOST, 0.066)                                   # the hand is lost ...
+    assert gaze.apply((0.5, 0.5), TRACKED, 0.066) == reference.apply((0.5, 0.5), TRACKED, 0.066)   # ... gaze unaffected
+
+
+# ============================================================ C interface compatibility
+
+def test_library_refuses_a_dll_of_another_version(lib, monkeypatch):
+    monkeypatch.setattr(osi_capi, "EXPECTED_VERSION", lib.version + 1)
+    with pytest.raises(RuntimeError, match="rebuild"):
+        osi_capi.OsiLibrary(lib.path)
+
+
+def test_library_uses_the_dll_named_by_the_launcher(lib, monkeypatch, tmp_path):
+    monkeypatch.setenv("OSI_CAPI_DLL", str(lib.path))
+    assert osi_capi.find_dll(tmp_path) == lib.path
+    monkeypatch.setenv("OSI_CAPI_DLL", str(tmp_path / "missing.dll"))
+    assert osi_capi.find_dll(tmp_path) is None                      # no out/build under tmp_path either
+
+
+def test_library_reports_a_missing_dll_clearly(monkeypatch, tmp_path):
+    monkeypatch.setattr(osi_capi, "find_dll", lambda start=None: None)
+    with pytest.raises(FileNotFoundError, match="os_integration_capi.dll"):
+        osi_capi.OsiLibrary()

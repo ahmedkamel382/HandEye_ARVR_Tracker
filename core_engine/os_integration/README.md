@@ -35,7 +35,7 @@ filters when the tray's Smoothing menu changes (`TrayOptions::on_settings_change
 | `app/` | `handeye_tray.exe`: system-tray app, settings, and calibration wizard. |
 | `capi/` | `os_integration_capi.dll`: a plain-C interface to `OsController` (used by the tester). |
 | `tester/` | **HandEye Tester**: `HandEyeTester.exe` + a test-bench UI for every part of the system. |
-| `tests/` | 100 library and tray tests, 9 C-interface tests and a latency benchmark (no GoogleTest needed). |
+| `tests/` | 107 library and tray tests, 9 C-interface tests and a latency benchmark (no GoogleTest needed). |
 
 ### Library files
 
@@ -87,10 +87,10 @@ struct FramePayload {
 | Gesture (confirmed after debouncing) | Action |
 | --- | --- |
 | Pinch starts / ends | Left button down / up, so pinch-and-move is a **drag** |
-| Fist (held 0.30 s) | Right click. Configurable: none, middle click, toggle pause. |
+| Fist (held 0.30 s) | Right click. Configurable: none, middle click, pause. |
 | Left wink (held 0.25 s) | Left click |
 | Right wink (held 0.25 s) | Right click |
-| Eyes closed (held 1.0 s) | Toggle pause. Works while paused, so control can resume hands-free. |
+| Eyes closed (held 1.0 s) | Pause. A gesture never resumes control: use Ctrl+Alt+P, the tray menu, or Activate in the tester. |
 | Gaze state −1 (calibrating) | Gaze cursor holds still, as `gaze_intent.py` requests |
 
 ## How it works
@@ -164,10 +164,11 @@ available.
 
 | Risk | Protection |
 | --- | --- |
-| The program takes over the mouse unexpectedly | It starts **paused**. Ctrl+Alt+P, the tray menu or a 1 s eye closure toggles control. |
-| A cursor move is refused | It is not counted as sent. The target stays owed, also if tracking is lost: it is retried, and no press or click is sent until Windows accepts it. A drop waits up to 0.3 s for its move, then releases where the cursor is. |
+| The program takes over the mouse unexpectedly | It starts **paused** (unless started with `--active`, `--start-active` or `start_active = true`). Only Ctrl+Alt+P, the tray menu or the tester's Activate/Space switch control on. Gestures (eye closure, a fist set to pause) can pause it but never resume it, also after settings reloads, display changes, tracking loss and inhibition. |
+| A cursor move is refused | It is not counted as sent. The target stays owed, also if tracking is lost: it is retried, and no press or click is sent until Windows accepts it. A drop waits up to 0.3 s for its move, then releases where the cursor is; a move that stays refused can never keep the button down longer. Pause, Esc, inhibit, stale input, Stop and exit release at once, without the wait. |
 | The tester changes mode or output | It releases held buttons before loading anything, keeps retrying refused releases (camera mode included) and releases after 0.5 s without camera frames. A watchdog thread does this, and handles Esc and Stop, even while a camera read is blocked. |
 | A saved Activate turns the real mouse on | The tester accepts Activate only for the configuration that is already running; Start, Stop and any option change cancel it. |
+| A gesture turns the real mouse on | Not possible: the controller ignores a pause gesture while paused, in the engine, the tray and the tester. |
 | A broken settings file loses calibration | A file with errors is never saved over (tester and tray) or reloaded. Saves edit the file as it is at that moment and keep `<file>.bak`. A UTF-8 byte-order mark is accepted. |
 | A button stays stuck down | Buttons are released on pause, inhibit, settings change, stale input (0.5 s without frames), controller destruction and app exit. A release Windows **refuses** keeps the button tracked as held and is retried every frame and every 250 ms by the tray, with a warning, until Windows accepts it; a click whose release was dropped is detected (`ClickResult::PressedOnly`) and released the same way (team tracker item #8). |
 | Fighting the user's real mouse | A low-level hook detects **physical** mouse input (not injected input) and yields control for 1.5 s. |
@@ -235,9 +236,9 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Check | Result |
 | --- | --- |
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
-| `os_integration_tests` | 100 / 100 passed |
+| `os_integration_tests` | 107 / 107 passed |
 | `os_integration_capi_tests` | 9 / 9 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 131 / 131 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 158 / 158 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |

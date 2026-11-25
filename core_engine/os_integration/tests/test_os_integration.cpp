@@ -31,6 +31,7 @@ void release_event_rearms_for_each_stuck_episode();
 void menu_change_keeps_external_edits();
 void invalid_file_is_never_overwritten();
 void invalid_reload_keeps_running_settings();
+void eye_closure_never_resumes_the_tray();
 } // namespace osi_tray_tests
 #endif
 
@@ -177,6 +178,38 @@ struct MoveRefusingSink final : IInputSink {
         return ClickResult::Clicked;
     }
 };
+
+// Pinch at the left, then drag right. With `refuse` set, Windows refuses every move after the press.
+double start_drag(OsController& c, MoveRefusingSink& sink, double t, bool refuse) {
+    sink.refuse = false;    // the hand moves to the start, and the press is accepted where the user aims
+    for (int i = 0; i < 8; ++i, t += kDt) {
+        c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}));
+    }
+    for (int i = 0; i < 8; ++i, t += kDt) {
+        c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}, HandGesture::Pinch));
+    }
+    sink.refuse = refuse;
+    for (int i = 0; i < 6; ++i, t += kDt) {
+        c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}, HandGesture::Pinch));
+    }
+    return t;
+}
+
+// Opens the hand with 1 ms frames for `seconds` and returns the frame time of the first button-up (or -1).
+// Lost: the hand vanishes as it opens (tracking lost during the drop wait).
+double open_hand(OsController& c, MoveRefusingSink& sink, double& t, double seconds, TrackerState tracking) {
+    const int ups = sink.ups;
+    double released = -1.0;
+    for (const double end = t + seconds; t < end; t += 0.001) {
+        const std::optional<NormalizedPoint> point =
+            tracking == TrackerState::Lost ? std::nullopt : std::optional<NormalizedPoint>(NormalizedPoint{0.7, 0.5});
+        c.update(hand_frame_tracking(t, point, HandGesture::Neutral, tracking));
+        if (released < 0.0 && sink.ups > ups) {
+            released = t;
+        }
+    }
+    return released;
+}
 
 // ------------------------------------------------------------ calibration helpers
 
@@ -842,7 +875,8 @@ int main() {
         c.update(hand_frame(t, kCentre));
         require(count(sink, SinkEvent::Kind::Move) == 1, "no move after inhibition ended");
     });
-    run_test("controller_eye_closure_resumes_hands_free", [] {
+    // ---- activation policy: gestures may pause, but only an explicit command resumes ----
+    run_test("controller_eye_closure_never_resumes", [] {
         RecordingInputSink sink;
         OsController c(unit_regions(), kFullHd, sink);
         double t = 0.0;
@@ -850,12 +884,73 @@ int main() {
             c.update(gaze_frame(t, kCentre));
         }
         bool toggled = false;
-        for (int i = 0; i < 40 && !toggled; ++i, t += kDt) {
-            require(sink.events.empty(), "input sent while paused");
-            toggled = c.update(gaze_frame(t, kCentre, EyeState::SustainedClosure)).pause_toggled;
+        for (int round = 0; round < 3; ++round) {       // repeated closures, separated by open eyes
+            for (int i = 0; i < 45; ++i, t += kDt) {
+                toggled |= c.update(gaze_frame(t, kCentre, EyeState::SustainedClosure)).pause_toggled;
+            }
+            for (int i = 0; i < 10; ++i, t += kDt) {
+                c.update(gaze_frame(t, kCentre));
+            }
         }
-        require(toggled && c.active(), "closure did not resume control");
-        require(count(sink, SinkEvent::Kind::Click) == 0, "closure clicked");
+        require(!c.active() && !toggled, "a gesture resumed control");
+        require(sink.events.empty(), "input sent while paused");
+    });
+    run_test("controller_fist_toggle_never_resumes", [] {
+        Settings settings = unit_regions();
+        settings.gestures.fist_action = FistAction::TogglePause;
+        RecordingInputSink sink;
+        OsController c(settings, kFullHd, sink);
+        double t = 0.0;
+        for (int round = 0; round < 3; ++round) {
+            for (int i = 0; i < 20; ++i, t += kDt) {
+                c.update(hand_frame(t, kCentre, HandGesture::Fist));
+            }
+            for (int i = 0; i < 10; ++i, t += kDt) {
+                c.update(hand_frame(t, kCentre));
+            }
+        }
+        require(!c.active() && sink.events.empty(), "a fist resumed control");
+    });
+    run_test("controller_gestures_still_pause", [] {
+        Settings settings = unit_regions();
+        settings.gestures.fist_action = FistAction::TogglePause;
+        for (int which = 0; which < 2; ++which) {
+            RecordingInputSink sink;
+            OsController c(settings, kFullHd, sink);
+            c.set_active(true);
+            double t = 0.0;
+            bool paused = false;
+            for (int i = 0; i < 45; ++i, t += kDt) {
+                const FrameReport r = c.update(which == 0 ? gaze_frame(t, kCentre, EyeState::SustainedClosure)
+                                                          : hand_frame(t, kCentre, HandGesture::Fist));
+                paused |= r.pause_toggled && !r.active;
+            }
+            require(paused && !c.active(), which == 0 ? "eye closure did not pause" : "fist did not pause");
+            for (int i = 0; i < 60; ++i, t += kDt) {   // keep closing: the next toggle must not resume
+                c.update(which == 0 ? gaze_frame(t, kCentre, EyeState::SustainedClosure)
+                                    : hand_frame(t, kCentre, HandGesture::Fist));
+            }
+            require(!c.active(), "held gesture resumed control");
+        }
+    });
+    run_test("controller_paused_survives_every_reset_path", [] {
+        RecordingInputSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        double t = 0.0;
+        c.update(hand_frame(t, kCentre));
+        c.apply_settings(unit_regions());                              // settings reload, clock restart
+        c.set_screen_geometry(kFullHd);                                // display change
+        c.set_inhibited(true);                                         // wizard, physical mouse
+        c.set_inhibited(false);
+        for (int i = 0; i < 10; ++i) {
+            t += kDt;
+            c.update(hand_frame_tracking(t, kCentre, HandGesture::Pinch, i % 2 ? TrackerState::Held
+                                                                                : TrackerState::Lost));
+        }
+        require(!c.active() && sink.events.empty(), "a reset path switched control on");
+        c.set_active(true);                                            // the explicit command still works
+        c.update(hand_frame(t + kDt, kCentre));
+        require(c.active() && count(sink, SinkEvent::Kind::Move) == 1, "explicit activation failed");
     });
     run_test("controller_rejects_bad_timestamps", [] {
         RecordingInputSink sink;
@@ -1059,6 +1154,71 @@ int main() {
         }
         c.set_active(false);
         require(sink.ups == 1 && !c.button_held(MouseButton::Left), "pause left a waiting drop held");
+    });
+    // ---- 0.3 s drop wait (os_controller.cpp kDropWaitSeconds): boundaries and every bypass ----
+    run_test("controller_drop_wait_ends_at_exactly_0_3_s", [] {
+        for (const TrackerState tracking : {TrackerState::Tracked, TrackerState::Lost}) {
+            // The same frames twice: the accepting run shows when the gesture's button-up happens.
+            MoveRefusingSink accepting_sink, refusing_sink;
+            OsController accepting(unit_regions(), kFullHd, accepting_sink), refusing(unit_regions(), kFullHd, refusing_sink);
+            accepting.set_active(true);
+            refusing.set_active(true);
+            double ta = start_drag(accepting, accepting_sink, 0.0, false);
+            double tr = start_drag(refusing, refusing_sink, 0.0, true);
+            const double up = open_hand(accepting, accepting_sink, ta, 1.0, tracking);
+            const double drop = open_hand(refusing, refusing_sink, tr, 1.0, tracking);
+            require(up >= 0.0 && drop >= 0.0, "no release at all");
+            double first_after = up;         // the first 1 ms frame at or after up + 0.3 s
+            while (first_after < up + 0.30) {
+                first_after += 0.001;
+            }
+            require(drop == first_after, "the drop wait did not end at exactly 0.3 s");
+            require(drop - 0.001 < up + 0.30, "released before the 0.3 s wait was over");
+            require(refusing_sink.downs == 1 && refusing_sink.ups == 1 && !refusing.button_held(MouseButton::Left),
+                    "wrong button state after the wait");
+        }
+    });
+    run_test("controller_permanently_refused_drop_never_holds_the_button", [] {
+        MoveRefusingSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int drag = 1; drag <= 3; ++drag) {   // repeated drags, every move refused, for 5 s of frames each
+            t = start_drag(c, sink, t, true);
+            const double opened = t;
+            const double released = open_hand(c, sink, t, 5.0, TrackerState::Tracked);
+            require(released >= 0.0 && released - opened <= 0.30 + 0.25, "a refused drop held the button");
+            require(sink.released_at && sink.released_at->x < 960, "the drop was not at the last accepted position: drag " + std::to_string(drag) + " x=" + (sink.released_at ? std::to_string(sink.released_at->x) : std::string("none")));
+            require(sink.downs == drag && sink.ups == drag && !c.button_held(MouseButton::Left),
+                    "button pressed again or still held");
+            require(!c.update(hand_frame(t, NormalizedPoint{0.7, 0.5})).release_pending, "release still pending");
+        }
+    });
+    run_test("controller_waiting_drop_is_released_at_once_by_every_safety_path", [] {
+        // pause/Esc, wizard or physical mouse (inhibit), stale-input watchdog and Tester Stop (release_all), shutdown
+        for (int path = 0; path < 4; ++path) {
+            MoveRefusingSink sink;
+            std::optional<OsController> c;
+            c.emplace(unit_regions(), kFullHd, sink);
+            c->set_active(true);
+            double t = start_drag(*c, sink, 0.0, true);
+            open_hand(*c, sink, t, 0.15, TrackerState::Tracked);
+            require(sink.ups == 0 && c->button_held(MouseButton::Left), "the drop was not waiting");
+            switch (path) {
+            case 0: c->set_active(false); break;
+            case 1: c->set_inhibited(true); break;
+            case 2: require(c->release_all_buttons(), "release_all failed"); break;
+            default: c.reset(); break;
+            }
+            require(sink.ups == 1, "a safety path waited for the drop");
+            if (c) {
+                require(!c->button_held(MouseButton::Left), "button still held");
+                for (int i = 0; i < 20; ++i, t += kDt) {     // the old wait must not fire or press later
+                    c->update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+                }
+                require(sink.ups == 1 && sink.downs == 1, "the cancelled wait acted later");
+            }
+        }
     });
     // ---- R1: settings files ----
     run_test("settings_accept_utf8_bom", [] {
@@ -1517,6 +1677,7 @@ int main() {
     run_test("tray_menu_change_keeps_external_edits", osi_tray_tests::menu_change_keeps_external_edits);
     run_test("tray_invalid_file_is_never_overwritten", osi_tray_tests::invalid_file_is_never_overwritten);
     run_test("tray_invalid_reload_keeps_running_settings", osi_tray_tests::invalid_reload_keeps_running_settings);
+    run_test("tray_eye_closure_never_resumes", osi_tray_tests::eye_closure_never_resumes_the_tray);
 #endif
 
     std::cout << "SUMMARY passed=" << passes << " failed=" << failures << '\n';

@@ -1100,6 +1100,39 @@ def test_middle_click_counts_in_the_accuracy_test(make_app, monkeypatch):
     assert seen == [True]
 
 
+# ============================================================ 23 Nov: same input validation as core_engine
+
+from types import SimpleNamespace  # noqa: E402
+
+INF, NAN = math.inf, math.nan
+
+
+def landmarks(count, x=0.4, y=0.5, bad_index=None, bad_value=INF):
+    points = [SimpleNamespace(x=x + 0.004 * i, y=y - 0.003 * i, z=0.001 * i) for i in range(count)]
+    if bad_index is not None:
+        points[bad_index] = SimpleNamespace(x=bad_value, y=0.5, z=0.0)
+    return points
+
+
+def hand_result(n_image=21, n_world=21, **bad):
+    world = [SimpleNamespace(x=0.01 * i, y=-0.01 * i, z=0.002 * i) for i in range(n_world)]
+    return SimpleNamespace(hand_landmarks=[landmarks(n_image, **bad)] if n_image else [],
+                           hand_world_landmarks=[world] if n_world else [], handedness=[])
+
+
+class ScriptedDetector:
+    """Stands in for MediaPipe: returns the queued results in order."""
+
+    def __init__(self, results):
+        self.results = list(results)
+
+    def detect_for_video(self, image, timestamp):
+        return self.results.pop(0)
+
+    def detect(self, image):
+        return SimpleNamespace(hand_landmarks=[], hand_world_landmarks=[], handedness=[])
+
+
 # ---------------------------------------------------------------- real mouse: gestures may pause, never resume
 
 class ClosedEyes:
@@ -1110,6 +1143,93 @@ class ClosedEyes:
 
     def close(self):
         pass
+
+
+@pytest.fixture
+def scripted_mediapipe(monkeypatch):
+    tester_engine.prepare_ai_imports()
+    from mediapipe.tasks.python import vision
+    queue = []
+    for name in ("HandLandmarker", "FaceLandmarker"):
+        monkeypatch.setattr(getattr(vision, name), "create_from_options",
+                            staticmethod(lambda options: ScriptedDetector(queue)))
+    return queue
+
+
+def run_hand(kind, queue, results, **options):
+    queue[:] = results
+    source = tester_engine.HandSource(kind, TesterConfig(**options))
+    frame = np.zeros((48, 64, 3), np.uint8)
+    try:
+        return [source.process(frame) for _ in results]
+    finally:
+        source.close()
+
+
+INVALID_HANDS = {
+    "20 image + 22 world": hand_result(20, 22),
+    "21 image + 22 world": hand_result(21, 22),
+    "21 image, no world": hand_result(21, 0),
+    "infinite fingertip": hand_result(bad_index=8, bad_value=INF),
+    "NaN fingertip": hand_result(bad_index=8, bad_value=NAN),
+    "infinite wrist": hand_result(bad_index=0, bad_value=-INF),
+}
+
+
+@pytest.mark.parametrize("kind", ["gesture", "index"])
+@pytest.mark.parametrize("case", list(INVALID_HANDS))
+def test_invalid_hand_landmarks_are_never_fresh(scripted_mediapipe, kind, case):
+    good = hand_result()
+    obs = run_hand(kind, scripted_mediapipe, [good, INVALID_HANDS[case], good])
+    assert obs[0].tracking == osi_capi.TRACKED
+    bad = obs[1]
+    assert bad.tracking != osi_capi.TRACKED, "rejected input reported as fresh"
+    if bad.point is not None:
+        assert bad.point == obs[0].point, "a held frame must repeat the last good point"
+    assert obs[2].tracking == osi_capi.TRACKED, "no recovery after the invalid frame"
+
+
+def test_invalid_hand_matches_the_engine_bridge(scripted_mediapipe):
+    """The same rule as ai_pipeline/bridge/landmark_extractors.pack_hand, case by case."""
+    tester_engine.prepare_ai_imports()
+    from landmark_extractors import pack_hand
+    for case, result in INVALID_HANDS.items():
+        _, diag = pack_hand(result.hand_landmarks[0] if result.hand_landmarks else None,
+                            result.hand_world_landmarks[0] if result.hand_world_landmarks else None)
+        assert not diag["valid"], case
+    assert pack_hand(hand_result().hand_landmarks[0], hand_result().hand_world_landmarks[0])[1]["valid"]
+
+
+def face_result(bad_matrix=None, bad_landmark=None, count=478):
+    points = [SimpleNamespace(x=0.4 + 0.0002 * i, y=0.5 + 0.0001 * (i % 7), z=0.0) for i in range(count)]
+    if bad_landmark is not None:
+        points[bad_landmark] = SimpleNamespace(x=bad_landmark_value, y=0.5, z=0.0)
+    matrix = np.eye(4, dtype=np.float32)
+    if bad_matrix is not None:
+        matrix[2, 1] = bad_matrix
+    return SimpleNamespace(face_landmarks=[points], facial_transformation_matrixes=[matrix])
+
+
+bad_landmark_value = INF
+
+
+@pytest.mark.parametrize("label, result", [
+    ("infinite head-pose value", lambda: face_result(bad_matrix=INF)),
+    ("NaN head-pose value", lambda: face_result(bad_matrix=NAN)),
+    ("infinite iris point", lambda: face_result(bad_landmark=468)),
+    ("too few landmarks", lambda: face_result(count=470)),
+])
+def test_invalid_face_input_never_becomes_a_gaze_point(scripted_mediapipe, label, result):
+    scripted_mediapipe[:] = [face_result() for _ in range(40)] + [result(), face_result()]
+    source = tester_engine.GazeSource()
+    frame = np.zeros((48, 64, 3), np.uint8)
+    try:
+        observations = [source.process(frame) for _ in range(42)]
+    finally:
+        source.close()
+    assert observations[39].point is not None, "setup: no gaze point after calibration"
+    assert observations[40].point is None, f"{label} produced a gaze point"
+    assert not observations[40].face
 
 
 class Fist:

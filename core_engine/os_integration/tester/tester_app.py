@@ -471,7 +471,7 @@ class TesterApp:
             ("OS stage (Engineer 5)", ["Cursor follows", "Cursor pixel", "Output", "Confirmed gesture",
                                        "Confirmed eye", "Stuck button"]),
             ("Counters", ["Left down / up", "Left clicks", "Right clicks", "Middle clicks", "Pauses",
-                          "Refused by Windows"]),
+                          "Refused by Windows", "Invalid landmarks"]),
             ("Quality", ["Frame rate", "Processing", "Brightness", "Camera size"]),
         ]
         for title, names in groups:
@@ -992,6 +992,7 @@ class TesterApp:
         put("Middle clicks", str(c.middle_click))
         put("Pauses", str(c.pauses))
         put("Refused by Windows", str(c.refused), BAD if c.refused else TEXT)
+        put("Invalid landmarks", str(c.invalid_input), WARN if c.invalid_input else TEXT)
         put("Frame rate", f"{snap.fps:.1f} fps")
         put("Processing", f"{snap.loop_ms:.1f} ms")
         put("Brightness", f"{snap.brightness:.0f} / 255", WARN if snap.running and snap.brightness < 60 else TEXT)

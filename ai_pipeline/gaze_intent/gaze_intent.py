@@ -149,7 +149,12 @@ def get_iris_ratio(landmarks, corners: Tuple[int, int], iris_idx: int, axis: str
 
 
 def get_head_pose_angles(matrix) -> Tuple[float, float, float]:
-    R = matrix[:3, :3]
+    mat = np.asarray(matrix, dtype=np.float64)
+    if mat.ndim < 2 or mat.shape[0] < 3 or mat.shape[1] < 3:
+        raise ValueError(f"Invalid pose matrix shape: {mat.shape}")
+    R = mat[:3, :3]
+    if not np.all(np.isfinite(R)):
+        raise ValueError("Non-finite rotation matrix entries in get_head_pose_angles")
     sy = math.sqrt(float(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0]))
     singular = sy < 1e-6
     if not singular:
@@ -160,7 +165,22 @@ def get_head_pose_angles(matrix) -> Tuple[float, float, float]:
         pitch = math.atan2(float(-R[1, 2]), float(R[1, 1]))
         yaw = math.atan2(float(-R[2, 0]), sy)
         roll = 0.0
-    return math.degrees(pitch), math.degrees(yaw), math.degrees(roll)
+    angles = (math.degrees(pitch), math.degrees(yaw), math.degrees(roll))
+    if not all(math.isfinite(v) for v in angles):
+        raise ValueError("Non-finite Euler angles computed in get_head_pose_angles")
+    return angles
+
+
+def _landmarks_and_pose_finite(landmarks, pose_matrix) -> bool:
+    if landmarks is None or len(landmarks) != 478 or pose_matrix is None:
+        return False
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            coords = np.asarray([(p.x, p.y, p.z) for p in landmarks], dtype=np.float32)
+            mat = np.asarray(pose_matrix, dtype=np.float32)
+        return mat.shape == (4, 4) and np.isfinite(mat).all() and np.isfinite(coords).all()
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return False
 
 
 def extract_gaze_features(landmarks, pose_matrix) -> Tuple[float, float, float, float, float]:
@@ -335,18 +355,46 @@ class GazeIntent:
     def __del__(self):
         self.shutdown()
 
+    def _emit_invalid_diag(self, frame_id: int, timestamp_ms: int) -> None:
+        if self._diag_writer is not None:
+            self._write_diag_row(GazeDiagnosticPayload(
+                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                detected=0, state=0,
+                left_iris_x=INVALID_ANGLE, right_iris_x=INVALID_ANGLE, sx=INVALID_ANGLE,
+                left_iris_y=INVALID_ANGLE, right_iris_y=INVALID_ANGLE, sy=INVALID_ANGLE,
+                head_pitch_deg=INVALID_ANGLE, head_yaw_deg=INVALID_ANGLE, head_roll_deg=INVALID_ANGLE,
+                rel_pitch_deg=INVALID_ANGLE, rel_yaw_deg=INVALID_ANGLE,
+                abs_pitch_deg=INVALID_ANGLE, abs_yaw_deg=INVALID_ANGLE,
+                norm_x=-1.0, norm_y=-1.0,
+                lm33_x=INVALID_ANGLE, lm33_y=INVALID_ANGLE,
+                lm133_x=INVALID_ANGLE, lm133_y=INVALID_ANGLE,
+                lm468_x=INVALID_ANGLE, lm468_y=INVALID_ANGLE,
+                lm362_x=INVALID_ANGLE, lm362_y=INVALID_ANGLE,
+                lm263_x=INVALID_ANGLE, lm263_y=INVALID_ANGLE,
+                lm473_x=INVALID_ANGLE, lm473_y=INVALID_ANGLE,
+            ))
+
     def process_frame(
         self, rgb_frame_array: np.ndarray, timestamp_ms: int
     ) -> Tuple[float, float, float, float, int, Optional[Any]]:
         """
         Returns (abs_yaw, abs_pitch, head_yaw, head_pitch, state, landmarks).
-        When calibrating (state == -1) or when no face is detected (state == 0, landmarks is None),
-        all four angles are NaN (INVALID_ANGLE) so invalid coordinates never enter downstream DSP
-        filters. Use is_valid_output(abs_yaw, abs_pitch) to test validity.
+        When calibrating (state == -1) or when no face / non-finite input is detected
+        (state == 0, landmarks is None), all four angles are NaN (INVALID_ANGLE) so invalid
+        coordinates never enter downstream DSP filters. Use is_valid_output(abs_yaw, abs_pitch)
+        to test validity.
         """
         frame_id = self._frame_id
         self._frame_id += 1
-        frame_h, frame_w, _ = rgb_frame_array.shape
+        if rgb_frame_array is None or getattr(rgb_frame_array, "ndim", 0) < 2:
+            self.ear_state.reset_tracking_state()
+            self._emit_invalid_diag(frame_id, timestamp_ms)
+            return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
+        frame_h, frame_w = int(rgb_frame_array.shape[0]), int(rgb_frame_array.shape[1])
+        if frame_w <= 0 or frame_h <= 0:
+            self.ear_state.reset_tracking_state()
+            self._emit_invalid_diag(frame_id, timestamp_ms)
+            return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame_array)
         results = self.detector.detect_for_video(mp_image, timestamp_ms)
@@ -354,10 +402,18 @@ class GazeIntent:
         if results.face_landmarks and results.facial_transformation_matrixes:
             landmarks = results.face_landmarks[0]
             pose_matrix = results.facial_transformation_matrixes[0]
+            if not _landmarks_and_pose_finite(landmarks, pose_matrix):
+                self.ear_state.reset_tracking_state()
+                self._emit_invalid_diag(frame_id, timestamp_ms)
+                return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             # 1. Blink Calibration & ML Inference
             raw_left_ear = calculate_ear(landmarks, LEFT_EYE, frame_w, frame_h)
             raw_right_ear = calculate_ear(landmarks, RIGHT_EYE, frame_w, frame_h)
+            if not (math.isfinite(raw_left_ear) and math.isfinite(raw_right_ear)):
+                self.ear_state.reset_tracking_state()
+                self._emit_invalid_diag(frame_id, timestamp_ms)
+                return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             wink_features = self.ear_state.update(raw_left_ear, raw_right_ear)
             if wink_features is None:
@@ -386,10 +442,7 @@ class GazeIntent:
                 # Issue #3 Fix: NaN sentinel angles during calibration
                 return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, -1, landmarks
 
-            wink_batch = tl2cgen.DMatrix(np.array([wink_features], dtype=np.float32))
-            state = int(self.wink_model.predict(wink_batch)[0].argmax())
-
-            # 2. Extract MPIIGaze Features
+            # 2. Extract MPIIGaze Features (validate before state inference)
             l_x = get_iris_ratio(landmarks, L_CORNERS, LEFT_IRIS, "x")
             r_x = get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "x")
             student_x = (l_x + r_x) / 2.0
@@ -398,7 +451,22 @@ class GazeIntent:
             r_y = get_iris_ratio(landmarks, R_CORNERS, RIGHT_IRIS, "y")
             student_y = (l_y + r_y) / 2.0
 
-            head_pitch, head_yaw, head_roll = get_head_pose_angles(pose_matrix)
+            try:
+                head_pitch, head_yaw, head_roll = get_head_pose_angles(pose_matrix)
+            except ValueError:
+                self.ear_state.reset_tracking_state()
+                self._emit_invalid_diag(frame_id, timestamp_ms)
+                return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
+
+            if not all(math.isfinite(v) for v in (
+                l_x, r_x, student_x, l_y, r_y, student_y, head_pitch, head_yaw, head_roll
+            )):
+                self.ear_state.reset_tracking_state()
+                self._emit_invalid_diag(frame_id, timestamp_ms)
+                return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
+
+            wink_batch = tl2cgen.DMatrix(np.array([wink_features], dtype=np.float32))
+            state = int(self.wink_model.predict(wink_batch)[0].argmax())
 
             # 3. Predict Screen Gaze (Pitch & Yaw)
             gaze_features = np.array(
@@ -413,6 +481,11 @@ class GazeIntent:
             # RECOMBINE: Calculate Absolute World Gaze
             abs_pitch = rel_pitch + head_pitch
             abs_yaw = rel_yaw + head_yaw
+
+            if not all(math.isfinite(v) for v in (rel_pitch, rel_yaw, abs_pitch, abs_yaw)):
+                self.ear_state.reset_tracking_state()
+                self._emit_invalid_diag(frame_id, timestamp_ms)
+                return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             if self._diag_writer is not None:
                 nx = angle_to_norm_coord(abs_yaw)
@@ -438,21 +511,5 @@ class GazeIntent:
 
         # Issue #4 Fix: Face lost -> clear temporal EAR window & return NaN sentinel angles
         self.ear_state.reset_tracking_state()
-        if self._diag_writer is not None:
-            self._write_diag_row(GazeDiagnosticPayload(
-                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
-                detected=0, state=0,
-                left_iris_x=INVALID_ANGLE, right_iris_x=INVALID_ANGLE, sx=INVALID_ANGLE,
-                left_iris_y=INVALID_ANGLE, right_iris_y=INVALID_ANGLE, sy=INVALID_ANGLE,
-                head_pitch_deg=INVALID_ANGLE, head_yaw_deg=INVALID_ANGLE, head_roll_deg=INVALID_ANGLE,
-                rel_pitch_deg=INVALID_ANGLE, rel_yaw_deg=INVALID_ANGLE,
-                abs_pitch_deg=INVALID_ANGLE, abs_yaw_deg=INVALID_ANGLE,
-                norm_x=-1.0, norm_y=-1.0,
-                lm33_x=INVALID_ANGLE, lm33_y=INVALID_ANGLE,
-                lm133_x=INVALID_ANGLE, lm133_y=INVALID_ANGLE,
-                lm468_x=INVALID_ANGLE, lm468_y=INVALID_ANGLE,
-                lm362_x=INVALID_ANGLE, lm362_y=INVALID_ANGLE,
-                lm263_x=INVALID_ANGLE, lm263_y=INVALID_ANGLE,
-                lm473_x=INVALID_ANGLE, lm473_y=INVALID_ANGLE,
-            ))
+        self._emit_invalid_diag(frame_id, timestamp_ms)
         return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None

@@ -638,6 +638,29 @@ def test_non_finite_points_are_never_published(dsp_filter, bad, axis):
     assert dsp_filter.update(point, 2.0) == (osi_capi.FILTER_INVALID, None)
 
 
+@pytest.mark.parametrize("bad, replayed", [(math.inf, True), (-math.inf, False), (math.nan, False)])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_held_sample_with_non_finite_coordinates_follows_the_core_gate(dsp_filter, bad, replayed, axis):
+    """freshness_gate.hpp: detected() is x >= 0 && y >= 0, and a HELD sample's coordinates are never used.
+    So HELD +Inf replays the cached point and keeps the filter history; HELD -Inf or NaN is not a detection and
+    ends tracking. (PR #7's Smoother reset on HELD +Inf: 2705 of 200,000 random frames differed from core.)"""
+    point = (bad, 0.4) if axis == 0 else (0.4, bad)
+    for with_filter in (True, False):
+        filt = dsp_filter if with_filter else None
+        gate = Smoother(filt)
+        gate.apply((0.2, 0.2), TRACKED, 1.0)
+        cached = gate.apply((0.3, 0.3), TRACKED, 1.033)[0]
+        assert gate.apply(point, HELD, 1.066) == ((cached, HELD) if replayed else (None, LOST))
+        after, state = gate.apply((0.4, 0.4), TRACKED, 1.1)
+        assert state == TRACKED
+        if with_filter and replayed:
+            assert after[0] < 0.4           # history kept: still smoothed
+        else:
+            assert after == (0.4, 0.4)      # history cleared (or no filter): the first sample is unsmoothed
+        if filt:
+            filt.reset()
+
+
 def test_held_without_smoothing_replays_the_last_observation():
     gate = Smoother(None)
     assert gate.apply((0.9, 0.8), HELD, 0.0) == (None, LOST)

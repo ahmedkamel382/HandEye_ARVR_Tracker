@@ -6,6 +6,7 @@ Needs a built os_integration_capi.dll (out/build/...); those tests skip without 
 """
 
 import csv
+import gc
 import math
 import random
 import sys
@@ -786,6 +787,41 @@ def test_run_checks_dialog_can_be_closed_early(make_app, tk_root, monkeypatch, c
     if not close_first:
         assert "ALL CHECKS PASSED" in text.get("1.0", "end")
 
+
+
+def test_destroyed_windows_leave_no_tk_garbage_for_a_worker_thread(lib, tk_root, monkeypatch, request):
+    """CI: the Tk variables of destroyed Tester windows were freed by a garbage collection that happened to run on a
+    worker thread, where Tkinter raises "main thread is not in main loop". conftest.py now collects after every test
+    on the main thread. This reproduces the hazard, then shows that a main-thread collection leaves nothing behind."""
+    assert "collect_tk_garbage_on_the_main_thread" in request.fixturenames, "conftest.py no longer collects"
+    monkeypatch.setattr(tester_app.TesterApp, "tick", lambda self: None)
+    errors = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda info: errors.append(info.exc_value))
+
+    def leave_a_destroyed_app():
+        window = tk.Toplevel(tk_root)
+        window.withdraw()
+        tester_app.TesterApp(window, lib, lambda text: None)
+        window.destroy()
+
+    def collect_on_a_worker_thread():
+        worker = threading.Thread(target=gc.collect)
+        worker.start()
+        worker.join()
+
+    gc.collect()
+    gc.disable()                                    # only the explicit collections below may run
+    try:
+        leave_a_destroyed_app()
+        collect_on_a_worker_thread()
+        assert errors and all(isinstance(e, RuntimeError) for e in errors), "setup: the hazard did not reproduce"
+        errors.clear()
+        leave_a_destroyed_app()
+        gc.collect()                                # what the conftest fixture does after every test
+        collect_on_a_worker_thread()
+        assert not errors, errors[:3]
+    finally:
+        gc.enable()
 
 # ---------------------------------------------------------------- Space shortcut
 

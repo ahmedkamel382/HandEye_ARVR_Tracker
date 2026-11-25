@@ -1308,3 +1308,503 @@ def test_vertical_up_down_cued_direction_report(tmp_path: Path):
     assert "VERTICAL_UP_TO_DOWN" in md
     assert "Δabs_pitch=" in md
 
+
+def _make_run_with_inactive_calib_rows(base_dir: Path) -> Tuple[Path, Path, Path]:
+    """Create a valid run whose first 5 rows are detected=0, state=-1 calibration rows with inactive NaN angles."""
+    run_dir, dsp_dir, diag_csv = _make_synthetic_run(base_dir, num_frames=40, dt_s=0.033)
+    # Rewrite first 5 rows in both trace.txt and gaze_diag.csv to legitimate inactive calibration rows
+    trace_path = dsp_dir / "trace.txt"
+    trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
+    new_trace_lines = [trace_lines[0]]
+    for idx, line in enumerate(trace_lines[1:-1]):
+        if idx < 5:
+            toks = dict(tok.split("=", 1) for tok in line.split()[2:])
+            toks.update(
+                ok="1", x="-1", y="-1", state="-1", trk="-1", adapter="0", called="0",
+                input_t="0", ix="0", iy="0", status="-1", has="0", dx="0", dy="0",
+                outcome="-1", resets="0", pub="0", px="0", py="0", out_trk="2",
+            )
+            new_trace_lines.append("E4REC F " + " ".join(f"{k}={v}" for k, v in toks.items()))
+        else:
+            if idx == 5:
+                line = line.replace(" status=1 ", " status=0 ")
+            new_trace_lines.append(line)
+    new_trace_lines.append(trace_lines[-1])
+    trace_path.write_text("\n".join(new_trace_lines) + "\n", encoding="utf-8")
+
+    with diag_csv.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    hdr = rows[0]
+    col_idx = {name: i for i, name in enumerate(hdr)}
+    for r_i in range(1, 6):
+        row = rows[r_i]
+        row[col_idx["detected"]] = "0"
+        row[col_idx["state"]] = "-1"
+        row[col_idx["norm_x"]] = "-1"
+        row[col_idx["norm_y"]] = "-1"
+        for nan_col in ("rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg"):
+            row[col_idx[nan_col]] = "nan"
+    with diag_csv.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows(rows)
+
+    # Update schedule to evaluate only the active frames (idx 5..39)
+    sched_path = run_dir / "cued_schedule.json"
+    sched_path.write_text(json.dumps({
+        "schema_version": 1,
+        "targets": [{"name": "CENTER", "target_start_s": 1.165, "target_end_s": 2.40}],
+    }), encoding="utf-8")
+    return run_dir, dsp_dir, diag_csv
+
+
+def test_legitimate_inactive_nan_placeholders_preserved(tmp_path: Path):
+    run_dir, dsp_dir, diag_csv = _make_run_with_inactive_calib_rows(tmp_path / "valid_inactive_nan")
+    # Also allow inactive NaN in all 25 non-sentinel columns when detected=0 (e.g., face lost)
+    with diag_csv.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    col_idx = {name: i for i, name in enumerate(rows[0])}
+    for col in ANALYZER.DIAG_INACTIVE_NAN_ALLOWED_COLUMNS:
+        rows[1][col_idx[col]] = "nan"
+    with diag_csv.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows(rows)
+
+    integ, aligned = ANALYZER.load_and_align_run(dsp_dir, diag_csv)
+    assert integ["alignment_ok"] is True
+    assert integ["schema_errors"] == 0
+    assert integ["nonfinite_errors"] == 0
+    assert len(aligned) == 40
+    assert ANALYZER.main(["--run-dir", str(run_dir), "--wash-in-s", "0.0"]) == 0
+
+
+@pytest.mark.parametrize(
+    "case_name,mutator,expected_counter",
+    [
+        (
+            "defect_a_surplus_33rd_field_active",
+            lambda rows, ci: rows[10].append("extra_33rd"),
+            "surplus_field_rows",
+        ),
+        (
+            "defect_a_surplus_33rd_field_inactive",
+            lambda rows, ci: rows[1].append("extra_33rd"),
+            "surplus_field_rows",
+        ),
+        (
+            "defect_b_inf_in_inactive_lm473_y",
+            lambda rows, ci: rows[1].__setitem__(ci["lm473_y"], "inf"),
+            "infinite_value_errors",
+        ),
+        (
+            "defect_b_neg_inf_in_inactive_sy",
+            lambda rows, ci: rows[1].__setitem__(ci["sy"], "-Infinity"),
+            "infinite_value_errors",
+        ),
+        (
+            "defect_b_inf_in_active_sx",
+            lambda rows, ci: rows[10].__setitem__(ci["sx"], "inf"),
+            "infinite_value_errors",
+        ),
+        (
+            "defect_c_detected_equals_2",
+            lambda rows, ci: rows[10].__setitem__(ci["detected"], "2"),
+            "invalid_detected_values",
+        ),
+        (
+            "defect_c_detected_equals_neg1",
+            lambda rows, ci: rows[10].__setitem__(ci["detected"], "-1"),
+            "invalid_detected_values",
+        ),
+        (
+            "invalid_state_enum_4",
+            lambda rows, ci: rows[10].__setitem__(ci["state"], "4"),
+            "invalid_state_values",
+        ),
+        (
+            "pr4_missing_inactive_lm473_y_field",
+            lambda rows, ci: rows[1].pop(),
+            "missing_field_rows",
+        ),
+        (
+            "pr4_unreadable_text_in_inactive_lm473_y",
+            lambda rows, ci: rows[1].__setitem__(ci["lm473_y"], "not_a_number"),
+            "invalid_numeric_fields",
+        ),
+        (
+            "empty_numeric_field_in_active_sx",
+            lambda rows, ci: rows[10].__setitem__(ci["sx"], ""),
+            "invalid_numeric_fields",
+        ),
+        (
+            "malformed_integer_frame_id_float",
+            lambda rows, ci: rows[10].__setitem__(ci["frame_id"], "9.0"),
+            "invalid_integer_fields",
+        ),
+        (
+            "negative_ts_ms",
+            lambda rows, ci: rows[10].__setitem__(ci["ts_ms"], "-5"),
+            "invalid_integer_fields",
+        ),
+        (
+            "nan_in_always_finite_norm_x_inactive",
+            lambda rows, ci: rows[1].__setitem__(ci["norm_x"], "nan"),
+            "nonfinite_errors",
+        ),
+        (
+            "nan_in_capture_s_inactive",
+            lambda rows, ci: rows[1].__setitem__(ci["capture_s"], "nan"),
+            "nonfinite_errors",
+        ),
+        (
+            "header_column_renamed",
+            lambda rows, ci: rows[0].__setitem__(ci["lm473_y"], "lm473_z"),
+            "schema_errors",
+        ),
+        (
+            "row_count_mismatch_dropped_last_row",
+            lambda rows, ci: rows.pop(),
+            "schema_errors",
+        ),
+        (
+            "correspondence_detected_0_on_published_row",
+            lambda rows, ci: rows[10].__setitem__(ci["detected"], "0"),
+            "recorder_correspondence_errors",
+        ),
+    ],
+)
+def test_schema_corruption_returns_controlled_diagnostic_failure(
+    tmp_path: Path, case_name: str, mutator, expected_counter: str
+):
+    """Engineer 4 Section 7 & PR #4 contract: every corruption fails cleanly without uncaught exceptions."""
+    run_dir, dsp_dir, diag_csv = _make_run_with_inactive_calib_rows(tmp_path / case_name)
+    with diag_csv.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    ci = {name: i for i, name in enumerate(rows[0])}
+    mutator(rows, ci)
+    with diag_csv.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows(rows)
+
+    integ, _ = ANALYZER.load_and_align_run(dsp_dir, diag_csv)
+    assert integ["alignment_ok"] is False
+    assert integ[expected_counter] > 0
+    assert len(integ["integrity_errors"]) > 0
+
+    out_json = run_dir / "corrupt.json"
+    out_md = run_dir / "corrupt.md"
+    rc = ANALYZER.main([
+        "--run-dir", str(run_dir),
+        "--wash-in-s", "0.0",
+        "--require-qualification-pass",
+        "--out-json", str(out_json),
+        "--out-md", str(out_md),
+    ])
+    # Integrity failure MUST always return exit code 1 (even under --require-qualification-pass)
+    assert rc == ANALYZER.EXIT_CODE_INTEGRITY_FAILED
+    rep = json.loads(out_json.read_text(encoding="utf-8"))
+    assert rep["integrity"]["alignment_ok"] is False
+    assert rep["qualification"]["archive_integrity_ok"] is False
+    assert rep["qualification"]["overall_qualification_pass"] is False
+    assert rep["qualification"]["scored_responsiveness_authorized"] is False
+
+
+def test_schedule_interval_and_cli_wash_in_validation(tmp_path: Path):
+    with pytest.raises(ValueError, match="overlaps|precedes"):
+        ANALYZER.parse_windows_spec("CENTER:1.0-5.0,LEFT:4.5-8.0")
+    with pytest.raises(ValueError, match="overlaps|precedes"):
+        ANALYZER.parse_windows_spec("LEFT:6.0-10.0,CENTER:1.0-5.0")
+    with pytest.raises(ValueError, match="bounds"):
+        ANALYZER.parse_windows_spec("CENTER:1.0-inf")
+    with pytest.raises(ValueError, match="bounds"):
+        ANALYZER.parse_windows_spec("CENTER:nan-5.0")
+
+    bad_sched = tmp_path / "overlap_schedule.json"
+    bad_sched.write_text(json.dumps({
+        "schema_version": 1,
+        "targets": [
+            {"name": "CENTER", "target_start_s": 1.0, "target_end_s": 5.0},
+            {"name": "LEFT", "target_start_s": 4.9, "target_end_s": 9.0},
+        ],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="overlaps|precedes"):
+        ANALYZER.load_cued_schedule(bad_sched)
+
+    nan_sched = tmp_path / "nan_schedule.json"
+    nan_sched.write_text(json.dumps({
+        "schema_version": 1,
+        "targets": [{"name": "CENTER", "target_start_s": 1.0, "target_end_s": float("inf")}],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid cued target"):
+        ANALYZER.load_cued_schedule(nan_sched)
+
+    for bad_wash in ("-0.1", "nan", "inf"):
+        with pytest.raises(SystemExit) as exc_info:
+            ANALYZER.main(["--run-dir", str(tmp_path), "--wash-in-s", bad_wash])
+        assert exc_info.value.code == 2
+
+
+def test_integrity_vs_qualification_separation_and_exit_codes(tmp_path: Path):
+    # 1. Valid integrity + failing fixation gap -> descriptive rc=0, gated rc=2
+    fail_dir, _, _ = _make_synthetic_run(
+        tmp_path / "qual_fail", num_frames=35, dt_s=0.033, gap_after_idx=15, gap_dt_s=0.145
+    )
+    out_desc = fail_dir / "desc.json"
+    rc_desc = ANALYZER.main([
+        "--run-dir", str(fail_dir), "--wash-in-s", "0.0",
+        "--out-json", str(out_desc), "--out-md", str(fail_dir / "desc.md"),
+    ])
+    assert rc_desc == ANALYZER.EXIT_CODE_OK
+    rep_desc = json.loads(out_desc.read_text(encoding="utf-8"))
+    assert rep_desc["integrity"]["alignment_ok"] is True
+    assert rep_desc["qualification"]["archive_integrity_ok"] is True
+    assert rep_desc["qualification"]["overall_qualification_pass"] is False
+    assert rep_desc["qualification"]["per_axis_pass_counts"]["passed"] == 0
+    assert rep_desc["qualification"]["per_axis_pass_counts"]["total"] == 2
+    assert rep_desc["qualification"]["scored_responsiveness_authorized"] is False
+
+    out_gate = fail_dir / "gate.json"
+    rc_gate = ANALYZER.main([
+        "--run-dir", str(fail_dir), "--wash-in-s", "0.0",
+        "--require-qualification-pass",
+        "--out-json", str(out_gate), "--out-md", str(fail_dir / "gate.md"),
+    ])
+    assert rc_gate == ANALYZER.EXIT_CODE_QUALIFICATION_FAILED
+    rep_gate = json.loads(out_gate.read_text(encoding="utf-8"))
+    assert rep_gate["exit_code_policy"]["computed_exit_code"] == 2
+    assert "## 2. Qualification Summary" in (fail_dir / "gate.md").read_text(encoding="utf-8")
+
+    # 2. Valid integrity + complete 6/6 Horizontal PASS -> gated rc=0
+    pass_dir = tmp_path / "qual_pass_horiz"
+    frames: List[Dict[str, Any]] = []
+    frames.extend(_make_target_segment(1.0, 40, 0.033, sx=0.50, sy=0.00, hy=0.0))
+    frames.extend(_make_target_segment(3.0, 40, 0.033, sx=0.38, sy=0.00, hy=-10.0))
+    frames.extend(_make_target_segment(5.0, 40, 0.033, sx=0.62, sy=0.00, hy=+10.0))
+    diag_csv = _write_synthetic_run(pass_dir, frames, y_sign_mult=-1.0)
+    out_pass = pass_dir / "pass.json"
+    rc_pass = ANALYZER.main([
+        "--run-dir", str(pass_dir),
+        "--diag-csv", str(diag_csv),
+        "--windows", "CENTER:1.0-2.5,LEFT:3.0-4.5,RIGHT:5.0-6.5",
+        "--wash-in-s", "0.0",
+        "--require-qualification-pass",
+        "--out-json", str(out_pass),
+        "--out-md", str(pass_dir / "pass.md"),
+    ])
+    assert rc_pass == ANALYZER.EXIT_CODE_OK
+    rep_pass = json.loads(out_pass.read_text(encoding="utf-8"))
+    q = rep_pass["qualification"]
+    assert q["archive_integrity_ok"] is True
+    assert q["alignment_ok"] is True
+    assert q["per_axis_pass_counts"]["passed"] == 6
+    assert q["per_axis_pass_counts"]["total"] == 6
+    assert q["horizontal_qualification_pass"] is True
+    assert q["vertical_qualification_pass"] is None
+    assert q["direction_verification_pass"] is True
+    assert q["overall_qualification_pass"] is True
+    assert q["scored_responsiveness_authorized"] is False
+
+
+def test_speaker_ack_telemetry_and_sampled_before_close_in_cued_capture(tmp_path: Path):
+    """Verify _CueSpeaker ACK timings and that run_cued_capture samples telemetry BEFORE speaker.close()."""
+    if ANALYZER.os.name == "nt":
+        import queue
+
+        written: List[str] = []
+        out_q: "queue.Queue[Optional[str]]" = queue.Queue()
+        out_q.put("WARM\n")
+        ack_times = {1: "4.25", 2: "3.5"}
+        seq_counter = {"n": 0}
+
+        class _RecIO(io.StringIO):
+            def write(self, s: str) -> int:
+                written.append(s)
+                if s.strip() == "__EXIT__":
+                    out_q.put(None)
+                elif s.strip():
+                    seq_counter["n"] += 1
+                    n = seq_counter["n"]
+                    out_q.put(f"ACK|{n}|{ack_times.get(n, '1.0')}\n")
+                    if n >= 2:
+                        out_q.put(None)
+                return super().write(s)
+
+        class _QueueStdout:
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                item = out_q.get(timeout=2.0)
+                if item is None:
+                    raise StopIteration
+                return item
+
+        fake_proc = mock.MagicMock()
+        fake_proc.stdin = _RecIO()
+        fake_proc.stdout = _QueueStdout()
+        fake_proc.poll.return_value = None
+
+        with mock.patch.object(ANALYZER.subprocess, "Popen", return_value=fake_proc):
+            sp = ANALYZER._CueSpeaker(enabled=True)
+            sp.start()
+            assert sp._ready.wait(timeout=2.0)
+            ev1 = sp.speak("Prepare: move eyes to LEFT now.")
+            ev2 = sp.speak("Hold left.")
+            assert ev1 is not None and ev2 is not None
+            # Wait for reader thread to finish consuming ACK lines
+            sp._thread.join(timeout=2.0)
+            tel_before = sp.get_telemetry(launch_mono=0.0, t_base=0.0)
+            assert tel_before["speaker_alive_at_telemetry"] is True
+            assert tel_before["audio_timing_scope"] == ANALYZER.AUDIO_TIMING_SCOPE
+            assert tel_before["acoustic_onset_measured"] is False
+            assert len(tel_before["events"]) == 2
+            assert tel_before["events"][0]["ps_speak_async_ms"] == pytest.approx(4.25)
+            assert tel_before["events"][1]["ps_speak_async_ms"] == pytest.approx(3.5)
+            assert tel_before["events"][0]["worker_write_call_ms"] >= 0.0
+            assert tel_before["events"][0]["ps_ack_delay_ms"] is not None
+            sp.close()
+            tel_after = sp.get_telemetry(launch_mono=0.0, t_base=0.0)
+            assert tel_after["speaker_alive_at_telemetry"] is False
+
+    # End-to-end ordering check inside run_cued_capture: get_telemetry() MUST happen BEFORE close()
+    run_dir = tmp_path / "telemetry_order_run"
+    fake_exe = tmp_path / "core_engine.exe"
+    fake_exe.write_text("stub", encoding="utf-8")
+
+    frames: List[Dict[str, Any]] = []
+    for i in range(30):
+        frames.append({"t_s": i * 0.033333, "state": -1, "sx": 0.5, "sy": 0.0})
+    for i in range(30, 300):
+        frames.append({"t_s": i * 0.033333, "state": 0, "sx": 0.5, "sy": 0.0})
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 200.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, dt: float) -> None:
+            self.now += dt
+
+    fake_clock = FakeClock()
+    call_order: List[str] = []
+
+    class TrackingSpeaker:
+        def __init__(self, enabled: bool) -> None:
+            self.enabled = enabled
+            self.closed = False
+            self._seq = 0
+            self._events: List[Dict[str, Any]] = []
+
+        def start(self) -> None:
+            call_order.append("start")
+
+        def speak(self, text: str) -> Dict[str, Any]:
+            self._seq += 1
+            ev = {
+                "seq": self._seq,
+                "text": text,
+                "enqueue_wall_s": round(fake_clock.now - 200.0, 4),
+                "enqueue_capture_s": None,
+                "buffered_until_warm": False,
+                "write_ok": True,
+                "worker_write_call_ms": 0.125,
+                "ps_speak_async_ms": 2.5,
+                "ps_ack_delay_ms": 3.1,
+            }
+            self._events.append(ev)
+            return ev
+
+        def get_telemetry(self, *, launch_mono: float, t_base: Optional[float] = None) -> Dict[str, Any]:
+            call_order.append("get_telemetry")
+            return {
+                "audio_timing_scope": ANALYZER.AUDIO_TIMING_SCOPE,
+                "acoustic_onset_measured": False,
+                "audio_cues_enabled": self.enabled,
+                "speaker_warmed": True,
+                "speaker_warm_delay_ms": 150.0,
+                "speaker_alive_at_telemetry": not self.closed,
+                "events": list(self._events),
+            }
+
+        def close(self) -> None:
+            call_order.append("close")
+            self.closed = True
+
+    class FakeProc:
+        def __init__(self, cmd: List[str], **_kwargs: Any) -> None:
+            dsp_dir = Path(cmd[cmd.index("--dsp-record-dir") + 1])
+            diag_csv_path = Path(cmd[cmd.index("--gaze-diag-log") + 1])
+            _write_synthetic_run(dsp_dir, frames, y_sign_mult=-1.0, diag_csv=diag_csv_path)
+            self.returncode = 0
+
+            class _TimedStdout:
+                def __init__(self) -> None:
+                    self._lines = [
+                        (200.0, "OS: log\n"),
+                        (201.168, "cap 30 | ai 30 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.50 s=0) hand(0.00,0.00 s=0) | os frames 35\n"),
+                        (202.165, "cap 30 | ai 30 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.50 s=0) hand(0.00,0.00 s=0) | os frames 65\n"),
+                        (203.169, "cap 30 | ai 30 fps | gaze 1.0 ms hand 0.0 ms | latency avg 1.0 max 2.0 ms | evict 0 stale 0 pyerr 0 | slots 8/8 | gaze(0.50,0.50 s=0) hand(0.00,0.00 s=0) | os frames 95\n"),
+                    ]
+                    self._idx = 0
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self) -> str:
+                    if self._idx >= len(self._lines):
+                        raise StopIteration
+                    ts, line = self._lines[self._idx]
+                    self._idx += 1
+                    if fake_clock.now < ts:
+                        fake_clock.now = ts
+                    return line
+
+            self.stdout = _TimedStdout()
+
+        def poll(self):
+            return None if fake_clock.now < 208.0 else 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    with (
+        mock.patch.object(ANALYZER, "_CueSpeaker", TrackingSpeaker),
+        mock.patch.object(ANALYZER.subprocess, "Popen", side_effect=FakeProc),
+        mock.patch.object(ANALYZER.time, "monotonic", side_effect=fake_clock.monotonic),
+        mock.patch.object(ANALYZER.time, "sleep", side_effect=fake_clock.sleep),
+    ):
+        sched_path = ANALYZER.run_cued_capture(
+            exe=fake_exe,
+            run_dir=run_dir,
+            diag_csv=run_dir / "gaze_diag.csv",
+            camera=0,
+            targets=["CENTER"],
+            hold_s=2.0,
+            gap_s=2.0,
+            pre_cue_s=1.5,
+            audio=True,
+            yes=True,
+        )
+
+    assert call_order.index("get_telemetry") < call_order.index("close")
+    sched = json.loads(sched_path.read_text(encoding="utf-8"))
+    assert sched["schema_version"] == 2
+    assert sched["audio_timing_scope"] == ANALYZER.AUDIO_TIMING_SCOPE
+    assert sched["audio_dispatch_telemetry"]["speaker_alive_at_telemetry"] is True
+    assert sched["audio_dispatch_telemetry"]["acoustic_onset_measured"] is False
+
+    clk = sched["clock_sync_diagnostics"]
+    assert clk["sync_method"] == "trace_status_sync"
+    assert clk["wall_clock_origin_unix_s"] is not None
+    assert clk["wall_clock_origin_utc_iso"] is not None
+    assert len(clk["raw_status_samples"]) == 3
+    assert clk["num_inliers"] >= 2
+    assert clk["inlier_spread_ms"] is not None and clk["inlier_spread_ms"] < 20.0
+    assert clk["mad_ms"] is not None
+    assert clk["uncertainty_estimate_ms"] is not None
+
+    tgt = sched["targets"][0]
+    assert tgt["cue_start_worker_write_call_ms"] == pytest.approx(0.125)
+    assert tgt["cue_start_ps_speak_async_ms"] == pytest.approx(2.5)
+    assert tgt["cue_start_ps_ack_delay_ms"] == pytest.approx(3.1)

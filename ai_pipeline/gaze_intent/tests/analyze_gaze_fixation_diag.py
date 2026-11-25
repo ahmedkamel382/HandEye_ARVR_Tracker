@@ -20,8 +20,14 @@ Capabilities:
        (c) Treelite prediction cliffs / local +-0.005 sensitivity
   5. Optional read-only A/B shadow replay against candidate DLLs (`--candidate-models-dir`).
   6. Optional safe cued-capture launcher (`--cued-capture`, `--os log --no-hand --filter dsp`)
-     guiding CENTER, LEFT, RIGHT, UP, DOWN fixations and logging `calib_ready_s` and
-     per-target `target_start_s`/`target_end_s` to `<run-dir>/cued_schedule.json`.
+     guiding CENTER, LEFT, RIGHT, UP, DOWN fixations and logging `calib_ready_s`,
+     per-target `target_start_s`/`target_end_s`, clock-sync diagnostics, and software SAPI
+     dispatch telemetry to `<run-dir>/cued_schedule.json`.
+
+Exit codes:
+  0: Archive integrity and alignment OK (and qualification PASS when `--require-qualification-pass` is set).
+  1: Archive integrity, CSV schema, or recorder alignment FAILED (`alignment_ok=False`).
+  2: Archive integrity and alignment OK, but fixation qualification FAILED under `--require-qualification-pass`.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -68,6 +75,15 @@ LOW_DELIVERED_FPS_WARN_THRESHOLD = 25.0
 DEFAULT_CUED_TARGETS = ("CENTER", "LEFT", "RIGHT", "UP", "DOWN")
 GAZE_FILTER_SPEC = "0.8,6,1.5"
 
+EXIT_CODE_OK = 0
+EXIT_CODE_INTEGRITY_FAILED = 1
+EXIT_CODE_QUALIFICATION_FAILED = 2
+
+AUDIO_TIMING_SCOPE = "software_sapi_dispatch_only_not_physical_acoustic_onset"
+ALLOWED_DETECTED_VALUES: Tuple[int, ...] = (0, 1)
+ALLOWED_STATE_VALUES: Tuple[int, ...] = (-1, 0, 1, 2, 3)
+
+STRICT_INT_RE = re.compile(r"^[+-]?\d+$")
 GAZE_STATUS_RE = re.compile(
     r"^cap\s+(\d+)\s*\|\s*ai\s+(\d+)\s+fps\s*\|.*?"
     r"pyerr\s+(\d+).*?gaze\(([^,]+),([^ ]+)\s+s=(-?\d+)\).*?os frames\s+(\d+)\s*$"
@@ -82,6 +98,48 @@ EXPECTED_DIAG_COLUMNS = (
     "lm33_x", "lm33_y", "lm133_x", "lm133_y", "lm468_x", "lm468_y",
     "lm362_x", "lm362_y", "lm263_x", "lm263_y", "lm473_x", "lm473_y",
 )
+
+DIAG_INT_COLUMNS = ("frame_id", "ts_ms", "detected", "state")
+DIAG_ALWAYS_FINITE_FLOAT_COLUMNS = ("capture_s", "norm_x", "norm_y")
+DIAG_INACTIVE_NAN_ALLOWED_COLUMNS = (
+    "left_iris_x", "right_iris_x", "sx", "left_iris_y", "right_iris_y", "sy",
+    "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
+    "rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg",
+    "lm33_x", "lm33_y", "lm133_x", "lm133_y", "lm468_x", "lm468_y",
+    "lm362_x", "lm362_y", "lm263_x", "lm263_y", "lm473_x", "lm473_y",
+)
+DIAG_FLOAT_COLUMNS = (
+    "left_iris_x", "right_iris_x", "sx", "left_iris_y", "right_iris_y", "sy",
+    "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
+    "rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg",
+    "norm_x", "norm_y",
+    "lm33_x", "lm33_y", "lm133_x", "lm133_y", "lm468_x", "lm468_y",
+    "lm362_x", "lm362_y", "lm263_x", "lm263_y", "lm473_x", "lm473_y",
+)
+
+
+def _parse_strict_int(raw: Any) -> Optional[int]:
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s or not STRICT_INT_RE.fullmatch(s):
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def _parse_strict_float(raw: Any) -> Optional[float]:
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 def _load_import_vs_trace():
@@ -235,7 +293,8 @@ def _compute_axis_metrics(values: np.ndarray, times_s: np.ndarray) -> Dict[str, 
 
 def parse_windows_spec(spec: str) -> List[Tuple[str, float, float]]:
     windows: List[Tuple[str, float, float]] = []
-    seen = set()
+    seen: Set[str] = set()
+    prev_end: Optional[float] = None
     for token in spec.split(","):
         tok = token.strip()
         if not tok:
@@ -246,9 +305,19 @@ def parse_windows_spec(spec: str) -> List[Tuple[str, float, float]]:
         name = name.strip()
         s_str, e_str = span.split("-", 1)
         start_s, end_s = float(s_str), float(e_str)
-        if not name or name in seen or not (0.0 <= start_s < end_s):
+        if (
+            not name
+            or name in seen
+            or not (math.isfinite(start_s) and math.isfinite(end_s))
+            or not (0.0 <= start_s < end_s)
+        ):
             raise ValueError(f"Invalid window bounds/name in {tok!r}")
+        if prev_end is not None and start_s < prev_end:
+            raise ValueError(
+                f"Window {name!r} ([{start_s}, {end_s})) overlaps or precedes previous end {prev_end}"
+            )
         seen.add(name)
+        prev_end = end_s
         windows.append((name, start_s, end_s))
     if not windows:
         raise ValueError("No valid windows parsed from --windows")
@@ -262,13 +331,26 @@ def load_cued_schedule(schedule_path: Path) -> Tuple[Dict[str, Any], List[Tuple[
         raise ValueError(f"Invalid cued_schedule.json (missing targets): {schedule_path}")
     windows: List[Tuple[str, float, float]] = []
     seen: Set[str] = set()
+    prev_end: Optional[float] = None
     for entry in targets:
+        if not isinstance(entry, dict) or "name" not in entry or "target_start_s" not in entry or "target_end_s" not in entry:
+            raise ValueError(f"Invalid cued target entry {entry!r} in {schedule_path}")
         name = str(entry["name"]).strip()
         start_s = float(entry["target_start_s"])
         end_s = float(entry["target_end_s"])
-        if not name or name in seen or not (0.0 <= start_s < end_s):
+        if (
+            not name
+            or name in seen
+            or not (math.isfinite(start_s) and math.isfinite(end_s))
+            or not (0.0 <= start_s < end_s)
+        ):
             raise ValueError(f"Invalid cued target entry {entry!r} in {schedule_path}")
+        if prev_end is not None and start_s < prev_end:
+            raise ValueError(
+                f"Cued target {name!r} ([{start_s}, {end_s})) overlaps or precedes previous end {prev_end} in {schedule_path}"
+            )
         seen.add(name)
+        prev_end = end_s
         windows.append((name, start_s, end_s))
     return data, windows
 
@@ -461,27 +543,129 @@ def _extract_trace_capture_times(trace_path: Path) -> List[float]:
     return times
 
 
+def _resolve_capture_epoch_with_diagnostics(
+    status_samples: Sequence[Tuple[int, float]],
+    trace_times: Sequence[float],
+    epoch_mono: Optional[float],
+    launch_mono: float,
+    wall_origin_unix_s: Optional[float] = None,
+) -> Tuple[float, str, Dict[str, Any]]:
+    raw_entries: List[Dict[str, Any]] = []
+    valid_indices: List[int] = []
+    cands: List[float] = []
+    for idx, (os_frames, rx_t) in enumerate(status_samples):
+        if 1 <= os_frames <= len(trace_times):
+            tr_t = float(trace_times[os_frames - 1])
+            cand_offset = float(rx_t) - tr_t
+            valid_indices.append(idx)
+            cands.append(cand_offset)
+            raw_entries.append({
+                "sample_index": idx,
+                "os_frames": int(os_frames),
+                "rx_mono_s": round(float(rx_t), 6),
+                "rx_since_launch_s": round(float(rx_t) - float(launch_mono), 6),
+                "trace_capture_s": round(tr_t, 6),
+                "candidate_offset_mono_s": round(cand_offset, 6),
+                "inlier": False,
+            })
+        else:
+            raw_entries.append({
+                "sample_index": idx,
+                "os_frames": int(os_frames),
+                "rx_mono_s": round(float(rx_t), 6),
+                "rx_since_launch_s": round(float(rx_t) - float(launch_mono), 6),
+                "trace_capture_s": None,
+                "candidate_offset_mono_s": None,
+                "inlier": False,
+            })
+
+    tail_start = 1 if len(cands) >= 3 else 0
+    tail = cands[tail_start:]
+    inliers: List[float] = []
+    inlier_cand_positions: List[int] = []
+    t_base: float
+    sync_method: str
+
+    if len(tail) >= 2:
+        med = float(np.median(tail))
+        for pos in range(tail_start, len(cands)):
+            if abs(cands[pos] - med) <= 0.25:
+                inliers.append(cands[pos])
+                inlier_cand_positions.append(pos)
+        if len(inliers) >= 2 and len(inliers) * 2 >= len(tail):
+            t_base = float(np.median(inliers))
+            sync_method = "trace_status_sync"
+        else:
+            inliers = []
+            inlier_cand_positions = []
+            t_base = float(epoch_mono) if epoch_mono is not None else float(launch_mono)
+            sync_method = "console_os_fallback"
+    elif len(cands) == 1:
+        inliers = [cands[0]]
+        inlier_cand_positions = [0]
+        t_base = float(cands[0])
+        sync_method = "trace_status_sync_single"
+    else:
+        t_base = float(epoch_mono) if epoch_mono is not None else float(launch_mono)
+        sync_method = "console_os_fallback"
+
+    for pos in inlier_cand_positions:
+        raw_entries[valid_indices[pos]]["inlier"] = True
+
+    inlier_spread_ms: Optional[float] = None
+    mad_ms: Optional[float] = None
+    uncertainty_ms: Optional[float] = None
+    if len(inliers) >= 2:
+        arr = np.array(inliers, dtype=np.float64)
+        inlier_spread_ms = round(float(np.max(arr) - np.min(arr)) * 1000.0, 3)
+        mad_ms = round(float(np.median(np.abs(arr - float(np.median(arr))))) * 1000.0, 3)
+        uncertainty_ms = round(max(inlier_spread_ms / 2.0, 1.4826 * mad_ms), 3)
+    elif len(inliers) == 1:
+        inlier_spread_ms = 0.0
+        mad_ms = 0.0
+        uncertainty_ms = None
+
+    wall_iso: Optional[str] = None
+    if wall_origin_unix_s is not None and math.isfinite(wall_origin_unix_s):
+        wall_iso = datetime.datetime.fromtimestamp(
+            wall_origin_unix_s, tz=datetime.timezone.utc
+        ).isoformat()
+
+    diagnostics = {
+        "capture_clock_origin": "core_engine Pipeline::t0 (std::chrono::steady_clock at pipeline start; trace.txt E4REC F t= seconds)",
+        "wall_clock_origin_monotonic_s": round(float(launch_mono), 6),
+        "wall_clock_origin_unix_s": round(float(wall_origin_unix_s), 6) if wall_origin_unix_s is not None else None,
+        "wall_clock_origin_utc_iso": wall_iso,
+        "conversion_formula": "capture_s = host_monotonic_s - clock_offset_mono_s",
+        "sync_method": sync_method,
+        "clock_offset_mono_s": round(float(t_base), 6),
+        "console_epoch_mono_s": round(float(epoch_mono), 6) if epoch_mono is not None else None,
+        "inlier_threshold_s": 0.25,
+        "num_status_samples": len(status_samples),
+        "num_valid_candidates": len(cands),
+        "num_inliers": len(inliers),
+        "inlier_spread_ms": inlier_spread_ms,
+        "mad_ms": mad_ms,
+        "uncertainty_estimate_ms": uncertainty_ms,
+        "uncertainty_note": (
+            "Estimated from 1 Hz stdout status reception timestamps vs trace.txt E4REC F capture_s; "
+            "reflects host/engine clock alignment uncertainty, NOT physical acoustic latency."
+        ),
+        "raw_status_samples": raw_entries,
+    }
+    return t_base, sync_method, diagnostics
+
+
 def _resolve_capture_epoch_mono(
     status_samples: Sequence[Tuple[int, float]],
     trace_times: Sequence[float],
     epoch_mono: Optional[float],
     launch_mono: float,
 ) -> Tuple[float, str]:
-    cands = [
-        rx_t - trace_times[os_frames - 1]
-        for os_frames, rx_t in status_samples
-        if 1 <= os_frames <= len(trace_times)
-    ]
-    tail = cands[1:] if len(cands) >= 3 else cands
-    if len(tail) >= 2:
-        med = float(np.median(tail))
-        inliers = [c for c in tail if abs(c - med) <= 0.25]
-        if len(inliers) >= 2 and len(inliers) * 2 >= len(tail):
-            return float(np.median(inliers)), "trace_status_sync"
-    if len(cands) == 1:
-        return float(cands[0]), "trace_status_sync_single"
-    fallback = epoch_mono if epoch_mono is not None else launch_mono
-    return fallback, "console_os_fallback"
+    t_base, sync_method, _ = _resolve_capture_epoch_with_diagnostics(
+        status_samples, trace_times, epoch_mono, launch_mono
+    )
+    return t_base, sync_method
 
 
 def resolve_run_paths(
@@ -535,7 +719,6 @@ def resolve_run_paths(
     return resolved_dsp, resolved_diag, sched_path
 
 
-
 def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     complete_marker = run_dir / "COMPLETE"
     incomplete_marker = run_dir / "INCOMPLETE"
@@ -545,33 +728,51 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
     if not diag_csv.is_file():
         raise FileNotFoundError(f"Missing native gaze diag CSV: {diag_csv}")
 
-    lines = trace_path.read_text(encoding="utf-8").splitlines()
+    integrity_errors: List[str] = []
+
+    def _record_err(msg: str) -> None:
+        if len(integrity_errors) < 25:
+            integrity_errors.append(msg)
+
+    lines = trace_path.read_text(encoding="utf-8", errors="replace").splitlines()
     header_meta: Dict[str, str] = {}
     footer_meta: Dict[str, str] = {}
     for ln in lines:
         parts = ln.split()
         if len(parts) >= 2 and parts[0] == "E4REC" and parts[1] == "BEGIN":
-            header_meta = dict(p.split("=", 1) for p in parts[2:])
+            header_meta = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
         elif len(parts) >= 2 and parts[0] == "E4REC" and parts[1] == "END":
-            footer_meta = dict(p.split("=", 1) for p in parts[2:])
+            footer_meta = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
 
-    e4 = _load_import_vs_trace()
-    converted = e4.convert_recorder(lines, "gaze")
-    col_names = e4.RECORDER_COLUMNS
-    trace_rows = [dict(zip(col_names, row)) for row in converted]
+    trace_parse_errors = 0
+    trace_rows: List[Dict[str, Any]] = []
+    try:
+        e4 = _load_import_vs_trace()
+        converted = e4.convert_recorder(lines, "gaze")
+        col_names = e4.RECORDER_COLUMNS
+        trace_rows = [dict(zip(col_names, row)) for row in converted]
+    except Exception as exc:
+        trace_parse_errors += 1
+        _record_err(f"trace.txt parse error: {type(exc).__name__}: {exc}")
 
     with diag_csv.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        diag_cols = tuple(reader.fieldnames or ())
-        if diag_cols != EXPECTED_DIAG_COLUMNS:
-            raise ValueError(
-                f"gaze_diag.csv header mismatch: expected 32 canonical columns, got {len(diag_cols)}"
-            )
-        diag_rows = list(reader)
+        reader = csv.reader(f)
+        header_row = next(reader, None)
+        diag_cols = tuple(header_row) if header_row is not None else ()
+        raw_diag_rows = list(reader)
 
-    if len(trace_rows) != len(diag_rows):
-        raise ValueError(
-            f"Row count mismatch: trace.txt has {len(trace_rows)} rows vs gaze_diag.csv {len(diag_rows)} rows"
+    expected_col_count = len(EXPECTED_DIAG_COLUMNS)
+    header_valid = diag_cols == EXPECTED_DIAG_COLUMNS
+    if not header_valid:
+        _record_err(
+            f"gaze_diag.csv header mismatch: expected {expected_col_count} canonical columns, "
+            f"got {len(diag_cols)}"
+        )
+
+    row_count_mismatch = len(trace_rows) != len(raw_diag_rows)
+    if row_count_mismatch:
+        _record_err(
+            f"Row count mismatch: trace.txt has {len(trace_rows)} rows vs gaze_diag.csv {len(raw_diag_rows)} rows"
         )
 
     aligned: List[Dict[str, Any]] = []
@@ -585,157 +786,278 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
     ts_ms_non_increasing = 0
     capture_s_non_increasing = 0
     nonfinite_errors = 0
+    surplus_field_rows = 0
+    missing_field_rows = 0
+    invalid_integer_fields = 0
+    invalid_detected_values = 0
+    invalid_state_values = 0
+    invalid_numeric_fields = 0
+    infinite_value_errors = 0
+    recorder_correspondence_errors = 0
     max_cap_s_diff = 0.0
     max_dx = 0.0
     max_dy = 0.0
 
-    diag_float_cols = (
-        "left_iris_x", "right_iris_x", "sx", "left_iris_y", "right_iris_y", "sy",
-        "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
-        "rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg",
-        "norm_x", "norm_y",
-        "lm33_x", "lm33_y", "lm133_x", "lm133_y", "lm468_x", "lm468_y",
-        "lm362_x", "lm362_y", "lm263_x", "lm263_y", "lm473_x", "lm473_y",
-    )
+    # Validate row widths across ALL CSV rows even if row counts differ.
+    if header_valid:
+        for row_idx, raw_row in enumerate(raw_diag_rows):
+            if len(raw_row) > expected_col_count:
+                surplus_field_rows += 1
+                _record_err(f"diag row {row_idx}: surplus fields ({len(raw_row)} > {expected_col_count})")
+            elif len(raw_row) < expected_col_count:
+                missing_field_rows += 1
+                _record_err(f"diag row {row_idx}: missing fields ({len(raw_row)} < {expected_col_count})")
 
     prev_fid: Optional[int] = None
     prev_ts_ms: Optional[int] = None
     prev_cap_s: Optional[float] = None
+    always_finite_set = set(DIAG_ALWAYS_FINITE_FLOAT_COLUMNS)
+    inactive_nan_allowed_set = set(DIAG_INACTIVE_NAN_ALLOWED_COLUMNS)
 
-    for tr, dg in zip(trace_rows, diag_rows):
-        t_fid = int(tr["frame_id"])
-        d_fid = int(dg["frame_id"])
-        t_obs_ms = int(tr["observation_ms"])
-        d_ts_ms = int(dg["ts_ms"])
-        t_cap_s = float(tr["dsp_timestamp_seconds"])
-        d_cap_s = float(dg["capture_s"])
-        t_state = int(tr["state"])
-        d_state = int(dg["state"])
-        t_tx = float(tr["tracker_x"])
-        t_ty = float(tr["tracker_y"])
-        d_nx = float(dg["norm_x"])
-        d_ny = float(dg["norm_y"])
+    if header_valid and trace_parse_errors == 0:
+        for row_idx, (tr, raw_row) in enumerate(zip(trace_rows, raw_diag_rows)):
+            if len(raw_row) != expected_col_count:
+                continue
 
-        if t_fid != d_fid:
-            fid_mismatches += 1
-        if t_obs_ms != d_ts_ms:
-            ts_ms_mismatches += 1
-        if t_state != d_state:
-            state_mismatches += 1
+            dg = dict(zip(EXPECTED_DIAG_COLUMNS, raw_row))
+            row_parse_ok = True
 
-        if prev_fid is not None and (t_fid <= prev_fid or d_fid <= prev_fid):
-            frame_id_non_increasing += 1
-        if prev_ts_ms is not None and (t_obs_ms <= prev_ts_ms or d_ts_ms <= prev_ts_ms):
-            ts_ms_non_increasing += 1
-        if prev_cap_s is not None:
-            if not (math.isfinite(t_cap_s) and math.isfinite(d_cap_s)) or t_cap_s <= prev_cap_s or d_cap_s <= prev_cap_s:
-                capture_s_non_increasing += 1
-        prev_fid = t_fid
-        prev_ts_ms = t_obs_ms
-        if math.isfinite(t_cap_s):
-            prev_cap_s = t_cap_s
+            # 1. Strict integer parsing & domain validation on diag row
+            d_fid = _parse_strict_int(dg["frame_id"])
+            if d_fid is None or d_fid < 0:
+                invalid_integer_fields += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: invalid frame_id={dg['frame_id']!r}")
 
-        if math.isfinite(t_cap_s) and math.isfinite(d_cap_s):
-            cap_diff = abs(t_cap_s - d_cap_s)
-            max_cap_s_diff = max(max_cap_s_diff, cap_diff)
-            if cap_diff > 1e-12:
+            d_ts_ms = _parse_strict_int(dg["ts_ms"])
+            if d_ts_ms is None or d_ts_ms < 0:
+                invalid_integer_fields += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: invalid ts_ms={dg['ts_ms']!r}")
+
+            detected = _parse_strict_int(dg["detected"])
+            if detected is None:
+                invalid_integer_fields += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: invalid detected={dg['detected']!r}")
+            elif detected not in ALLOWED_DETECTED_VALUES:
+                invalid_detected_values += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: disallowed detected={detected} (allowed: {ALLOWED_DETECTED_VALUES})")
+
+            d_state = _parse_strict_int(dg["state"])
+            if d_state is None:
+                invalid_integer_fields += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: invalid state={dg['state']!r}")
+            elif d_state not in ALLOWED_STATE_VALUES:
+                invalid_state_values += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: disallowed state={d_state} (allowed: {ALLOWED_STATE_VALUES})")
+
+            # 2. Strict float parsing across ALL 28 float columns (capture_s + 27 numeric cols)
+            d_cap_s = _parse_strict_float(dg["capture_s"])
+            if d_cap_s is None:
+                invalid_numeric_fields += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: unreadable capture_s={dg['capture_s']!r}")
+            elif math.isinf(d_cap_s):
+                infinite_value_errors += 1
+                nonfinite_errors += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: infinite capture_s={dg['capture_s']!r}")
+            elif math.isnan(d_cap_s):
+                nonfinite_errors += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: NaN capture_s")
+            elif d_cap_s < 0.0:
+                invalid_numeric_fields += 1
+                row_parse_ok = False
+                _record_err(f"diag row {row_idx}: negative capture_s={d_cap_s}")
+
+            parsed_diag: Dict[str, float] = {}
+            for col in DIAG_FLOAT_COLUMNS:
+                val = _parse_strict_float(dg[col])
+                if val is None:
+                    invalid_numeric_fields += 1
+                    row_parse_ok = False
+                    _record_err(f"diag row {row_idx}: unreadable numeric {col}={dg[col]!r}")
+                    continue
+                parsed_diag[col] = val
+                if math.isinf(val):
+                    infinite_value_errors += 1
+                    nonfinite_errors += 1
+                    _record_err(f"diag row {row_idx}: infinite value in {col}={dg[col]!r}")
+                elif math.isnan(val):
+                    if col in always_finite_set:
+                        nonfinite_errors += 1
+                        _record_err(f"diag row {row_idx}: NaN in always-finite column {col}")
+                    elif detected == 1:
+                        nonfinite_errors += 1
+                        _record_err(f"diag row {row_idx}: NaN in active (detected=1) column {col}")
+                    elif detected == 0 and col in inactive_nan_allowed_set:
+                        # Legitimate inactive placeholder per 32-column schema.
+                        pass
+                    else:
+                        nonfinite_errors += 1
+                        _record_err(f"diag row {row_idx}: NaN in column {col} with detected={detected}")
+
+            # 3. Parse trace row fields safely
+            try:
+                t_fid = int(tr["frame_id"])
+                t_obs_ms = int(tr["observation_ms"])
+                t_cap_s = float(tr["dsp_timestamp_seconds"])
+                t_state = int(tr["state"])
+                t_tx = float(tr["tracker_x"])
+                t_ty = float(tr["tracker_y"])
+                raw_x = float(tr["raw_x"]) if tr["raw_x"] != "" else None
+                raw_y = float(tr["raw_y"]) if tr["raw_y"] != "" else None
+                filt_x = float(tr["filtered_x"]) if tr["filtered_x"] != "" else None
+                filt_y = float(tr["filtered_y"]) if tr["filtered_y"] != "" else None
+                landmarks = int(tr["landmarks"])
+                published = int(tr["published"])
+            except (ValueError, TypeError, KeyError) as exc:
+                recorder_correspondence_errors += 1
+                _record_err(f"trace row {row_idx}: malformed field ({type(exc).__name__}: {exc})")
+                continue
+
+            if t_state not in ALLOWED_STATE_VALUES:
+                invalid_state_values += 1
+                _record_err(f"trace row {row_idx}: disallowed state={t_state}")
+
+            if not row_parse_ok or "norm_x" not in parsed_diag or "norm_y" not in parsed_diag:
+                continue
+
+            assert d_fid is not None and d_ts_ms is not None and detected is not None and d_state is not None
+            assert d_cap_s is not None
+            d_nx = parsed_diag["norm_x"]
+            d_ny = parsed_diag["norm_y"]
+
+            # 4. 1:1 alignment & monotonicity
+            if t_fid != d_fid:
+                fid_mismatches += 1
+            if t_obs_ms != d_ts_ms:
+                ts_ms_mismatches += 1
+            if t_state != d_state:
+                state_mismatches += 1
+
+            if prev_fid is not None and (t_fid <= prev_fid or d_fid <= prev_fid):
+                frame_id_non_increasing += 1
+            if prev_ts_ms is not None and (t_obs_ms <= prev_ts_ms or d_ts_ms <= prev_ts_ms):
+                ts_ms_non_increasing += 1
+            if prev_cap_s is not None:
+                if not (math.isfinite(t_cap_s) and math.isfinite(d_cap_s)) or t_cap_s <= prev_cap_s or d_cap_s <= prev_cap_s:
+                    capture_s_non_increasing += 1
+            prev_fid = t_fid
+            prev_ts_ms = t_obs_ms
+            if math.isfinite(t_cap_s):
+                prev_cap_s = t_cap_s
+
+            if math.isfinite(t_cap_s) and math.isfinite(d_cap_s):
+                cap_diff = abs(t_cap_s - d_cap_s)
+                max_cap_s_diff = max(max_cap_s_diff, cap_diff)
+                if cap_diff > 1e-12:
+                    cap_s_mismatches += 1
+            else:
+                nonfinite_errors += 1
                 cap_s_mismatches += 1
-        else:
-            nonfinite_errors += 1
-            cap_s_mismatches += 1
 
-        if math.isfinite(t_tx) and math.isfinite(d_nx):
-            dx = abs(t_tx - d_nx)
-            max_dx = max(max_dx, dx)
-            if dx > COORD_TOL:
+            if math.isfinite(t_tx) and math.isfinite(d_nx):
+                dx = abs(t_tx - d_nx)
+                max_dx = max(max_dx, dx)
+                if dx > COORD_TOL:
+                    norm_x_mismatches += 1
+            else:
+                if not math.isfinite(t_tx):
+                    nonfinite_errors += 1
                 norm_x_mismatches += 1
-        else:
-            nonfinite_errors += 1
-            norm_x_mismatches += 1
 
-        if math.isfinite(t_ty) and math.isfinite(d_ny):
-            dy = abs(t_ty - d_ny)
-            max_dy = max(max_dy, dy)
-            if dy > COORD_TOL:
+            if math.isfinite(t_ty) and math.isfinite(d_ny):
+                dy = abs(t_ty - d_ny)
+                max_dy = max(max_dy, dy)
+                if dy > COORD_TOL:
+                    norm_y_mismatches += 1
+            else:
+                if not math.isfinite(t_ty):
+                    nonfinite_errors += 1
                 norm_y_mismatches += 1
-        else:
-            nonfinite_errors += 1
-            norm_y_mismatches += 1
 
-        raw_x = float(tr["raw_x"]) if tr["raw_x"] != "" else None
-        raw_y = float(tr["raw_y"]) if tr["raw_y"] != "" else None
-        filt_x = float(tr["filtered_x"]) if tr["filtered_x"] != "" else None
-        filt_y = float(tr["filtered_y"]) if tr["filtered_y"] != "" else None
-        landmarks = int(tr["landmarks"])
-        detected = int(dg["detected"])
-        published = int(tr["published"])
+            # 5. Recorder correspondence & trace finiteness
+            if detected == 0 and published == 1:
+                recorder_correspondence_errors += 1
+                _record_err(f"row {row_idx}: detected=0 but trace published=1")
+            if detected == 0 and math.isfinite(d_nx) and math.isfinite(d_ny) and (d_nx != -1.0 or d_ny != -1.0):
+                recorder_correspondence_errors += 1
+                _record_err(f"row {row_idx}: detected=0 expects sentinel norm=(-1,-1), got ({d_nx}, {d_ny})")
+            if published == 1 and (detected != 1 or landmarks != 484):
+                recorder_correspondence_errors += 1
+                _record_err(f"row {row_idx}: published=1 inconsistent with detected={detected}, landmarks={landmarks}")
+            if detected == 1 and d_state != -1 and landmarks != 484:
+                recorder_correspondence_errors += 1
+                _record_err(f"row {row_idx}: active detected=1 expects landmarks=484, got {landmarks}")
 
-        parsed_diag = {col: float(dg[col]) for col in diag_float_cols}
-        if detected == 1:
-            if not all(math.isfinite(v) for v in parsed_diag.values()):
+            for opt_val in (raw_x, raw_y, filt_x, filt_y):
+                if opt_val is not None and not math.isfinite(opt_val):
+                    nonfinite_errors += 1
+            if published == 1 and (
+                raw_x is None or raw_y is None or filt_x is None or filt_y is None
+                or not (math.isfinite(raw_x) and math.isfinite(raw_y) and math.isfinite(filt_x) and math.isfinite(filt_y))
+            ):
                 nonfinite_errors += 1
-        for opt_val in (raw_x, raw_y, filt_x, filt_y):
-            if opt_val is not None and not math.isfinite(opt_val):
-                nonfinite_errors += 1
-        if published == 1 and (
-            raw_x is None or raw_y is None or filt_x is None or filt_y is None
-            or not (math.isfinite(raw_x) and math.isfinite(raw_y) and math.isfinite(filt_x) and math.isfinite(filt_y))
-        ):
-            nonfinite_errors += 1
 
-        diag_core_finite = all(
-            math.isfinite(parsed_diag[k])
-            for k in (
-                "sx", "sy", "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
-                "rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg", "norm_x", "norm_y",
+            diag_core_finite = all(
+                math.isfinite(parsed_diag[k])
+                for k in (
+                    "sx", "sy", "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
+                    "rel_pitch_deg", "rel_yaw_deg", "abs_pitch_deg", "abs_yaw_deg", "norm_x", "norm_y",
+                )
             )
-        )
-        eligible = (
-            detected == 1
-            and d_state == 0
-            and landmarks == 484
-            and published == 1
-            and math.isfinite(t_cap_s)
-            and raw_x is not None
-            and raw_y is not None
-            and filt_x is not None
-            and filt_y is not None
-            and math.isfinite(raw_x)
-            and math.isfinite(raw_y)
-            and math.isfinite(filt_x)
-            and math.isfinite(filt_y)
-            and diag_core_finite
-        )
+            eligible = (
+                detected == 1
+                and d_state == 0
+                and landmarks == 484
+                and published == 1
+                and math.isfinite(t_cap_s)
+                and raw_x is not None
+                and raw_y is not None
+                and filt_x is not None
+                and filt_y is not None
+                and math.isfinite(raw_x)
+                and math.isfinite(raw_y)
+                and math.isfinite(filt_x)
+                and math.isfinite(filt_y)
+                and diag_core_finite
+            )
 
-        aligned.append(
-            {
-                "frame_id": t_fid,
-                "ts_ms": t_obs_ms,
-                "capture_s": t_cap_s,
-                "diag_capture_s": d_cap_s,
-                "landmarks": landmarks,
-                "detected": detected,
-                "state": d_state,
-                "published": published,
-                "status": tr["status"],
-                "raw_x": raw_x,
-                "raw_y": raw_y,
-                "filtered_x": filt_x,
-                "filtered_y": filt_y,
-                "sx": parsed_diag["sx"],
-                "sy": parsed_diag["sy"],
-                "head_pitch_deg": parsed_diag["head_pitch_deg"],
-                "head_yaw_deg": parsed_diag["head_yaw_deg"],
-                "head_roll_deg": parsed_diag["head_roll_deg"],
-                "rel_pitch_deg": parsed_diag["rel_pitch_deg"],
-                "rel_yaw_deg": parsed_diag["rel_yaw_deg"],
-                "abs_pitch_deg": parsed_diag["abs_pitch_deg"],
-                "abs_yaw_deg": parsed_diag["abs_yaw_deg"],
-                "norm_x": d_nx,
-                "norm_y": d_ny,
-                "eligible": eligible,
-            }
-        )
+            aligned.append(
+                {
+                    "frame_id": t_fid,
+                    "ts_ms": t_obs_ms,
+                    "capture_s": t_cap_s,
+                    "diag_capture_s": d_cap_s,
+                    "landmarks": landmarks,
+                    "detected": detected,
+                    "state": d_state,
+                    "published": published,
+                    "status": tr["status"],
+                    "raw_x": raw_x,
+                    "raw_y": raw_y,
+                    "filtered_x": filt_x,
+                    "filtered_y": filt_y,
+                    "sx": parsed_diag["sx"],
+                    "sy": parsed_diag["sy"],
+                    "head_pitch_deg": parsed_diag["head_pitch_deg"],
+                    "head_yaw_deg": parsed_diag["head_yaw_deg"],
+                    "head_roll_deg": parsed_diag["head_roll_deg"],
+                    "rel_pitch_deg": parsed_diag["rel_pitch_deg"],
+                    "rel_yaw_deg": parsed_diag["rel_yaw_deg"],
+                    "abs_pitch_deg": parsed_diag["abs_pitch_deg"],
+                    "abs_yaw_deg": parsed_diag["abs_yaw_deg"],
+                    "norm_x": d_nx,
+                    "norm_y": d_ny,
+                    "eligible": eligible,
+                }
+            )
 
     detected_rows = [
         r for r in aligned
@@ -757,6 +1079,58 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
         logged_y_sign = "fixed"
         logged_y_sign_mult = FIXED_Y_SIGN
 
+    overflow_val = _parse_strict_int(footer_meta.get("overflow", "-1"))
+    config_changes_val = _parse_strict_int(footer_meta.get("config_changes", "-1"))
+    complete_flag_val = _parse_strict_int(footer_meta.get("complete", "0"))
+    overflow_i = overflow_val if overflow_val is not None else -1
+    config_changes_i = config_changes_val if config_changes_val is not None else -1
+    complete_flag_i = complete_flag_val if complete_flag_val is not None else 0
+
+    schema_errors = (
+        (0 if header_valid else 1)
+        + (1 if row_count_mismatch else 0)
+        + trace_parse_errors
+        + surplus_field_rows
+        + missing_field_rows
+        + invalid_integer_fields
+        + invalid_detected_values
+        + invalid_state_values
+        + invalid_numeric_fields
+        + infinite_value_errors
+        + recorder_correspondence_errors
+    )
+
+    alignment_ok = bool(
+        complete_marker.is_file()
+        and not incomplete_marker.exists()
+        and overflow_i == 0
+        and config_changes_i == 0
+        and complete_flag_i == 1
+        and header_valid
+        and not row_count_mismatch
+        and trace_parse_errors == 0
+        and len(trace_rows) > 0
+        and len(raw_diag_rows) == len(trace_rows)
+        and len(aligned) == len(trace_rows)
+        and len(diag_cols) == expected_col_count
+        and schema_errors == 0
+        and fid_mismatches == 0
+        and ts_ms_mismatches == 0
+        and cap_s_mismatches == 0
+        and state_mismatches == 0
+        and norm_x_mismatches == 0
+        and norm_y_mismatches == 0
+        and frame_id_non_increasing == 0
+        and ts_ms_non_increasing == 0
+        and capture_s_non_increasing == 0
+        and nonfinite_errors == 0
+        and math.isfinite(max_cap_s_diff)
+        and math.isfinite(max_dx)
+        and math.isfinite(max_dy)
+        and max_dx <= COORD_TOL
+        and max_dy <= COORD_TOL
+    )
+
     integrity = {
         "run_dir": str(run_dir),
         "diag_csv": str(diag_csv),
@@ -764,12 +1138,25 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
         "incomplete_marker_absent": not incomplete_marker.exists(),
         "trace_header": header_meta,
         "trace_footer": footer_meta,
-        "overflow": int(footer_meta.get("overflow", -1)),
-        "config_changes": int(footer_meta.get("config_changes", -1)),
-        "complete_flag": int(footer_meta.get("complete", 0)),
+        "overflow": overflow_i,
+        "config_changes": config_changes_i,
+        "complete_flag": complete_flag_i,
+        "header_valid": header_valid,
+        "row_count_mismatch": row_count_mismatch,
+        "trace_parse_errors": trace_parse_errors,
         "trace_rows": len(trace_rows),
-        "diag_rows": len(diag_rows),
+        "diag_rows": len(raw_diag_rows),
+        "aligned_rows": len(aligned),
         "diag_columns": len(diag_cols),
+        "surplus_field_rows": surplus_field_rows,
+        "missing_field_rows": missing_field_rows,
+        "invalid_integer_fields": invalid_integer_fields,
+        "invalid_detected_values": invalid_detected_values,
+        "invalid_state_values": invalid_state_values,
+        "invalid_numeric_fields": invalid_numeric_fields,
+        "infinite_value_errors": infinite_value_errors,
+        "recorder_correspondence_errors": recorder_correspondence_errors,
+        "schema_errors": schema_errors,
         "frame_id_mismatches": fid_mismatches,
         "ts_ms_mismatches": ts_ms_mismatches,
         "capture_s_mismatches": cap_s_mismatches,
@@ -780,6 +1167,7 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
         "ts_ms_non_increasing": ts_ms_non_increasing,
         "capture_s_non_increasing": capture_s_non_increasing,
         "nonfinite_errors": nonfinite_errors,
+        "integrity_errors": integrity_errors,
         "coord_tol": COORD_TOL,
         "max_abs_capture_s_diff": max_cap_s_diff,
         "max_abs_delta_norm_x": max_dx,
@@ -788,31 +1176,7 @@ def load_and_align_run(run_dir: Path, diag_csv: Path) -> Tuple[Dict[str, Any], L
         "logged_y_sign_mult": logged_y_sign_mult,
         "y_sign_err_fixed": err_fixed,
         "y_sign_err_legacy": err_legacy,
-        "alignment_ok": bool(
-            complete_marker.is_file()
-            and not incomplete_marker.exists()
-            and int(footer_meta.get("overflow", -1)) == 0
-            and int(footer_meta.get("config_changes", -1)) == 0
-            and int(footer_meta.get("complete", 0)) == 1
-            and len(trace_rows) > 0
-            and len(diag_rows) == len(trace_rows)
-            and len(diag_cols) == len(EXPECTED_DIAG_COLUMNS)
-            and fid_mismatches == 0
-            and ts_ms_mismatches == 0
-            and cap_s_mismatches == 0
-            and state_mismatches == 0
-            and norm_x_mismatches == 0
-            and norm_y_mismatches == 0
-            and frame_id_non_increasing == 0
-            and ts_ms_non_increasing == 0
-            and capture_s_non_increasing == 0
-            and nonfinite_errors == 0
-            and math.isfinite(max_cap_s_diff)
-            and math.isfinite(max_dx)
-            and math.isfinite(max_dy)
-            and max_dx <= COORD_TOL
-            and max_dy <= COORD_TOL
-        ),
+        "alignment_ok": alignment_ok,
     }
     return integrity, aligned
 
@@ -1226,9 +1590,113 @@ def compute_direction_checks(windows_res: Sequence[Dict[str, Any]]) -> List[Dict
     return checks
 
 
+def compute_qualification_summary(
+    integrity: Dict[str, Any],
+    windows_res: Sequence[Dict[str, Any]],
+    directions: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    archive_integrity_ok = bool(integrity.get("alignment_ok", False))
+    alignment_ok = bool(integrity.get("alignment_ok", False))
+
+    by_window: Dict[str, Dict[str, Any]] = {}
+    by_window_upper: Dict[str, Dict[str, Any]] = {}
+    passed_axes = 0
+    total_axes = 0
+    for w in windows_res:
+        rx_pass = bool(w.get("raw_x", {}).get("pass_all", False))
+        ry_pass = bool(w.get("raw_y", {}).get("pass_all", False))
+        w_passed = int(rx_pass) + int(ry_pass)
+        passed_axes += w_passed
+        total_axes += 2
+        entry = {
+            "raw_x": rx_pass,
+            "raw_y": ry_pass,
+            "passed": w_passed,
+            "total": 2,
+            "pass_both": rx_pass and ry_pass,
+        }
+        by_window[w["window"]] = entry
+        by_window_upper[w["window"].upper()] = entry
+
+    dirs_by_comp = {d["comparison"]: d for d in directions}
+    horiz_dir = dirs_by_comp.get("HORIZONTAL_LEFT_TO_RIGHT")
+    vert_dir = dirs_by_comp.get("VERTICAL_UP_TO_DOWN")
+
+    horiz_dir_pass: Optional[bool] = None
+    if horiz_dir is not None:
+        dx = horiz_dir.get("delta_raw_x_mean")
+        horiz_dir_pass = bool(dx is not None and math.isfinite(dx) and dx > 0.0)
+
+    vert_dir_pass: Optional[bool] = None
+    if vert_dir is not None:
+        dy = vert_dir.get("delta_raw_y_mean")
+        vert_dir_pass = bool(dy is not None and math.isfinite(dy) and dy > 0.0)
+
+    cardinal_checks = [c for c in (horiz_dir_pass, vert_dir_pass) if c is not None]
+    direction_verification_pass: Optional[bool] = (
+        all(cardinal_checks) if cardinal_checks else None
+    )
+
+    horiz_present = all(k in by_window_upper for k in ("CENTER", "LEFT", "RIGHT"))
+    vert_present = all(k in by_window_upper for k in ("CENTER", "UP", "DOWN"))
+
+    horiz_qual_pass: Optional[bool] = None
+    if horiz_present:
+        horiz_qual_pass = bool(
+            archive_integrity_ok
+            and alignment_ok
+            and all(by_window_upper[k]["pass_both"] for k in ("CENTER", "LEFT", "RIGHT"))
+            and horiz_dir_pass is True
+        )
+
+    vert_qual_pass: Optional[bool] = None
+    if vert_present:
+        vert_qual_pass = bool(
+            archive_integrity_ok
+            and alignment_ok
+            and all(by_window_upper[k]["pass_both"] for k in ("CENTER", "UP", "DOWN"))
+            and vert_dir_pass is True
+        )
+
+    all_evaluated_axes_pass = bool(total_axes > 0 and passed_axes == total_axes)
+    overall_qualification_pass = bool(
+        archive_integrity_ok
+        and alignment_ok
+        and all_evaluated_axes_pass
+        and direction_verification_pass is not False
+        and (horiz_qual_pass is not False)
+        and (vert_qual_pass is not False)
+    )
+
+    return {
+        "archive_integrity_ok": archive_integrity_ok,
+        "alignment_ok": alignment_ok,
+        "per_axis_pass_counts": {
+            "passed": passed_axes,
+            "total": total_axes,
+            "by_window": by_window,
+        },
+        "all_evaluated_axes_pass": all_evaluated_axes_pass,
+        "horizontal_axes_present": horiz_present,
+        "vertical_axes_present": vert_present,
+        "horizontal_direction_pass": horiz_dir_pass,
+        "vertical_direction_pass": vert_dir_pass,
+        "direction_verification_pass": direction_verification_pass,
+        "horizontal_qualification_pass": horiz_qual_pass,
+        "vertical_qualification_pass": vert_qual_pass,
+        "overall_qualification_pass": overall_qualification_pass,
+        "scored_responsiveness_authorized": False,
+        "scored_responsiveness_note": (
+            "Scored gaze responsiveness remains ON HOLD until Engineer 4 independently reviews "
+            "and authorizes the complete qualification evidence and exact executable configuration."
+        ),
+    }
+
+
 def format_markdown_report(report: Dict[str, Any]) -> str:
     integ = report["integrity"]
     cadence = report.get("cadence") or {}
+    qual = report.get("qualification") or {}
     artifact_dir = integ.get("artifact_dir") or integ["run_dir"]
     dsp_dir = integ.get("dsp_record_dir") or integ["run_dir"]
     run_line = f"- **Run directory:** `{artifact_dir}`"
@@ -1258,12 +1726,19 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
         "## 1. Alignment & Integrity",
         f"- **Alignment & integrity verdict:** **{'VALID (`alignment_ok=True`)' if integ.get('alignment_ok') else 'INVALID (`alignment_ok=False`)'}**",
         run_line,
-        f"- **Diag CSV:** `{integ['diag_csv']}` (`{integ['diag_rows']}` rows, `{integ['diag_columns']}` columns)",
+        f"- **Diag CSV:** `{integ['diag_csv']}` (`{integ['diag_rows']}` rows, `{integ['diag_columns']}` columns, `header_valid={integ.get('header_valid', True)}`)",
         f"- **Cadence (`{cadence.get('delivered_fps_formula', '(N - 1) / (last_capture_s - first_capture_s)')}`):** `requested_fps={req_fps_str}`, `delivered_fps_overall={deliv_fps_str}`, `capture_span_s={cadence.get('capture_span_s')}`, `max_frame_gap_ms={cadence.get('max_frame_gap_ms')}`, `low_fps_warning={cadence.get('low_fps_warning', False)}`",
         f"- **Recorder markers:** `COMPLETE={integ['complete_marker_present']}`, `INCOMPLETE_absent={integ['incomplete_marker_absent']}`, `overflow={integ['overflow']}`, `config_changes={integ['config_changes']}`, `complete={integ['complete_flag']}`",
         f"- **DSP config (E4REC BEGIN):** `min_cutoff={integ['trace_header'].get('min_cutoff')}`, `beta={integ['trace_header'].get('beta')}`, `derivative_cutoff={integ['trace_header'].get('derivative_cutoff')}`",
         f"- **1:1 Alignment (`COORD_TOL={integ.get('coord_tol', COORD_TOL):.1e}`):** `frame_id_mismatches={integ['frame_id_mismatches']}`, `ts_ms_mismatches={integ.get('ts_ms_mismatches', 0)}`, `capture_s_mismatches={integ['capture_s_mismatches']}` (`max_diff={integ['max_abs_capture_s_diff']:.3e} s`), `state_mismatches={integ['state_mismatches']}`, `norm_mismatches=({integ.get('norm_x_mismatches', 0)}, {integ.get('norm_y_mismatches', 0)})`, `max_delta_norm=({integ['max_abs_delta_norm_x']:.3e}, {integ['max_abs_delta_norm_y']:.3e})`, `logged_y_sign={integ['logged_y_sign']}`",
+        f"- **Schema & correspondence validation:** `schema_errors={integ.get('schema_errors', 0)}`, `surplus_field_rows={integ.get('surplus_field_rows', 0)}`, `missing_field_rows={integ.get('missing_field_rows', 0)}`, `invalid_integer_fields={integ.get('invalid_integer_fields', 0)}`, `invalid_detected_values={integ.get('invalid_detected_values', 0)}`, `invalid_state_values={integ.get('invalid_state_values', 0)}`, `invalid_numeric_fields={integ.get('invalid_numeric_fields', 0)}`, `infinite_value_errors={integ.get('infinite_value_errors', 0)}`, `recorder_correspondence_errors={integ.get('recorder_correspondence_errors', 0)}`",
         f"- **Monotonicity & finiteness:** `frame_id_non_increasing={integ.get('frame_id_non_increasing', 0)}`, `ts_ms_non_increasing={integ.get('ts_ms_non_increasing', 0)}`, `capture_s_non_increasing={integ.get('capture_s_non_increasing', 0)}`, `nonfinite_errors={integ.get('nonfinite_errors', 0)}`",
+    ])
+    if integ.get("integrity_errors"):
+        lines.append("- **Integrity error samples:**")
+        for err in integ["integrity_errors"][:10]:
+            lines.append(f"  - `{err}`")
+    lines.extend([
         "",
         "### Model Inventory",
         "| Role | File | Bytes | SHA-256 |",
@@ -1273,7 +1748,22 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
         for name, info in inv_map.items():
             lines.append(f"| {role} | `{name}` | {info.get('bytes')} | `{info.get('sha256')}` |")
 
-    lines += ["", "## 2. Raw Fixation Stability & Attribution by Window"]
+    if qual:
+        counts = qual.get("per_axis_pass_counts") or {}
+        lines.extend([
+            "",
+            "## 2. Qualification Summary (Separate from Archive Integrity)",
+            f"- **Archive integrity (`archive_integrity_ok`):** `{qual.get('archive_integrity_ok')}` | **Alignment (`alignment_ok`):** `{qual.get('alignment_ok')}`",
+            f"- **Per-axis fixation pass count:** `{counts.get('passed', 0)}/{counts.get('total', 0)}` (`all_evaluated_axes_pass={qual.get('all_evaluated_axes_pass')}`)",
+            f"- **Horizontal qualification (`CENTER/LEFT/RIGHT`):** `{qual.get('horizontal_qualification_pass')}` (direction: `{qual.get('horizontal_direction_pass')}`)",
+            f"- **Vertical qualification (`CENTER/UP/DOWN`):** `{qual.get('vertical_qualification_pass')}` (direction: `{qual.get('vertical_direction_pass')}`)",
+            f"- **Direction verification (`direction_verification_pass`):** `{qual.get('direction_verification_pass')}`",
+            f"- **Overall fixation qualification (`overall_qualification_pass`):** **{'PASS' if qual.get('overall_qualification_pass') else 'FAIL'}**",
+            f"- **Scored responsiveness authorized (`scored_responsiveness_authorized`):** `{qual.get('scored_responsiveness_authorized', False)}` ({qual.get('scored_responsiveness_note', '')})",
+            "- **Exit code policy:** `0` = integrity OK (and qualification PASS if `--require-qualification-pass`), `1` = integrity/schema/alignment FAILED, `2` = integrity OK but qualification FAILED under `--require-qualification-pass`.",
+        ])
+
+    lines += ["", "## 3. Raw Fixation Stability & Attribution by Window"]
     for w in report["windows"]:
         wash_mode = "strict-protocol" if w.get("strict_protocol_wash_in") else "window-start"
         w_fps = w.get("delivered_fps")
@@ -1340,7 +1830,7 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
                     )
 
     if report["directions"]:
-        lines += ["", "## 3. Direction Verification"]
+        lines += ["", "## 4. Direction Verification"]
         for d in report["directions"]:
             lines.append(
                 f"- **{d['comparison']}** (`{d['window_a']}` -> `{d['window_b']}`): "
@@ -1362,20 +1852,30 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
 
 
 class _CueSpeaker:
-    """Persistent pre-warmed Windows SAPI speech worker for sub-50ms target audio cues."""
+    """Persistent pre-warmed Windows SAPI speech worker with software dispatch telemetry.
+
+    NOTE: Timings recorded here measure software pipe-write and SAPI `SpeakAsync()`
+    acknowledgement only (`AUDIO_TIMING_SCOPE`), NOT physical acoustic speaker onset.
+    """
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = bool(enabled and os.name == "nt")
         self._proc: Optional[subprocess.Popen[str]] = None
         self._ready = threading.Event()
         self._lock = threading.Lock()
-        self._pending: Optional[str] = None
+        self._pending: Optional[Tuple[str, float]] = None
         self._closed = False
         self._thread: Optional[threading.Thread] = None
+        self._start_perf: Optional[float] = None
+        self._warm_perf: Optional[float] = None
+        self._seq: int = 0
+        self._events: List[Dict[str, Any]] = []
+        self._events_by_seq: Dict[int, Dict[str, Any]] = {}
 
     def start(self) -> None:
         if not self.enabled or self._proc is not None:
             return
+        self._start_perf = time.perf_counter()
         try:
             ps = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
             script = (
@@ -1385,10 +1885,16 @@ class _CueSpeaker:
                 "$s.Speak(''); "
                 "Write-Output 'WARM'; "
                 "[Console]::Out.Flush(); "
+                "$seq = 0; "
                 "while ($null -ne ($line = [Console]::In.ReadLine())) { "
                 "  if ($line -eq '__EXIT__') { break } "
+                "  $seq++; "
+                "  $sw = [System.Diagnostics.Stopwatch]::StartNew(); "
                 "  $s.SpeakAsyncCancelAll(); "
                 "  $null = $s.SpeakAsync($line); "
+                "  $sw.Stop(); "
+                "  Write-Output ('ACK|' + $seq + '|' + [math]::Round($sw.Elapsed.TotalMilliseconds, 3)); "
+                "  [Console]::Out.Flush(); "
                 "} "
                 "$s.SpeakAsyncCancelAll(); "
                 "$s.Dispose()"
@@ -1404,50 +1910,139 @@ class _CueSpeaker:
                 bufsize=1,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            self._thread = threading.Thread(target=self._wait_warm, daemon=True)
+            self._thread = threading.Thread(target=self._read_worker_stdout, daemon=True)
             self._thread.start()
         except Exception:
             self._proc = None
 
-    def _wait_warm(self) -> None:
+    def _read_worker_stdout(self) -> None:
         proc = self._proc
         if proc is None or proc.stdout is None:
             return
         try:
-            for line in proc.stdout:
-                if line.strip() == "WARM":
+            for raw_line in proc.stdout:
+                rx_perf = time.perf_counter()
+                line = raw_line.strip()
+                if line == "WARM":
+                    self._warm_perf = rx_perf
                     self._ready.set()
                     with self._lock:
                         pending = self._pending
                         self._pending = None
-                    if pending and not self._closed:
-                        self._write_line(pending)
-                    break
+                        if pending and not self._closed:
+                            self._write_line_locked(pending[0], enqueue_mono=pending[1], buffered_until_warm=True)
+                elif line.startswith("ACK|"):
+                    parts = line.split("|")
+                    if len(parts) == 3:
+                        ack_seq = _parse_strict_int(parts[1])
+                        ps_ms = _parse_strict_float(parts[2])
+                        if ack_seq is not None:
+                            with self._lock:
+                                ev = self._events_by_seq.get(ack_seq)
+                                if ev is not None:
+                                    if ps_ms is not None and math.isfinite(ps_ms):
+                                        ev["ps_speak_async_ms"] = round(ps_ms, 3)
+                                    w_perf = ev.get("_write_start_perf")
+                                    if isinstance(w_perf, float):
+                                        ev["ps_ack_delay_ms"] = round((rx_perf - w_perf) * 1000.0, 3)
         except Exception:
             pass
 
-    def _write_line(self, text: str) -> None:
+    def _write_line_locked(
+        self,
+        text: str,
+        *,
+        enqueue_mono: float,
+        buffered_until_warm: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
-            return
+            return None
         clean = text.replace("\r", " ").replace("\n", " ").strip()
         if not clean:
-            return
+            return None
+        self._seq += 1
+        seq = self._seq
+        w_t0 = time.perf_counter()
+        ev: Dict[str, Any] = {
+            "seq": seq,
+            "text": clean,
+            "enqueue_mono_s": float(enqueue_mono),
+            "buffered_until_warm": buffered_until_warm,
+            "write_ok": False,
+            "worker_write_call_ms": None,
+            "ps_speak_async_ms": None,
+            "ps_ack_delay_ms": None,
+            "_write_start_perf": w_t0,
+        }
+        self._events.append(ev)
+        self._events_by_seq[seq] = ev
+        ok = False
         try:
             proc.stdin.write(clean + "\n")
             proc.stdin.flush()
+            ok = True
         except Exception:
-            pass
+            ok = False
+        w_t1 = time.perf_counter()
+        ev["write_ok"] = ok
+        ev["worker_write_call_ms"] = round((w_t1 - w_t0) * 1000.0, 4)
+        return ev
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str) -> Optional[Dict[str, Any]]:
         if not self.enabled or self._closed:
-            return
+            return None
+        enqueue_mono = time.monotonic()
         if self._ready.is_set():
             with self._lock:
-                self._write_line(text)
-        else:
-            with self._lock:
-                self._pending = text
+                return self._write_line_locked(text, enqueue_mono=enqueue_mono, buffered_until_warm=False)
+        with self._lock:
+            self._pending = (text, enqueue_mono)
+        return None
+
+    def get_telemetry(
+        self,
+        *,
+        launch_mono: float,
+        t_base: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            proc = self._proc
+            alive = bool(proc is not None and proc.poll() is None and not self._closed)
+            warm_delay_ms = (
+                round((self._warm_perf - self._start_perf) * 1000.0, 3)
+                if (self._start_perf is not None and self._warm_perf is not None)
+                else None
+            )
+            public_events: List[Dict[str, Any]] = []
+            for ev in self._events:
+                enq_m = float(ev["enqueue_mono_s"])
+                public_events.append({
+                    "seq": ev["seq"],
+                    "text": ev["text"],
+                    "enqueue_wall_s": round(enq_m - launch_mono, 4),
+                    "enqueue_capture_s": round(enq_m - t_base, 4) if t_base is not None else None,
+                    "buffered_until_warm": ev["buffered_until_warm"],
+                    "write_ok": ev["write_ok"],
+                    "worker_write_call_ms": ev["worker_write_call_ms"],
+                    "ps_speak_async_ms": ev["ps_speak_async_ms"],
+                    "ps_ack_delay_ms": ev["ps_ack_delay_ms"],
+                })
+        return {
+            "audio_timing_scope": AUDIO_TIMING_SCOPE,
+            "acoustic_onset_measured": False,
+            "zero_dispatch_explanation": (
+                "Earlier 0.0 ms dispatch readings occurred because time.monotonic() on Windows has "
+                "~15.6 ms tick resolution while pipe writes complete in <0.2 ms. Current telemetry "
+                "uses time.perf_counter() for worker_write_call_ms and PowerShell Stopwatch/ACK for "
+                "ps_speak_async_ms and ps_ack_delay_ms; it explicitly does NOT measure physical acoustic onset."
+            ),
+            "audio_cues_enabled": self.enabled,
+            "speaker_warmed": self._ready.is_set(),
+            "speaker_warm_delay_ms": warm_delay_ms,
+            "speaker_alive_at_telemetry": alive,
+            "events": public_events,
+        }
 
     def close(self) -> None:
         self._closed = True
@@ -1567,6 +2162,7 @@ def run_cued_capture(
     speaker.start()
 
     clock = time.monotonic
+    launch_unix_s = time.time()
     launch_mono = clock()
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(REPO_ROOT),
@@ -1606,6 +2202,7 @@ def run_cued_capture(
     console_tail: "collections.deque[str]" = collections.deque(maxlen=200)
     all_targets_done_at: Optional[float] = None
     stop_sent = False
+    speaker_telemetry: Optional[Dict[str, Any]] = None
 
     def _handle_line(line: str, rx_time: float) -> None:
         nonlocal epoch_mono
@@ -1656,33 +2253,38 @@ def run_cued_capture(
                         and rel_ready < item["offset_from_ready_start_s"]
                     ):
                         pc_t0 = clock()
+                        pc_perf0 = time.perf_counter()
                         prep_msg = f"Prepare: move eyes to {item['name']} now."
                         print(
                             f"[PRE-CUE   +{rel_ready:.2f}s from ready | wall=+{pc_t0 - launch_mono:.2f}s] {prep_msg}",
                             flush=True,
                         )
-                        speaker.speak(prep_msg)
-                        pc_t1 = clock()
+                        pc_ev = speaker.speak(prep_msg)
+                        pc_perf1 = time.perf_counter()
                         pre_cue_state = {
                             "pre_cue_mono": pc_t0,
-                            "pre_cue_dispatch_ms": round((pc_t1 - pc_t0) * 1000.0, 3),
+                            "pre_cue_dispatch_ms": round((pc_perf1 - pc_perf0) * 1000.0, 4),
+                            "pre_cue_speaker_seq": pc_ev["seq"] if isinstance(pc_ev, dict) else None,
                         }
                     if rel_ready >= item["offset_from_ready_start_s"]:
                         active_idx = next_idx
                         st_t0 = clock()
+                        st_perf0 = time.perf_counter()
                         msg = f"Hold {item['name']} still."
                         print(
                             f"[CUE START +{rel_ready:.2f}s from ready | wall=+{st_t0 - launch_mono:.2f}s] {msg}",
                             flush=True,
                         )
-                        speaker.speak(f"Hold {item['name'].lower()}.")
-                        st_t1 = clock()
+                        st_ev = speaker.speak(f"Hold {item['name'].lower()}.")
+                        st_perf1 = time.perf_counter()
                         raw_targets.append({
                             "name": item["name"],
                             "pre_cue_mono": pre_cue_state["pre_cue_mono"] if pre_cue_state else None,
                             "pre_cue_dispatch_ms": pre_cue_state["pre_cue_dispatch_ms"] if pre_cue_state else None,
+                            "pre_cue_speaker_seq": pre_cue_state["pre_cue_speaker_seq"] if pre_cue_state else None,
                             "start_mono": st_t0,
-                            "cue_start_dispatch_ms": round((st_t1 - st_t0) * 1000.0, 3),
+                            "cue_start_dispatch_ms": round((st_perf1 - st_perf0) * 1000.0, 4),
+                            "cue_start_speaker_seq": st_ev["seq"] if isinstance(st_ev, dict) else None,
                             "end_mono": None,
                         })
                         pre_cue_state = None
@@ -1730,6 +2332,10 @@ def run_cued_capture(
                 proc.stdout.close()
             except Exception:
                 pass
+        # CRITICAL: sample speaker telemetry BEFORE speaker.close() so speaker_alive_at_telemetry
+        # reflects live worker health rather than post-shutdown state.
+        if hasattr(speaker, "get_telemetry"):
+            speaker_telemetry = speaker.get_telemetry(launch_mono=launch_mono)
         speaker.close()
 
     tail_list = list(console_tail)
@@ -1739,25 +2345,55 @@ def run_cued_capture(
         raise RuntimeError(f"Cued capture ended before all targets completed; tail={tail_list[-15:]}")
 
     trace_times = _extract_trace_capture_times(dsp_dir / "trace.txt")
-    t_base, sync_method = _resolve_capture_epoch_mono(status_samples, trace_times, epoch_mono, launch_mono)
+    t_base, sync_method, clock_sync_diag = _resolve_capture_epoch_with_diagnostics(
+        status_samples, trace_times, epoch_mono, launch_mono, wall_origin_unix_s=launch_unix_s
+    )
     calib_ready_s = round(gate.calib_ready_time - t_base, 4)
     effective_gap_pre_cue = min(float(pre_cue_s), max(0.0, float(gap_s) - 0.5)) if pre_cue_s > 0.0 else 0.0
-    scheduled_targets = [
-        {
+
+    # Enrich speaker telemetry with capture_s timestamps now that t_base is resolved
+    events_by_seq: Dict[int, Dict[str, Any]] = {}
+    if speaker_telemetry is not None:
+        for ev in speaker_telemetry.get("events") or []:
+            if ev.get("enqueue_wall_s") is not None:
+                ev["enqueue_capture_s"] = round(launch_mono + float(ev["enqueue_wall_s"]) - t_base, 4)
+            if isinstance(ev.get("seq"), int):
+                events_by_seq[ev["seq"]] = ev
+    else:
+        speaker_telemetry = {
+            "audio_timing_scope": AUDIO_TIMING_SCOPE,
+            "acoustic_onset_measured": False,
+            "audio_cues_enabled": bool(audio),
+            "speaker_warmed": False,
+            "speaker_warm_delay_ms": None,
+            "speaker_alive_at_telemetry": False,
+            "events": [],
+        }
+
+    scheduled_targets: List[Dict[str, Any]] = []
+    for t in raw_targets:
+        pc_ev = events_by_seq.get(t["pre_cue_speaker_seq"]) if t.get("pre_cue_speaker_seq") is not None else None
+        st_ev = events_by_seq.get(t["cue_start_speaker_seq"]) if t.get("cue_start_speaker_seq") is not None else None
+        scheduled_targets.append({
             "name": t["name"],
             "pre_cue_s": round(float(t["pre_cue_mono"]) - t_base, 4) if t["pre_cue_mono"] is not None else None,
             "pre_cue_wall_s": round(float(t["pre_cue_mono"]) - launch_mono, 4) if t["pre_cue_mono"] is not None else None,
             "pre_cue_dispatch_ms": t["pre_cue_dispatch_ms"],
+            "pre_cue_worker_write_call_ms": pc_ev["worker_write_call_ms"] if pc_ev else None,
+            "pre_cue_ps_speak_async_ms": pc_ev["ps_speak_async_ms"] if pc_ev else None,
+            "pre_cue_ps_ack_delay_ms": pc_ev["ps_ack_delay_ms"] if pc_ev else None,
             "target_start_s": round(float(t["start_mono"]) - t_base, 4),
             "cue_start_wall_s": round(float(t["start_mono"]) - launch_mono, 4),
             "cue_start_dispatch_ms": t["cue_start_dispatch_ms"],
+            "cue_start_worker_write_call_ms": st_ev["worker_write_call_ms"] if st_ev else None,
+            "cue_start_ps_speak_async_ms": st_ev["ps_speak_async_ms"] if st_ev else None,
+            "cue_start_ps_ack_delay_ms": st_ev["ps_ack_delay_ms"] if st_ev else None,
             "target_end_s": round(float(t["end_mono"]) - t_base, 4),
             "cue_end_wall_s": round(float(t["end_mono"]) - launch_mono, 4),
-        }
-        for t in raw_targets
-    ]
+        })
+
     schedule_payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "command": cmd,
         "dsp_record_dir": str(dsp_dir),
         "diag_csv": str(diag_csv),
@@ -1768,12 +2404,15 @@ def run_cued_capture(
         "requested_pre_cue_s": pre_cue_s,
         "pre_cue_s": effective_gap_pre_cue,
         "audio_cues_enabled": bool(audio),
+        "audio_timing_scope": AUDIO_TIMING_SCOPE,
         "time_sync_method": sync_method,
         "first_frame_capture_s": round(float(trace_times[0]), 4) if trace_times else None,
         "gaze_filter": GAZE_FILTER_SPEC,
         "wash_in_s": DEFAULT_CUED_WASH_IN_S,
         "blink_pad_frames": DEFAULT_BLINK_PAD_FRAMES,
         "calib_ready_s": calib_ready_s,
+        "clock_sync_diagnostics": clock_sync_diag,
+        "audio_dispatch_telemetry": speaker_telemetry,
         "targets": scheduled_targets,
     }
     sched_path = run_dir / "cued_schedule.json"
@@ -1790,18 +2429,23 @@ def run_cued_capture(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", type=Path, required=True, help="Run directory (artifacts/reports, or legacy flat recorder dir containing trace.txt)")
     ap.add_argument("--dsp-record-dir", type=Path, default=None, help="Recorder directory for trace.txt/COMPLETE (default for --cued-capture: <run-dir>/dsp_record; offline auto-detects <run-dir> or <run-dir>/dsp_record)")
     ap.add_argument("--diag-csv", type=Path, default=None, help="Path to gaze_diag.csv (default: <run-dir>/gaze_diag.csv)")
     ap.add_argument("--windows", type=str, default=None, help="Comma-separated NAME:START_S-END_S intervals, e.g. 'LEFT:5-15,RIGHT:17-27'")
     ap.add_argument("--auto-windows", action="store_true", help="Automatically segment active tracking windows")
     ap.add_argument("--cued-schedule", type=Path, default=None, help="Path to cued_schedule.json (auto-detected in <run-dir> if present and --windows/--auto-windows omitted)")
-    ap.add_argument("--wash-in-s", type=float, default=None, help="Seconds to trim from the start of each window (default: 0.5 with cued schedule, else 0.0)")
+    ap.add_argument("--wash-in-s", type=float, default=None, help="Seconds to trim from the start of each window (finite, >= 0; default: 0.5 with cued schedule, else 0.0)")
     ap.add_argument(
         "--strict-protocol-wash-in",
         action="store_true",
         help="Restart the wash-in countdown inside a window whenever a frame is excluded or gap > 100 ms (matches evaluate_holds.py)",
+    )
+    ap.add_argument(
+        "--require-qualification-pass",
+        action="store_true",
+        help="Return exit code 2 when archive integrity is OK but physical fixation qualification fails (default descriptive mode returns 0 if alignment_ok else 1)",
     )
     ap.add_argument("--blink-pad-frames", type=int, default=DEFAULT_BLINK_PAD_FRAMES, help="Frames to exclude before/after blink or face loss (default: 2)")
     ap.add_argument("--deployed-models-dir", type=Path, default=DEFAULT_DEPLOYED_MODELS_DIR)
@@ -1830,6 +2474,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.windows is not None and args.auto_windows:
         ap.error("Specify either --windows or --auto-windows, not both.")
+    if args.wash_in_s is not None and (not math.isfinite(args.wash_in_s) or args.wash_in_s < 0.0):
+        ap.error("--wash-in-s must be finite and >= 0")
     if args.blink_pad_frames < 0:
         ap.error("--blink-pad-frames must be >= 0")
     if args.width is not None and args.width <= 0:
@@ -1838,6 +2484,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error("--height must be > 0")
     if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0.0):
         ap.error("--fps must be > 0")
+    if not math.isfinite(args.hold_s) or args.hold_s <= DEFAULT_CUED_WASH_IN_S:
+        ap.error(f"--hold-s must be finite and > {DEFAULT_CUED_WASH_IN_S}")
+    if not math.isfinite(args.gap_s) or args.gap_s < 0.0:
+        ap.error("--gap-s must be finite and >= 0")
     if not math.isfinite(args.pre_cue_s) or args.pre_cue_s < 0.0:
         ap.error("--pre-cue-s must be finite and >= 0")
 
@@ -1904,23 +2554,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         windows_spec = auto_detect_windows(rows)
 
-    wash_in_s = args.wash_in_s if args.wash_in_s is not None else (
-        DEFAULT_CUED_WASH_IN_S if cued_meta is not None else 0.0
-    )
+    if args.wash_in_s is not None:
+        wash_in_s = args.wash_in_s
+        wash_in_source = "cli_override"
+    elif cued_meta is not None:
+        wash_in_s = DEFAULT_CUED_WASH_IN_S
+        wash_in_source = "cued_schedule_default"
+    else:
+        wash_in_s = 0.0
+        wash_in_source = "analyzer_default"
     padded_bad = compute_blink_pad_indices(rows, args.blink_pad_frames)
 
-    windows_res = [
-        analyze_window(
-            name, s, e, rows, dep_yaw, dep_pitch, cand_yaw, cand_pitch,
-            logged_y_sign_mult=integrity["logged_y_sign_mult"],
-            wash_in_s=wash_in_s,
-            blink_pad_frames=args.blink_pad_frames,
-            padded_bad_indices=padded_bad,
-            strict_protocol_wash_in=args.strict_protocol_wash_in,
-        )
-        for name, s, e in windows_spec
-    ]
+    if integrity["schema_errors"] > 0 or integrity["nonfinite_errors"] > 0:
+        windows_res = []
+    else:
+        windows_res = [
+            analyze_window(
+                name, s, e, rows, dep_yaw, dep_pitch, cand_yaw, cand_pitch,
+                logged_y_sign_mult=integrity["logged_y_sign_mult"],
+                wash_in_s=wash_in_s,
+                blink_pad_frames=args.blink_pad_frames,
+                padded_bad_indices=padded_bad,
+                strict_protocol_wash_in=args.strict_protocol_wash_in,
+            )
+            for name, s, e in windows_spec
+        ]
     directions = compute_direction_checks(windows_res)
+    qualification = compute_qualification_summary(integrity, windows_res, directions)
 
     all_cap_times = [float(r["capture_s"]) for r in rows if math.isfinite(r["capture_s"])]
     delivered_fps_overall = _compute_cadence_fps(all_cap_times)
@@ -1958,14 +2618,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "max_frame_gap_ms": max_frame_gap_ms,
     }
 
+    if not integrity["alignment_ok"]:
+        exit_code = EXIT_CODE_INTEGRITY_FAILED
+    elif args.require_qualification_pass and not qualification["overall_qualification_pass"]:
+        exit_code = EXIT_CODE_QUALIFICATION_FAILED
+    else:
+        exit_code = EXIT_CODE_OK
+
     report = {
         "integrity": integrity,
+        "qualification": qualification,
+        "exit_code_policy": {
+            "require_qualification_pass": bool(args.require_qualification_pass),
+            "computed_exit_code": exit_code,
+            "codes": {
+                "0": "Archive integrity and alignment OK (and qualification PASS when --require-qualification-pass is set).",
+                "1": "Archive integrity, CSV schema, or recorder alignment FAILED (alignment_ok=False).",
+                "2": "Archive integrity and alignment OK, but fixation qualification FAILED under --require-qualification-pass.",
+            },
+        },
         "cadence": cadence,
         "deployed_models": dep_inv,
         "candidate_models": cand_inv,
         "cued_schedule": cued_meta,
         "analysis_params": {
             "wash_in_s": wash_in_s,
+            "wash_in_source": wash_in_source,
             "strict_protocol_wash_in": args.strict_protocol_wash_in,
             "blink_pad_frames": args.blink_pad_frames,
             "fixed_y_sign": FIXED_Y_SIGN,
@@ -1990,17 +2668,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not integrity["alignment_ok"]:
         print("=== INVALID RUN / ALIGNMENT FAILED ===")
-    print(f"=== ALIGNMENT & INTEGRITY ===")
+    print("=== ALIGNMENT & INTEGRITY ===")
     print(
         f"alignment_ok={integrity['alignment_ok']} rows={integrity['trace_rows']} "
         f"COMPLETE={integrity['complete_marker_present']} "
         f"overflow={integrity['overflow']} config_changes={integrity['config_changes']} "
+        f"schema_err={integrity['schema_errors']} "
         f"fid_mis={integrity['frame_id_mismatches']} ts_mis={integrity['ts_ms_mismatches']} "
         f"cap_s_mis={integrity['capture_s_mismatches']} state_mis={integrity['state_mismatches']} "
         f"norm_mis=({integrity['norm_x_mismatches']}, {integrity['norm_y_mismatches']}) "
         f"non_inc=({integrity['frame_id_non_increasing']}, {integrity['ts_ms_non_increasing']}, {integrity['capture_s_non_increasing']}) "
         f"nonfinite={integrity['nonfinite_errors']} y_sign={integrity['logged_y_sign']} "
         f"max_dnorm=({integrity['max_abs_delta_norm_x']:.3e}, {integrity['max_abs_delta_norm_y']:.3e})"
+    )
+    q_counts = qualification["per_axis_pass_counts"]
+    print(
+        f"Qualification: overall={'PASS' if qualification['overall_qualification_pass'] else 'FAIL'} "
+        f"axes={q_counts['passed']}/{q_counts['total']} "
+        f"horiz={qualification['horizontal_qualification_pass']} "
+        f"vert={qualification['vertical_qualification_pass']} "
+        f"dir={qualification['direction_verification_pass']} "
+        f"scored_authorized={qualification['scored_responsiveness_authorized']} "
+        f"exit_code={exit_code}"
     )
     req_fps_disp = f"{requested_fps:.2f}" if requested_fps is not None else "unspecified"
     deliv_fps_disp = f"{delivered_fps_overall:.2f}" if delivered_fps_overall is not None else "n/a"
@@ -2050,7 +2739,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             line += f" | cand_d_raw_x={d['candidate_delta_raw_x_mean']:+.5f}, cand_d_raw_y(fixed)={d['candidate_delta_raw_y_mean']:+.5f}"
         print(line)
     print(f"Reports written: {out_json} | {out_md}")
-    return 0 if integrity["alignment_ok"] else 1
+    return exit_code
 
 
 if __name__ == "__main__":

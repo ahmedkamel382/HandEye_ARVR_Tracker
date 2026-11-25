@@ -238,7 +238,7 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
 | `os_integration_tests` | 107 / 107 passed |
 | `os_integration_capi_tests` | 9 / 9 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 157 / 157 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 158 / 158 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |

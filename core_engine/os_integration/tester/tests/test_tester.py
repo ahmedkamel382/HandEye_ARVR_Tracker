@@ -716,6 +716,54 @@ def test_run_checks_dialog_can_be_closed_early(make_app, tk_root, monkeypatch, c
         assert "ALL CHECKS PASSED" in text.get("1.0", "end")
 
 
+def _pending_timers(tk_root):
+    return set(tk_root.tk.splitlist(tk_root.tk.call("after", "info")))
+
+
+@pytest.mark.parametrize("schedule", ["startup", "run_checks", "tuning_edit"])
+def test_closing_the_window_cancels_its_tk_timers(make_app, tk_root, monkeypatch, schedule):
+    """Root cause of the intermittent test_run_checks_dialog_can_be_closed_early failure.
+
+    Destroying a window deletes its Python callbacks but leaves their Tcl `after` timers pending. Tkinter names a
+    callback after the memory address of a temporary object plus the function name ('<lambda>' for the patched
+    tick), so a later callback can be given the same name - for example a Scrollable `lambda e:` binding. When the
+    stale timer fires it calls that binding with no event argument (TypeError). The test that pumps the event loop
+    for 0.8 s is the one that runs the stale timers of earlier tests, hence the rare failure there.
+    Here the address reuse is simulated, so the failure is deterministic."""
+    monkeypatch.setattr(tester_app, "system_checks", lambda *a, **k: [(True, "fake check", "")])
+    before = _pending_timers(tk_root)
+    app = make_app()
+    if schedule == "run_checks":
+        app.run_checks()
+    elif schedule == "tuning_edit":
+        app._tuning_changed()
+    mine = _pending_timers(tk_root) - before
+    assert mine, "the app scheduled no timer, so this test checks nothing"
+
+    errors = []
+    monkeypatch.setattr(tk_root, "report_callback_exception", lambda *info: errors.append(info[1]))
+    app.root.destroy()
+    stale = _pending_timers(tk_root) & mine
+    for timer in stale:     # what address reuse does: a new event handler takes the stale timer's command name
+        name = tk_root.tk.splitlist(tk_root.tk.call("after", "info", timer))[0]
+        tk_root.tk.createcommand(name, tk.CallWrapper(lambda e: None, None, tk_root).__call__)
+        tk_root.tk.call("after", "cancel", timer)
+        tk_root.tk.call("after", 0, name)
+    for _ in range(5):
+        tk_root.update()
+    assert not stale and not errors, f"timers left running after the window closed: {sorted(stale)} {errors}"
+
+
+def test_no_timer_is_scheduled_after_the_window_closed(make_app, tk_root):
+    """A callback that runs during or after teardown must not start a timer that nothing would cancel."""
+    app = make_app()
+    app.root.destroy()
+    before = _pending_timers(tk_root)
+    assert app._after(10, lambda: None) is None
+    app._tuning_changed()                     # e.g. a slider trace firing late
+    assert _pending_timers(tk_root) == before and not app._timers
+
+
 # ---------------------------------------------------------------- Space shortcut
 
 @pytest.mark.parametrize("widget, active, toggles", [

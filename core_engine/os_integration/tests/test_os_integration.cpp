@@ -179,6 +179,38 @@ struct MoveRefusingSink final : IInputSink {
     }
 };
 
+// Pinch at the left, then drag right. With `refuse` set, Windows refuses every move after the press.
+double start_drag(OsController& c, MoveRefusingSink& sink, double t, bool refuse) {
+    sink.refuse = false;    // the hand moves to the start, and the press is accepted where the user aims
+    for (int i = 0; i < 8; ++i, t += kDt) {
+        c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}));
+    }
+    for (int i = 0; i < 8; ++i, t += kDt) {
+        c.update(hand_frame(t, NormalizedPoint{0.3, 0.5}, HandGesture::Pinch));
+    }
+    sink.refuse = refuse;
+    for (int i = 0; i < 6; ++i, t += kDt) {
+        c.update(hand_frame(t, NormalizedPoint{0.7, 0.5}, HandGesture::Pinch));
+    }
+    return t;
+}
+
+// Opens the hand with 1 ms frames for `seconds` and returns the frame time of the first button-up (or -1).
+// Lost: the hand vanishes as it opens (tracking lost during the drop wait).
+double open_hand(OsController& c, MoveRefusingSink& sink, double& t, double seconds, TrackerState tracking) {
+    const int ups = sink.ups;
+    double released = -1.0;
+    for (const double end = t + seconds; t < end; t += 0.001) {
+        const std::optional<NormalizedPoint> point =
+            tracking == TrackerState::Lost ? std::nullopt : std::optional<NormalizedPoint>(NormalizedPoint{0.7, 0.5});
+        c.update(hand_frame_tracking(t, point, HandGesture::Neutral, tracking));
+        if (released < 0.0 && sink.ups > ups) {
+            released = t;
+        }
+    }
+    return released;
+}
+
 // ------------------------------------------------------------ calibration helpers
 
 std::vector<TargetObservation> synthetic_observations(const InputRegion& truth, unsigned seed,
@@ -1122,6 +1154,71 @@ int main() {
         }
         c.set_active(false);
         require(sink.ups == 1 && !c.button_held(MouseButton::Left), "pause left a waiting drop held");
+    });
+    // ---- 0.3 s drop wait (os_controller.cpp kDropWaitSeconds): boundaries and every bypass ----
+    run_test("controller_drop_wait_ends_at_exactly_0_3_s", [] {
+        for (const TrackerState tracking : {TrackerState::Tracked, TrackerState::Lost}) {
+            // The same frames twice: the accepting run shows when the gesture's button-up happens.
+            MoveRefusingSink accepting_sink, refusing_sink;
+            OsController accepting(unit_regions(), kFullHd, accepting_sink), refusing(unit_regions(), kFullHd, refusing_sink);
+            accepting.set_active(true);
+            refusing.set_active(true);
+            double ta = start_drag(accepting, accepting_sink, 0.0, false);
+            double tr = start_drag(refusing, refusing_sink, 0.0, true);
+            const double up = open_hand(accepting, accepting_sink, ta, 1.0, tracking);
+            const double drop = open_hand(refusing, refusing_sink, tr, 1.0, tracking);
+            require(up >= 0.0 && drop >= 0.0, "no release at all");
+            double first_after = up;         // the first 1 ms frame at or after up + 0.3 s
+            while (first_after < up + 0.30) {
+                first_after += 0.001;
+            }
+            require(drop == first_after, "the drop wait did not end at exactly 0.3 s");
+            require(drop - 0.001 < up + 0.30, "released before the 0.3 s wait was over");
+            require(refusing_sink.downs == 1 && refusing_sink.ups == 1 && !refusing.button_held(MouseButton::Left),
+                    "wrong button state after the wait");
+        }
+    });
+    run_test("controller_permanently_refused_drop_never_holds_the_button", [] {
+        MoveRefusingSink sink;
+        OsController c(unit_regions(), kFullHd, sink);
+        c.set_active(true);
+        double t = 0.0;
+        for (int drag = 1; drag <= 3; ++drag) {   // repeated drags, every move refused, for 5 s of frames each
+            t = start_drag(c, sink, t, true);
+            const double opened = t;
+            const double released = open_hand(c, sink, t, 5.0, TrackerState::Tracked);
+            require(released >= 0.0 && released - opened <= 0.30 + 0.25, "a refused drop held the button");
+            require(sink.released_at && sink.released_at->x < 960, "the drop was not at the last accepted position: drag " + std::to_string(drag) + " x=" + (sink.released_at ? std::to_string(sink.released_at->x) : std::string("none")));
+            require(sink.downs == drag && sink.ups == drag && !c.button_held(MouseButton::Left),
+                    "button pressed again or still held");
+            require(!c.update(hand_frame(t, NormalizedPoint{0.7, 0.5})).release_pending, "release still pending");
+        }
+    });
+    run_test("controller_waiting_drop_is_released_at_once_by_every_safety_path", [] {
+        // pause/Esc, wizard or physical mouse (inhibit), stale-input watchdog and Tester Stop (release_all), shutdown
+        for (int path = 0; path < 4; ++path) {
+            MoveRefusingSink sink;
+            std::optional<OsController> c;
+            c.emplace(unit_regions(), kFullHd, sink);
+            c->set_active(true);
+            double t = start_drag(*c, sink, 0.0, true);
+            open_hand(*c, sink, t, 0.15, TrackerState::Tracked);
+            require(sink.ups == 0 && c->button_held(MouseButton::Left), "the drop was not waiting");
+            switch (path) {
+            case 0: c->set_active(false); break;
+            case 1: c->set_inhibited(true); break;
+            case 2: require(c->release_all_buttons(), "release_all failed"); break;
+            default: c.reset(); break;
+            }
+            require(sink.ups == 1, "a safety path waited for the drop");
+            if (c) {
+                require(!c->button_held(MouseButton::Left), "button still held");
+                for (int i = 0; i < 20; ++i, t += kDt) {     // the old wait must not fire or press later
+                    c->update(hand_frame(t, NormalizedPoint{0.7, 0.5}));
+                }
+                require(sink.ups == 1 && sink.downs == 1, "the cancelled wait acted later");
+            }
+        }
     });
     // ---- R1: settings files ----
     run_test("settings_accept_utf8_bom", [] {

@@ -376,22 +376,116 @@ class TestFeatureExtractionAndGeometry:
         assert math.isclose(r_ear, 1.0, abs_tol=1e-9)
 
     def test_mpii_processor_shared_feature_extraction_and_vector_to_pitch_yaw(self):
-        stub_detector = StubFaceDetector()
-        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector):
-            import mpii_processor as mp_proc
+        import importlib.util
 
-        # Verify mpii_processor reuses the exact same extract_gaze_features function from gaze_intent
-        assert mp_proc.extract_gaze_features is gi.extract_gaze_features
+        spec = importlib.util.spec_from_file_location("mpii_processor_lazy_test", GAZE_DIR / "mpii_processor.py")
+        mp_proc = importlib.util.module_from_spec(spec)
+        blocked_optional = {
+            "pandas": None,
+            "tqdm": None,
+            "cv2": None,
+            "mediapipe": None,
+            "mediapipe.tasks": None,
+            "mediapipe.tasks.python": None,
+            "mediapipe.tasks.python.vision": None,
+        }
+        with patch.dict(sys.modules, blocked_optional):
+            spec.loader.exec_module(mp_proc)
+            # Pure math helper works with all optional heavy dependencies absent
+            pitch, yaw = mp_proc.vector_to_pitch_yaw(np.array([0.0, 0.0, -1.0]))
+            assert math.isclose(pitch, 0.0, abs_tol=1e-6)
+            assert math.isclose(yaw, 0.0, abs_tol=1e-6)
 
-        # Straight-ahead gaze in camera coordinates (0, 0, -1) -> pitch=0, yaw=0
-        pitch, yaw = mp_proc.vector_to_pitch_yaw(np.array([0.0, 0.0, -1.0]))
-        assert math.isclose(pitch, 0.0, abs_tol=1e-6)
-        assert math.isclose(yaw, 0.0, abs_tol=1e-6)
+            pitch_up, yaw_up = mp_proc.vector_to_pitch_yaw(np.array([0.0, -1.0, -1.0]))
+            assert math.isclose(pitch_up, 45.0, abs_tol=1e-5)
+            assert math.isclose(yaw_up, 0.0, abs_tol=1e-5)
 
-        # Gaze vector tilted up (negative Y in camera space -> positive pitch) and left/right
-        pitch_up, yaw_up = mp_proc.vector_to_pitch_yaw(np.array([0.0, -1.0, -1.0]))
-        assert math.isclose(pitch_up, 45.0, abs_tol=1e-5)
-        assert math.isclose(yaw_up, 0.0, abs_tol=1e-5)
+        # Verify mpii_processor reuses the exact same extract_gaze_features function without creating FaceLandmarker
+        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options") as mock_create:
+            assert mp_proc.extract_gaze_features is gi.extract_gaze_features
+            mock_create.assert_not_called()
+
+    def test_mpii_processor_lazy_detector_and_exception_safe_close(self, tmp_path, monkeypatch):
+        import importlib.util
+        import types
+
+        spec = importlib.util.spec_from_file_location("mpii_processor_lifecycle_test", GAZE_DIR / "mpii_processor.py")
+        mp_proc = importlib.util.module_from_spec(spec)
+        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options") as mock_create:
+            spec.loader.exec_module(mp_proc)
+            mock_create.assert_not_called()
+
+        # 1. Missing dataset returns early without constructing FaceLandmarker
+        monkeypatch.setattr(mp_proc, "DATASET_PATH", str(tmp_path / "missing_dataset"))
+        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options") as mock_create:
+            mp_proc.process_mpiigaze()
+            mock_create.assert_not_called()
+
+        # Prepare a minimal 1-image synthetic MPIIFaceGaze directory
+        ds_dir = tmp_path / "MPIIFaceGaze"
+        p00_dir = ds_dir / "p00"
+        p00_dir.mkdir(parents=True)
+        img_path = p00_dir / "sample.jpg"
+        img_path.write_bytes(b"fake-image")
+        fields = ["sample.jpg"] + ["0.0"] * 20 + ["0.0", "0.0", "0.0", "0.0", "0.0", "-1.0", "extra"]
+        (p00_dir / "p00.txt").write_text(" ".join(fields) + "\n", encoding="utf-8")
+        out_csv = tmp_path / "out.csv"
+
+        fake_cv2 = types.ModuleType("cv2")
+        fake_cv2.COLOR_BGR2RGB = 4
+        fake_cv2.imread = lambda _p: np.zeros((16, 16, 3), dtype=np.uint8)
+        fake_cv2.cvtColor = lambda img, _code: img
+
+        saved_rows = {}
+        class _FakeDF:
+            def __init__(self, rows):
+                self._rows = list(rows)
+            def __len__(self):
+                return len(self._rows)
+            def to_csv(self, path, index=False):
+                saved_rows["path"] = path
+                saved_rows["rows"] = self._rows
+        fake_pandas = types.ModuleType("pandas")
+        fake_pandas.DataFrame = _FakeDF
+        fake_tqdm = types.ModuleType("tqdm")
+        fake_tqdm.tqdm = lambda it: it
+
+        monkeypatch.setattr(mp_proc, "DATASET_PATH", str(ds_dir))
+        monkeypatch.setattr(mp_proc, "OUTPUT_CSV", str(out_csv))
+
+        # 2. Normal completion constructs FaceLandmarker lazily, extracts row, and closes detector
+        class _TrackingDetector:
+            def __init__(self, should_raise=False):
+                self.closed = 0
+                self.detected = 0
+                self.should_raise = should_raise
+            def detect(self, _mp_image):
+                self.detected += 1
+                if self.should_raise:
+                    raise RuntimeError("simulated detector failure")
+                return types.SimpleNamespace(
+                    face_landmarks=[make_synthetic_landmarks()],
+                    facial_transformation_matrixes=[np.eye(4, dtype=np.float64)],
+                )
+            def close(self):
+                self.closed += 1
+
+        det_ok = _TrackingDetector(should_raise=False)
+        with patch.dict(sys.modules, {"cv2": fake_cv2, "pandas": fake_pandas, "tqdm": fake_tqdm}), \
+             patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=det_ok) as mock_create:
+            mp_proc.process_mpiigaze()
+            assert mock_create.call_count == 1
+            assert det_ok.detected == 1
+            assert det_ok.closed == 1
+            assert len(saved_rows["rows"]) == 1
+
+        # 3. Exception during detect still closes detector cleanly (no resource leak)
+        det_err = _TrackingDetector(should_raise=True)
+        with patch.dict(sys.modules, {"cv2": fake_cv2, "pandas": fake_pandas, "tqdm": fake_tqdm}), \
+             patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=det_err):
+            with pytest.raises(RuntimeError, match="simulated detector failure"):
+                mp_proc.process_mpiigaze()
+            assert det_err.closed == 1
 
 
 # ===========================================================================

@@ -60,8 +60,10 @@ def build_rows(rows_from_validator):
         trkmap = {"Tracked": 0, "Held": 1, "Lost": 2}
         statuses = ("Initialized", "Filtered", "ReinitializedAfterGap", "TrackingLost",
                     "InvalidInput", "RejectedTimestamp", "NumericalError")
-        out.append(dict(frame=int(r[0]), t=float(r[15]), x=float(r[7]), y=float(r[8]),
-                        fx=float(r[9]), fy=float(r[10]), n=int(r[4]), ok=int(r[21]),
+        def f(v):  # empty filtered fields are legitimate for non-published rows
+            return float(v) if v not in ("", None) else float("nan")
+        out.append(dict(frame=int(r[0]), t=float(r[15]), x=f(r[7]), y=f(r[8]),
+                        fx=f(r[9]), fy=f(r[10]), n=int(r[4]), ok=int(r[21]),
                         trk=trkmap.get(r[12], -1), state=int(r[5]),
                         status=statuses.index(r[11]) if r[11] in statuses else -1,
                         pub=int(r[6]), resets=int(r[19])))

@@ -13,11 +13,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1375,6 +1377,102 @@ int main() {
     });
 
     // ================================================================ calibration
+    run_test("calibration_reports_each_target_and_reproduces_rms", [] {
+        const InputRegion truth{0.268, 0.646, 0.783, 0.753};          // shape of a real gaze calibration
+        const auto observations = synthetic_observations(truth, 11, 0.01, 3);
+        const auto result = fit_input_region(observations);
+        require(result.fit.has_value(), result.error);
+        require(result.targets.size() == observations.size(), "per-target results missing");
+        double squared = 0.0;
+        for (std::size_t k = 0; k < result.targets.size(); ++k) {
+            const TargetFit& t = result.targets[k];
+            require(t.target.u == observations[k].target.u && t.target.v == observations[k].target.v, "wrong target");
+            require(t.samples == observations[k].samples.size(), "sample count wrong");
+            squared += t.error_u * t.error_u + t.error_v * t.error_v;
+        }
+        close_to(std::sqrt(squared / static_cast<double>(result.targets.size())), result.fit->rms_error, 1e-12,
+                 "rms from the per-target errors");
+        // Targets are kept for a rejected fit too, so a failure can be examined.
+        auto inconsistent = observations;
+        for (NormalizedPoint& p : inconsistent[2].samples) {
+            p.x += 0.3; // the user looked somewhere else for one target
+        }
+        const auto bad = fit_input_region(inconsistent);
+        require(!bad.fit, "an inconsistent calibration was accepted");
+        require(bad.targets.size() == 5 && std::isfinite(bad.targets[2].error_u),
+                "rejected fit lost its per-target results");
+    });
+    // Reads observations_csv() back: target_index,target_u,target_v,x,y; empty x,y = a target without samples.
+    static const auto read_samples_csv = [](const std::string& text) {
+        std::istringstream csv(text);
+        std::string line;
+        std::getline(csv, line);
+        require(line == "target_index,target_u,target_v,x,y", "header changed: " + line);
+        std::vector<TargetObservation> reread;
+        while (std::getline(csv, line)) {
+            std::istringstream fields(line);
+            std::size_t k = 0;
+            double u = 0, v = 0;
+            char c1 = 0, c2 = 0, c3 = 0;
+            require(static_cast<bool>(fields >> k >> c1 >> u >> c2 >> v >> c3) && c1 == ',' && c2 == ',' && c3 == ',',
+                    "bad line: " + line);
+            require(k == reread.size() || k + 1 == reread.size(), "targets out of order: " + line);
+            if (k == reread.size()) {
+                reread.push_back({CalibrationTarget{u, v}, {}});
+            }
+            std::string rest;
+            std::getline(fields, rest);
+            if (rest == ",") {
+                continue; // the target had no sample
+            }
+            std::istringstream xy(rest);
+            double x = 0, y = 0;
+            char c4 = 0;
+            require(static_cast<bool>(xy >> x >> c4 >> y) && c4 == ',', "bad sample: " + line);
+            reread.back().samples.push_back({x, y});
+        }
+        return reread;
+    };
+    run_test("calibration_samples_csv_reproduces_the_fit_exactly", [] {
+        const auto observations = synthetic_observations(InputRegion{0.268, 0.646, 0.783, 0.753}, 5, 0.01, 2);
+        const auto reread = read_samples_csv(observations_csv(observations));
+        const auto a = fit_input_region(observations), b = fit_input_region(reread);
+        require(a.fit && b.fit, "fit failed");
+        require(a.fit->rms_error == b.fit->rms_error && a.fit->region.x_min == b.fit->region.x_min &&
+                    a.fit->region.y_min == b.fit->region.y_min && a.fit->region.x_max == b.fit->region.x_max &&
+                    a.fit->region.y_max == b.fit->region.y_max,
+                "the saved samples do not reproduce the fit bit for bit");
+    });
+    run_test("calibration_keeps_the_evidence_of_every_rejection", [] {
+        const auto good = synthetic_observations(InputRegion{0.268, 0.646, 0.783, 0.753}, 5, 0.01, 2);
+        // A computed fit above the limit: no accepted fit, but its region and RMS are kept.
+        auto inconsistent = good;
+        for (NormalizedPoint& p : inconsistent[2].samples) {
+            p.x += 0.3;
+        }
+        const auto over = fit_input_region(inconsistent);
+        require(!over.fit && over.computed && over.computed->rms_error > RegionFitOptions{}.max_rms_error,
+                "a rejected computed fit lost its numbers");
+        // A fit that never existed: a target without usable samples. Every target is still kept, in order.
+        auto empty = good;
+        empty[3].samples.clear();
+        const auto none = fit_input_region(empty);
+        require(!none.fit && !none.computed, "a fit was reported although it could not be computed");
+        require(none.targets.size() == good.size(), "targets after the empty one were lost");
+        require(none.targets[3].index == 3 && none.targets[3].samples == 0 && std::isnan(none.targets[3].median_x),
+                "the empty target is not recorded as empty");
+        require(none.targets[4].samples == good[4].samples.size(), "a later target lost its samples");
+        // The CSV keeps the empty target too, and reading it back gives the same observations.
+        const auto reread = read_samples_csv(observations_csv(empty));
+        require(reread.size() == empty.size() && reread[3].samples.empty() &&
+                    reread[4].samples.size() == empty[4].samples.size(),
+                "the CSV lost a target");
+        // Non-finite samples are kept in the CSV as they were measured (and ignored by the fit).
+        auto odd = good;
+        odd[0].samples.push_back({std::numeric_limits<double>::infinity(), 0.5});
+        require(observations_csv(odd).find("inf,0.5") != std::string::npos, "a non-finite sample was dropped");
+        require(fit_input_region(odd).targets[0].samples == good[0].samples.size(), "a non-finite sample was used");
+    });
     run_test("calibration_recovers_region", [] {
         const InputRegion truth{0.3, 0.25, 0.7, 0.65};
         const auto result = fit_input_region(synthetic_observations(truth, 7, 0.005));
@@ -1560,6 +1658,96 @@ int main() {
     run_test("settings_from_a_newer_version_are_refused", [] {
         const auto loaded = parse_settings("[app]\nsettings_version = 3\n");
         require(!loaded.error.empty(), "a file from a newer version was accepted");
+    });
+    // ---- migration acceptance (Engineer 4 request, 25 Nov) ----
+    run_test("settings_migration_rejects_invalid_versions", [] {
+        for (const char* bad : {"0", "-1", "two", "2.5", ""}) {
+            const auto loaded = parse_settings(std::string("[app]\nsettings_version = ") + bad + "\n");
+            require(!loaded.error.empty(), std::string("settings_version = '") + bad + "' accepted");
+        }
+    });
+    run_test("settings_migration_converts_once_across_restarts", [] {
+        // Version 1 file with a custom region: converted on the first load, then stable through save/load cycles.
+        const auto first = parse_settings("[mapping]\ngaze_region = 0.62 0.21 0.36 0.33\n");
+        require(!first.migrated.empty() && first.settings.mapping.gaze_calibrated, "first load not converted");
+        require_region(first.settings.mapping.gaze_region, {0.62, 0.79, 0.36, 0.67}, 1e-12);
+        std::string text = serialize_settings(first.settings);
+        for (int restart = 0; restart < 4; ++restart) {
+            const auto again = parse_settings(text);
+            require(again.migrated.empty(), "converted again after restart " + std::to_string(restart));
+            require_region(again.settings.mapping.gaze_region, {0.62, 0.79, 0.36, 0.67}, 1e-12);
+            require(again.settings.mapping.gaze_calibrated, "calibration flag lost after restart");
+            text = serialize_settings(again.settings);
+        }
+    });
+    run_test("settings_migration_window_files_are_repaired_by_a_version_line", [] {
+        // Known limitation: builds from 8f98cfa up to (not including) 7070bd7 saved the corrected Y direction but
+        // wrote neither settings_version nor gaze_calibrated, so their files look like version 1.
+        const std::string window_file = "[mapping]\ngaze_region = 0.62 0.79 0.36 0.67\n";
+        const auto unrepaired = parse_settings(window_file);
+        require(!unrepaired.migrated.empty(), "the limitation is no longer there: update the README");
+        require_region(unrepaired.settings.mapping.gaze_region, {0.62, 0.21, 0.36, 0.33}, 1e-12); // flipped wrongly
+        // Documented repair: back the file up and add "settings_version = 2" under [app] before the first start.
+        const auto repaired = parse_settings(window_file + "[app]\nsettings_version = 2\n");
+        require(repaired.error.empty() && repaired.migrated.empty(), "the repaired file was converted");
+        require_region(repaired.settings.mapping.gaze_region, {0.62, 0.79, 0.36, 0.67}, 1e-12);
+        require(repaired.settings.mapping.gaze_calibrated, "the repaired calibration is not marked calibrated");
+        std::string text = serialize_settings(repaired.settings);
+        for (int restart = 0; restart < 3; ++restart) {
+            const auto again = parse_settings(text);
+            require(again.migrated.empty() && again.settings.mapping.gaze_calibrated, "changed after restart");
+            require_region(again.settings.mapping.gaze_region, {0.62, 0.79, 0.36, 0.67}, 1e-12);
+            text = serialize_settings(again.settings);
+        }
+    });
+    run_test("settings_migration_keeps_every_unrelated_value", [] {
+        const std::string v1 =
+            "[mapping]\nhand_region = 0.1 0.2 0.8 0.9\ngaze_region = 0.62 0.21 0.36 0.33\n"
+            "cursor_source = gaze_only\nscreen_target = all_monitors\n"
+            "[stabilization]\ndrag_threshold_px = 42\n"
+            "[gestures]\nwink_onset_seconds = 0.4\nfist_action = middle_click\n"
+            "[hand_filter]\nbeta = 3.5\n[gaze_filter]\nmin_cutoff_hz = 0.9\n";
+        const auto loaded = parse_settings(v1);
+        const Settings& s = loaded.settings;
+        require(loaded.error.empty(), "valid version 1 file rejected: " + loaded.error);
+        require_region(s.mapping.hand_region, {0.1, 0.2, 0.8, 0.9}, 1e-12);
+        require(s.mapping.cursor_source == CursorSourceMode::GazeOnly &&
+                    s.mapping.screen_target == ScreenTarget::VirtualDesktop,
+                "mapping options changed");
+        require(s.stabilization.drag_threshold_px == 42.0 && s.gestures.wink_onset_seconds == 0.4 &&
+                    s.gestures.fist_action == FistAction::MiddleClick,
+                "gesture values changed");
+        require(s.hand_filter.beta == 3.5 && s.gaze_filter.min_cutoff_hz == 0.9, "filter values changed");
+    });
+    run_test("settings_migration_never_switches_control_on", [] {
+        for (const char* text : {"[mapping]\ngaze_region = 0.3 0.3 0.7 0.7\n",
+                                 "[mapping]\ngaze_region = 0.62 0.21 0.36 0.33\n", ""}) {
+            const auto loaded = parse_settings(text);
+            require(!loaded.settings.app.start_active, "migration enabled start_active");
+            RecordingInputSink sink;
+            OsController c(loaded.settings, kFullHd, sink);
+            require(!c.active(), "a migrated controller started active");
+        }
+    });
+    run_test("settings_migration_skips_files_with_errors", [] {
+        // A broken gaze_region keeps the default and reports the error; nothing is "converted".
+        const auto loaded = parse_settings("[mapping]\ngaze_region = 0.62 0.21 oops 0.33\n");
+        require(!loaded.error.empty(), "bad region accepted");
+        require(loaded.migrated.empty(), "a file with errors was converted");
+        require_region(loaded.settings.mapping.gaze_region, Settings{}.mapping.gaze_region, 1e-12);
+    });
+    run_test("settings_migration_empty_file_uses_defaults", [] {
+        const auto loaded = parse_settings("");
+        require(loaded.error.empty() && loaded.migrated.empty(), "empty text reported a problem");
+        require(!loaded.settings.mapping.gaze_calibrated, "empty file marked calibrated");
+        require_region(loaded.settings.mapping.gaze_region, Settings{}.mapping.gaze_region, 1e-12);
+        require(loaded.settings.app.settings_version == kSettingsVersion, "version not current");
+    });
+    run_test("settings_migration_placeholders_are_exact", [] {
+        // Only the three known placeholders are replaced; a region close to one is a real calibration.
+        const auto close_one = parse_settings("[mapping]\ngaze_region = 0.31 0.3 0.7 0.7\n");
+        require(close_one.settings.mapping.gaze_calibrated, "a near-placeholder region was discarded");
+        require_region(close_one.settings.mapping.gaze_region, {0.31, 0.7, 0.7, 0.3}, 1e-12);
     });
 
     // ================================================================ E3 + E5 joint gaze contract

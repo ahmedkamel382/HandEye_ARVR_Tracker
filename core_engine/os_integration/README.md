@@ -35,7 +35,7 @@ filters when the tray's Smoothing menu changes (`TrayOptions::on_settings_change
 | `app/` | `handeye_tray.exe`: system-tray app, settings, and calibration wizard. |
 | `capi/` | `os_integration_capi.dll`: a plain-C interface to `OsController` (used by the tester). |
 | `tester/` | **HandEye Tester**: `HandEyeTester.exe` + a test-bench UI for every part of the system. |
-| `tests/` | 110 library and tray tests, 10 C-interface tests and a latency benchmark (no GoogleTest needed). |
+| `tests/` | 121 library and tray tests, 10 C-interface tests and a latency benchmark (no GoogleTest needed). |
 
 ### Library files
 
@@ -189,6 +189,26 @@ available.
 
 The fit is rejected, with a plain-language reason, when there is too little
 movement, too few tracked frames, or an average error above 12% of the screen.
+The average error is `sqrt(mean(error_u^2 + error_v^2))` over the targets, in
+screen fractions.
+
+Every range calibration keeps its evidence, whether it is accepted, rejected or
+aborted (a target that timed out):
+
+* Every raw sample is saved beside the tray log as a new file
+  `calibration_<hand|gaze>_<date>_<time>_<ms>.csv`
+  (`target_index,target_u,target_v,x,y`, full precision). An existing file is
+  never overwritten; a name already taken gets `_2`, `_3`, .... A target
+  without any sample gets one row with `x` and `y` empty. `fit_input_region`
+  reproduces the fit exactly from this file.
+* The tray log lists every target in order (screen position, sample count,
+  median input, error, or "no usable samples"). If the fit could be computed,
+  the log gives its region and RMS, also when the RMS was over the limit or the
+  region was implausible. Otherwise it says "fit not computed" (too few
+  targets or samples, no movement). The outcome line follows: accepted,
+  rejected with the reason, or aborted.
+* If the samples could not be saved, the log says "evidence NOT saved" with the
+  reason, and the wizard's result text says so too.
 
 **Blink & wink timing**
 
@@ -236,9 +256,9 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Check | Result |
 | --- | --- |
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
-| `os_integration_tests` | 110 / 110 passed |
+| `os_integration_tests` | 121 / 121 passed |
 | `os_integration_capi_tests` | 10 / 10 passed |
-| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 131 / 131 passed |
+| Tester logic (`pytest core_engine/os_integration/tester/tests`) | 141 / 141 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
 | `os_demo selftest` | Left, right and middle click and drag all arrived at the exact pixel |
@@ -356,6 +376,13 @@ Other tools can drive the controller without C++ through `capi/osi_capi.h`
   pixel for the same pitch) with `gaze_calibrated = true`. New files are written
   as `settings_version = 2`. An older build reading a version 2 file would map
   gaze upside down, so do not mix builds from before and after this change.
+* **Files saved by experimental builds from `8f98cfa` up to `7070bd7`** (22 to
+  23 Nov 2026, development machines only) already use the corrected direction
+  but carry neither marker, so they would be converted a second time (gaze
+  upside down). Before the first start of a current build: back up
+  `%APPDATA%\HandEyeTracker\os_integration.ini`, then either add
+  `settings_version = 2` under `[app]` or run the gaze calibration again
+  (`settings_migration_window_files_are_repaired_by_a_version_line`).
 * **Gaze accuracy:** the estimate from `gaze_intent.py` is coarse, so gaze
   pointing is best for large targets. Hand pointing is the precise mode.
 * **Elevated windows:** Windows blocks injected input into apps running as

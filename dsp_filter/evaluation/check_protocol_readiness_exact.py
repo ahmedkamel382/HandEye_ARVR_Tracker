@@ -23,7 +23,9 @@ CHANNEL = "hand"
 # ---------------- recorder integrity (mandatory prerequisite) ----------------
 def recorder_integrity(trace_path):
     """Reject corrupted/incomplete evidence using the authoritative importer."""
-    sys.path.insert(0, r'C:\Users\Doctor Laptop\Downloads\HandEye_ARVR_Tracker\dsp_filter\evaluation')
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
     import import_vs_trace as ivt
     with open(trace_path, encoding="utf-8", errors="replace") as fh:
         lines = [ln.rstrip("\n") for ln in fh]
@@ -160,7 +162,9 @@ def first_departure(rows, start, ref_mean, thr):
         trio = seq[i:i + 3]
         if any(not r["eligible"] for r in trio):
             continue
-        if trio[2]["tp"] - trio[0]["tp"] > 3 * G["gap_max"]:  # contiguous
+        # Every ADJACENT interval must respect the existing 100 ms limit,
+        # not just the total three-observation span.
+        if any(trio[j+1]["tp"] - trio[j]["tp"] > G["gap_max"] for j in (0, 1)):
             continue
         d, e = trio[1]["x"] - ref_mean, trio[2]["x"] - ref_mean
         if abs(d) > thr and abs(e) > thr and (d > 0) == (e > 0):
@@ -192,7 +196,14 @@ def score(trace_path):
         out.update(verdict=worst("FAIL", "FAIL" if any("NONMONOTONIC" in p for p in seq_problems) else "PASS"))
         return out
     legs = []; ref = bs
+    right_reference_established = False
     for leg, expected in (("LEFT_TO_RIGHT", 1), ("RIGHT_TO_LEFT", -1)):
+        # The return leg cannot be analysed without a qualifying RIGHT arrival.
+        if leg == "RIGHT_TO_LEFT" and not right_reference_established:
+            legs.append(dict(leg=leg, verdict="INCONCLUSIVE",
+                             reason="return leg not independently established: no qualifying RIGHT reference",
+                             reference_established=False))
+            continue
         start = 5.0 if leg == "LEFT_TO_RIGHT" else ref["t1"]
         thr = max(G["delta_min"], 6 * ref["sd"])
         dep, actual = first_departure(rows, start, ref["mean_x"], thr)
@@ -207,7 +218,10 @@ def score(trace_path):
                 arr = ws; break
         if arr is None:
             legs.append(dict(leg=leg, verdict="INCONCLUSIVE", reason="no qualifying arrival window",
-                             departure_t=dep["tp"], direction=direction_ok)); continue
+                             departure_t=dep["tp"], direction=direction_ok,
+                             reference_established=False)); continue
+        if leg == "LEFT_TO_RIGHT":
+            right_reference_established = True      # accepts RIGHT arrival for the return leg
         a, b = ref["mean_x"], arr["mean_x"]; amp = abs(b - a)
         ydiff = abs(ref["mean_y"] - arr["mean_y"])
         search_from = 5.0 if leg == "LEFT_TO_RIGHT" else ref["t1"]
@@ -239,8 +253,24 @@ def score(trace_path):
 
 
 # ---------------- end-to-end regression tests ----------------
+def _fixture_trace():
+    """Locate a real recorded trace without machine-specific absolute paths."""
+    import glob
+    here = os.path.dirname(os.path.abspath(__file__))
+    # repo-relative first; then sibling run folders discovered by pattern
+    candidates = glob.glob(os.path.join(here, "..", "..", "..", "E2D_UNSCORED_20261123_10",
+                                        "recording", "trace.txt"))
+    if not candidates:
+        parent = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
+        candidates = glob.glob(os.path.join(parent, "E2D_UNSCORED_20261123_10", "recording", "trace.txt"))
+    if not candidates:
+        raise RuntimeError("run-10 fixture trace not found (set RUN10_TRACE env var)")
+    return os.path.abspath(candidates[0])
+
+
 def tests():
-    import tempfile, copy
+    import tempfile, copy, shutil
+    fixture = os.environ.get("RUN10_TRACE") or _fixture_trace()
     results = []
     # 1 verdict propagation (end-to-end helper)
     assert worst("INCONCLUSIVE", "PASS") == "INCONCLUSIVE"
@@ -250,9 +280,7 @@ def tests():
     # 2 malformed row rejected by recorder validator
     with tempfile.TemporaryDirectory() as td:
         valid = os.path.join(td, "v.txt")
-        # copy run 10 trace for a real integrity base
-        import shutil
-        shutil.copy(r'C:\Users\Doctor Laptop\Downloads\E2D_UNSCORED_20261123_10\recording\trace.txt', valid)
+        shutil.copy(fixture, valid)
         ok, probs, _ = recorder_integrity(valid)
         assert ok, probs[:3]
         bad = os.path.join(td, "bad.txt")
@@ -295,7 +323,7 @@ def tests():
 
     # 4 first_departure contiguity + 2nd/3rd both beyond
     rows = [dict(tp=t, eligible=True, x=x, frame=i) for i, (t, x) in
-            enumerate([(5.1,.2),(5.2,.2),(5.3,.3),(5.4,.4),(5.5,.4)])]
+            enumerate([(5.1,.2),(5.15,.2),(5.2,.3),(5.25,.4),(5.3,.4)])]
     d, sign = first_departure(rows, 5.0, .2, .03)
     assert d is not None and sign == 1
     rows2 = [dict(r) for r in rows]; rows2[3]["eligible"] = False
@@ -303,30 +331,75 @@ def tests():
     assert d2 is None
     results.append("P4 departure requires contiguous eligible rows; ineligible breaks it")
 
-    # 7 full-outcome timestamp shift
-    import shutil
-    trace = r'C:\Users\Doctor Laptop\Downloads\E2D_UNSCORED_20261123_10\recording\trace.txt'
+    # A: adjacent-gap rejection (old total-span check accepted this; new per-adjacent check rejects)
+    gapped = [dict(tp=5.0, eligible=True, x=.2, frame=1),
+              dict(tp=5.19, eligible=True, x=.31, frame=2),   # 190 ms adjacent gap
+              dict(tp=5.24, eligible=True, x=.42, frame=3)]
+    old_total = gapped[2]["tp"] - gapped[0]["tp"]           # 240 ms <= 300 ms old limit -> accepted
+    assert old_total <= 3 * G["gap_max"]
+    da, _ = first_departure(gapped, 5.0, .2, .03)
+    assert da is None, "per-adjacent gap check must reject 190 ms adjacent gap"
+    results.append("A per-adjacent 100ms gap rejects 190ms gap (old total-span check accepted it)")
+
+    # B: RUN_03_THIRD return must not reuse LEFT reference (no RIGHT arrival)
+    r3 = None
+    for root in (os.path.join(os.path.dirname(fixture), "..", ".."),
+                 os.environ.get("RUN3_DIR", "")):
+        if not root: continue
+        p = os.path.join(root, "E2D_UNSCORED_20261125_03", "recording", "trace.txt")
+        if os.path.exists(p): r3 = p; break
+    if r3:
+        rr = score(r3)
+        rt = next((l for l in rr.get("legs", []) if l["leg"] == "RIGHT_TO_LEFT"), None)
+        assert rt and rt["verdict"] == "INCONCLUSIVE" and rt.get("reference_established") is False
+        assert "not independently established" in rt.get("reason", "")
+        results.append("B return leg not scored without RIGHT reference (RUN_03_THIRD verified)")
+
+    # C: GENUINE timestamp shift - rewrite t/ms/cap/input_t by a constant in recorder lines
     with tempfile.TemporaryDirectory() as td:
-        a = os.path.join(td, "a.txt"); shutil.copy(trace, a)
+        a = os.path.join(td, "a.txt"); shutil.copy(fixture, a)
         b = os.path.join(td, "b.txt")
-        L = open(trace, encoding="utf-8").read().splitlines()
+        shift = 1000.0
+        L = open(fixture, encoding="utf-8").read().splitlines()
         out = []
         for line in L:
-            if line.startswith("E4REC "):
-                out.append(line)  # shift by rewriting input_t/ cap not needed for full compare here
+            if line.startswith("E4REC F "):
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p.startswith("t="): parts[i] = "t=%.9f" % (float(p[2:]) + shift)
+                    elif p.startswith("ms="): parts[i] = "ms=%d" % (int(p[3:]) + 1000000)
+                    elif p.startswith("cap="): parts[i] = "cap=%d" % (int(p[4:]) + 1000000)
+                    elif p.startswith("input_t="): parts[i] = "input_t=%.9f" % (float(p[8:]) + shift)
+                out.append(" ".join(parts))
             else:
                 out.append(line)
         open(b, "w", encoding="utf-8").write("\n".join(out) + "\n")
         ra, rb = score(a), score(b)
         assert ra["verdict"] == rb["verdict"] == "PASS"
-        results.append("P7 full-outcome identical under file rewrite (time shift covered by v2 D4 test)")
-    results.append("ALL V3 REGRESSION TESTS PASSED")
+        assert abs(ra["zero"] - rb["zero"]) > 900        # prove shift actually happened
+        assert ra["verdict"] == rb["verdict"] == "PASS"
+        # Full outcome: compare every classification/value with float tolerance.
+        # Only absolute time origins differ (by the exact shift); relative
+        # timings, counts and verdicts must be identical within float precision.
+        def close(x, y):
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                return abs(x - y) <= 1e-9
+            if isinstance(x, dict) and isinstance(y, dict):
+                return set(x) == set(y) and all(close(x[k], y[k]) for k in x)
+            if isinstance(x, (list, tuple)) and isinstance(y, (list, tuple)):
+                return len(x) == len(y) and all(close(a, b) for a, b in zip(x, y))
+            return x == y
+        for key in ("baseline", "legs"):
+            assert close(ra.get(key), rb.get(key)), \
+                "full outcome must be equivalent under timestamp shift (key=%s)" % key
+        results.append("C genuine +1000s timestamp shift: full outcome equivalent (verdict, gates, relative timings; float tol 1e-9; zero shifted %.0fs)" % (rb["zero"] - ra["zero"]))
+    results.append("ALL V4 REGRESSION TESTS PASSED")
     return results
 
 
 def self_test():
     import tempfile, shutil, os
-    trace = r'C:\Users\Doctor Laptop\Downloads\E2D_UNSCORED_20261123_10\recording\trace.txt'
+    trace = os.environ.get("RUN10_TRACE") or _fixture_trace()
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "t.txt"); shutil.copy(trace, p)
         r = score(p)

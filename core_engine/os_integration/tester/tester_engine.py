@@ -990,7 +990,7 @@ class TesterEngine:
                 self.event(f"{button.capitalize()} CLICK")
         if report.pause_toggled:
             c.pauses += 1
-            self.event("Eyes closed: output " + ("resumed" if report.active else "paused"))
+            self.event("Pause gesture: output paused (Activate or Space resumes)")
         if report.injection_failed:
             c.refused += 1
         if report.release_pending and not state.release_warned:

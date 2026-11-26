@@ -21,7 +21,7 @@ constexpr UINT_PTR kStatusTimer = 1;
 constexpr int kToggleHotkey = 1;
 constexpr UINT kTrayIconId = 1;
 
-enum Event : WPARAM { FirstFrame = 1, GesturePause, GestureResume, InjectionBlocked, ReleaseBlocked };
+enum Event : WPARAM { FirstFrame = 1, GesturePause, InjectionBlocked, ReleaseBlocked };
 
 enum MenuId : UINT {
     IdStatus = 1,
@@ -361,7 +361,7 @@ void TrayApp::submit_frame(const FramePayload& frame) noexcept {
         post_event(FirstFrame);
     }
     if (report.pause_toggled) {
-        post_event(report.active ? GestureResume : GesturePause);
+        post_event(GesturePause); // a gesture only ever pauses (OsController::update)
     }
     if (post_release_blocked) {
         post_event(ReleaseBlocked); // once per stuck episode; the UI timer keeps retrying
@@ -519,12 +519,8 @@ LRESULT TrayApp::handle(UINT message, WPARAM wparam, LPARAM lparam) {
             notify(L"Tracking data received", L"Press Ctrl+Alt+P to toggle mouse control.");
             break;
         case GesturePause:
-            AppLog::info("control paused by sustained eye closure");
-            notify(L"Control paused", L"Eyes closed. Close them again for a second to resume.");
-            break;
-        case GestureResume:
-            AppLog::info("control resumed by sustained eye closure");
-            notify(L"Control resumed", L"Eyes closed. Close them again for a second to pause.");
+            AppLog::info("control paused by a gesture (sustained eye closure or fist)");
+            notify(L"Control paused", L"Press Ctrl+Alt+P or use the tray menu to resume.");
             break;
         case ReleaseBlocked:
             retry_stuck_buttons();

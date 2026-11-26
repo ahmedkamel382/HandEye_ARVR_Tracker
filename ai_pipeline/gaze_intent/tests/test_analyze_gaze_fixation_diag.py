@@ -1808,3 +1808,140 @@ def test_speaker_ack_telemetry_and_sampled_before_close_in_cued_capture(tmp_path
     assert tgt["cue_start_worker_write_call_ms"] == pytest.approx(0.125)
     assert tgt["cue_start_ps_speak_async_ms"] == pytest.approx(2.5)
     assert tgt["cue_start_ps_ack_delay_ms"] == pytest.approx(3.1)
+
+
+@pytest.mark.parametrize(
+    "case_name,windows_spec,expected_missing_h,expected_missing_v,expected_horiz_q,expected_vert_q",
+    [
+        ("center_only", "CENTER:1.0-2.5", [], [], None, None),
+        ("center_left_missing_right", "CENTER:1.0-2.5,LEFT:3.0-4.5", ["RIGHT"], [], False, None),
+        ("left_right_missing_center", "LEFT:3.0-4.5,RIGHT:5.0-6.5", ["CENTER"], [], False, None),
+        ("center_up_missing_down", "CENTER:1.0-2.5,UP:7.0-8.5", [], ["DOWN"], None, False),
+        ("up_down_missing_center", "UP:7.0-8.5,DOWN:9.0-10.5", [], ["CENTER"], None, False),
+        (
+            "complete_horiz_plus_incomplete_vert",
+            "CENTER:1.0-2.5,LEFT:3.0-4.5,RIGHT:5.0-6.5,UP:7.0-8.5",
+            [],
+            ["DOWN"],
+            True,
+            False,
+        ),
+        ("custom_non_mandatory_subset", "FOO:1.0-2.5,BAR:3.0-4.5", [], [], None, None),
+    ],
+)
+def test_incomplete_target_set_cannot_pass_qualification(
+    tmp_path: Path,
+    case_name: str,
+    windows_spec: str,
+    expected_missing_h: List[str],
+    expected_missing_v: List[str],
+    expected_horiz_q: Optional[bool],
+    expected_vert_q: Optional[bool],
+):
+    """Engineer 4 Item 4: Incomplete mandatory target sets MUST fail overall qualification even if all evaluated windows pass."""
+    run_dir = tmp_path / case_name
+    frames: List[Dict[str, Any]] = []
+    frames.extend(_make_target_segment(1.0, 40, 0.033, sx=0.50, sy=-0.10, hp=0.0, hy=0.0))
+    frames.extend(_make_target_segment(3.0, 40, 0.033, sx=0.38, sy=-0.10, hp=0.0, hy=-10.0))
+    frames.extend(_make_target_segment(5.0, 40, 0.033, sx=0.62, sy=-0.10, hp=0.0, hy=+10.0))
+    frames.extend(_make_target_segment(7.0, 40, 0.033, sx=0.50, sy=-0.25, hp=0.0, hy=0.0))
+    frames.extend(_make_target_segment(9.0, 40, 0.033, sx=0.50, sy=+0.05, hp=0.0, hy=0.0))
+    diag_csv = _write_synthetic_run(run_dir, frames, y_sign_mult=-1.0)
+
+    out_json = run_dir / "report.json"
+    out_md = run_dir / "report.md"
+    rc = ANALYZER.main([
+        "--run-dir", str(run_dir),
+        "--diag-csv", str(diag_csv),
+        "--windows", windows_spec,
+        "--wash-in-s", "0.0",
+        "--require-qualification-pass",
+        "--out-json", str(out_json),
+        "--out-md", str(out_md),
+    ])
+    assert rc == ANALYZER.EXIT_CODE_QUALIFICATION_FAILED
+    rep = json.loads(out_json.read_text(encoding="utf-8"))
+    q = rep["qualification"]
+    assert rep["integrity"]["alignment_ok"] is True
+    assert q["archive_integrity_ok"] is True
+    assert q["alignment_ok"] is True
+    assert q["all_evaluated_axes_pass"] is True
+    assert q["mandatory_target_set_complete"] is False
+    assert q["missing_horizontal_targets"] == expected_missing_h
+    assert q["missing_vertical_targets"] == expected_missing_v
+    assert q["horizontal_qualification_pass"] is expected_horiz_q
+    assert q["vertical_qualification_pass"] is expected_vert_q
+    assert q["overall_qualification_pass"] is False
+    assert q["scored_responsiveness_authorized"] is False
+
+
+def test_duplicate_window_names_rejected_by_qualification_summary():
+    """Duplicate target window names cannot pass qualification even if each axis passes."""
+    pass_axis = {"pass_all": True}
+    dup_windows = [
+        {"window": "CENTER", "raw_x": pass_axis, "raw_y": pass_axis},
+        {"window": "LEFT", "raw_x": pass_axis, "raw_y": pass_axis},
+        {"window": "RIGHT", "raw_x": pass_axis, "raw_y": pass_axis},
+        {"window": "LEFT", "raw_x": pass_axis, "raw_y": pass_axis},
+    ]
+    dirs = [{"comparison": "HORIZONTAL_LEFT_TO_RIGHT", "delta_raw_x_mean": 0.45}]
+    q = ANALYZER.compute_qualification_summary({"alignment_ok": True}, dup_windows, dirs)
+    assert q["duplicate_window_names"] is True
+    assert q["mandatory_target_set_complete"] is False
+    assert q["horizontal_qualification_pass"] is False
+    assert q["overall_qualification_pass"] is False
+    assert q["scored_responsiveness_authorized"] is False
+
+
+def test_complete_vertical_and_full_5_target_qualification_pass(tmp_path: Path):
+    """Complete vertical (CENTER,UP,DOWN) and full 5-target sets PASS qualification and exit 0 while keeping scored authorization False."""
+    frames: List[Dict[str, Any]] = []
+    frames.extend(_make_target_segment(1.0, 40, 0.033, sx=0.50, sy=-0.10, hp=0.0, hy=0.0))
+    frames.extend(_make_target_segment(3.0, 40, 0.033, sx=0.38, sy=-0.10, hp=0.0, hy=-10.0))
+    frames.extend(_make_target_segment(5.0, 40, 0.033, sx=0.62, sy=-0.10, hp=0.0, hy=+10.0))
+    frames.extend(_make_target_segment(7.0, 40, 0.033, sx=0.50, sy=-0.25, hp=0.0, hy=0.0))
+    frames.extend(_make_target_segment(9.0, 40, 0.033, sx=0.50, sy=+0.05, hp=0.0, hy=0.0))
+
+    # 1. Complete Vertical (CENTER, UP, DOWN)
+    v_dir = tmp_path / "complete_vert"
+    v_csv = _write_synthetic_run(v_dir, frames, y_sign_mult=-1.0)
+    v_json = v_dir / "v.json"
+    rc_v = ANALYZER.main([
+        "--run-dir", str(v_dir),
+        "--diag-csv", str(v_csv),
+        "--windows", "CENTER:1.0-2.5,UP:7.0-8.5,DOWN:9.0-10.5",
+        "--wash-in-s", "0.0",
+        "--require-qualification-pass",
+        "--out-json", str(v_json),
+        "--out-md", str(v_dir / "v.md"),
+    ])
+    assert rc_v == ANALYZER.EXIT_CODE_OK
+    qv = json.loads(v_json.read_text(encoding="utf-8"))["qualification"]
+    assert qv["mandatory_target_set_complete"] is True
+    assert qv["horizontal_qualification_pass"] is None
+    assert qv["vertical_qualification_pass"] is True
+    assert qv["overall_qualification_pass"] is True
+    assert qv["scored_responsiveness_authorized"] is False
+
+    # 2. Complete 5-target (CENTER, LEFT, RIGHT, UP, DOWN)
+    f_dir = tmp_path / "complete_5tgt"
+    f_csv = _write_synthetic_run(f_dir, frames, y_sign_mult=-1.0)
+    f_json = f_dir / "f.json"
+    rc_f = ANALYZER.main([
+        "--run-dir", str(f_dir),
+        "--diag-csv", str(f_csv),
+        "--windows", "CENTER:1.0-2.5,LEFT:3.0-4.5,RIGHT:5.0-6.5,UP:7.0-8.5,DOWN:9.0-10.5",
+        "--wash-in-s", "0.0",
+        "--require-qualification-pass",
+        "--out-json", str(f_json),
+        "--out-md", str(f_dir / "f.md"),
+    ])
+    assert rc_f == ANALYZER.EXIT_CODE_OK
+    qf = json.loads(f_json.read_text(encoding="utf-8"))["qualification"]
+    assert qf["mandatory_target_set_complete"] is True
+    assert qf["horizontal_qualification_pass"] is True
+    assert qf["vertical_qualification_pass"] is True
+    assert qf["overall_qualification_pass"] is True
+    assert qf["scored_responsiveness_authorized"] is False
+
+

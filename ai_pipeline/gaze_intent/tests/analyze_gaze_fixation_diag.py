@@ -73,6 +73,8 @@ DEFAULT_BLINK_PAD_FRAMES = 2
 DEFAULT_PRE_CUE_S = 2.5
 LOW_DELIVERED_FPS_WARN_THRESHOLD = 25.0
 DEFAULT_CUED_TARGETS = ("CENTER", "LEFT", "RIGHT", "UP", "DOWN")
+MANDATORY_HORIZONTAL_TARGETS: Tuple[str, ...] = ("CENTER", "LEFT", "RIGHT")
+MANDATORY_VERTICAL_TARGETS: Tuple[str, ...] = ("CENTER", "UP", "DOWN")
 GAZE_FILTER_SPEC = "0.8,6,1.5"
 
 EXIT_CODE_OK = 0
@@ -1637,33 +1639,65 @@ def compute_qualification_summary(
         all(cardinal_checks) if cardinal_checks else None
     )
 
-    horiz_present = all(k in by_window_upper for k in ("CENTER", "LEFT", "RIGHT"))
-    vert_present = all(k in by_window_upper for k in ("CENTER", "UP", "DOWN"))
+    window_names_upper = set(by_window_upper.keys())
+    has_duplicate_windows = len(windows_res) != len(window_names_upper)
+    horiz_present = all(k in window_names_upper for k in MANDATORY_HORIZONTAL_TARGETS)
+    vert_present = all(k in window_names_upper for k in MANDATORY_VERTICAL_TARGETS)
+    horiz_attempted = bool({"LEFT", "RIGHT"} & window_names_upper)
+    vert_attempted = bool({"UP", "DOWN"} & window_names_upper)
+
+    missing_horiz_targets = (
+        [k for k in MANDATORY_HORIZONTAL_TARGETS if k not in window_names_upper]
+        if horiz_attempted and not horiz_present
+        else []
+    )
+    missing_vert_targets = (
+        [k for k in MANDATORY_VERTICAL_TARGETS if k not in window_names_upper]
+        if vert_attempted and not vert_present
+        else []
+    )
+    known_mandatory_targets = set(MANDATORY_HORIZONTAL_TARGETS) | set(MANDATORY_VERTICAL_TARGETS)
+    unexpected_windows = sorted(window_names_upper - known_mandatory_targets)
+
+    mandatory_target_set_complete = bool(
+        (horiz_present or vert_present)
+        and (not horiz_attempted or horiz_present)
+        and (not vert_attempted or vert_present)
+        and not unexpected_windows
+        and not has_duplicate_windows
+    )
 
     horiz_qual_pass: Optional[bool] = None
     if horiz_present:
         horiz_qual_pass = bool(
             archive_integrity_ok
             and alignment_ok
-            and all(by_window_upper[k]["pass_both"] for k in ("CENTER", "LEFT", "RIGHT"))
+            and not has_duplicate_windows
+            and all(by_window_upper[k]["pass_both"] for k in MANDATORY_HORIZONTAL_TARGETS)
             and horiz_dir_pass is True
         )
+    elif horiz_attempted:
+        horiz_qual_pass = False
 
     vert_qual_pass: Optional[bool] = None
     if vert_present:
         vert_qual_pass = bool(
             archive_integrity_ok
             and alignment_ok
-            and all(by_window_upper[k]["pass_both"] for k in ("CENTER", "UP", "DOWN"))
+            and not has_duplicate_windows
+            and all(by_window_upper[k]["pass_both"] for k in MANDATORY_VERTICAL_TARGETS)
             and vert_dir_pass is True
         )
+    elif vert_attempted:
+        vert_qual_pass = False
 
     all_evaluated_axes_pass = bool(total_axes > 0 and passed_axes == total_axes)
     overall_qualification_pass = bool(
         archive_integrity_ok
         and alignment_ok
+        and mandatory_target_set_complete
         and all_evaluated_axes_pass
-        and direction_verification_pass is not False
+        and direction_verification_pass is True
         and (horiz_qual_pass is not False)
         and (vert_qual_pass is not False)
     )
@@ -1677,8 +1711,13 @@ def compute_qualification_summary(
             "by_window": by_window,
         },
         "all_evaluated_axes_pass": all_evaluated_axes_pass,
+        "mandatory_target_set_complete": mandatory_target_set_complete,
         "horizontal_axes_present": horiz_present,
         "vertical_axes_present": vert_present,
+        "missing_horizontal_targets": missing_horiz_targets,
+        "missing_vertical_targets": missing_vert_targets,
+        "unexpected_windows": unexpected_windows,
+        "duplicate_window_names": has_duplicate_windows,
         "horizontal_direction_pass": horiz_dir_pass,
         "vertical_direction_pass": vert_dir_pass,
         "direction_verification_pass": direction_verification_pass,
@@ -1754,6 +1793,7 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
             "",
             "## 2. Qualification Summary (Separate from Archive Integrity)",
             f"- **Archive integrity (`archive_integrity_ok`):** `{qual.get('archive_integrity_ok')}` | **Alignment (`alignment_ok`):** `{qual.get('alignment_ok')}`",
+            f"- **Mandatory target set complete (`mandatory_target_set_complete`):** `{qual.get('mandatory_target_set_complete')}` (missing_horiz=`{qual.get('missing_horizontal_targets', [])}`, missing_vert=`{qual.get('missing_vertical_targets', [])}`, unexpected=`{qual.get('unexpected_windows', [])}`)",
             f"- **Per-axis fixation pass count:** `{counts.get('passed', 0)}/{counts.get('total', 0)}` (`all_evaluated_axes_pass={qual.get('all_evaluated_axes_pass')}`)",
             f"- **Horizontal qualification (`CENTER/LEFT/RIGHT`):** `{qual.get('horizontal_qualification_pass')}` (direction: `{qual.get('horizontal_direction_pass')}`)",
             f"- **Vertical qualification (`CENTER/UP/DOWN`):** `{qual.get('vertical_qualification_pass')}` (direction: `{qual.get('vertical_direction_pass')}`)",

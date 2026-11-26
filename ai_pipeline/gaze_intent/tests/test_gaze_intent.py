@@ -237,9 +237,9 @@ class TestTreeliteModelDlls:
             assert float(pitch_pred.predict(dmat).item()) == pitch_val_1
             assert float(yaw_pred.predict(dmat).item()) == yaw_val_1
 
-        # Golden regression values for integrated Candidate HGB abs_pitch + ET rel_yaw models
-        assert math.isclose(pitch_val_1, -16.2770163919, rel_tol=1e-5, abs_tol=1e-5)
-        assert math.isclose(yaw_val_1, 0.8371970249, rel_tol=1e-5, abs_tol=1e-5)
+        # Golden regression values for Candidate v2 ET-300 direct abs_pitch + ET-300 rel_yaw models
+        assert math.isclose(pitch_val_1, -14.2937010976, rel_tol=1e-5, abs_tol=1e-5)
+        assert math.isclose(yaw_val_1, 1.1939865343, rel_tol=1e-5, abs_tol=1e-5)
 
         # Batch of realistic feature vectors stays finite and within plausible angular bounds
         rng = np.random.default_rng(42)

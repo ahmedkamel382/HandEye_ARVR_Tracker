@@ -39,9 +39,25 @@ struct RegionFit {
     double rms_error;
 };
 
+// One target after the fit: what was measured, and how far its median lands
+// from the target (screen fractions). rms_error is sqrt(mean(error_u^2 + error_v^2)).
+struct TargetFit {
+    std::size_t index;     // position in the observations (the order the targets were shown)
+    CalibrationTarget target;
+    std::size_t samples;   // finite samples (0 = no usable sample)
+    double median_x;       // median raw input (NaN without samples)
+    double median_y;
+    double error_u;        // where the median maps minus the target, horizontally (NaN if no line was fitted)
+    double error_v;
+};
+
 struct RegionFitResult {
-    std::optional<RegionFit> fit;
-    std::string error; // user-facing reason when fit is empty
+    std::optional<RegionFit> fit;   // the accepted fit
+    std::string error;              // user-facing reason when fit is empty
+    std::vector<TargetFit> targets; // every observed target, also those without usable samples, also for a rejection
+    // The region and RMS whenever they could be computed, also when the fit was then rejected (implausible region,
+    // RMS above the limit). Empty when the fit never existed (too few targets or samples, no movement).
+    std::optional<RegionFit> computed;
 };
 
 struct RegionFitOptions {
@@ -51,6 +67,10 @@ struct RegionFitOptions {
 
 RegionFitResult fit_input_region(const std::vector<TargetObservation>& observations,
                                  const RegionFitOptions& options = {});
+
+// Every sample of every target as CSV (target_index,target_u,target_v,x,y; full precision), so a fit can be
+// recomputed exactly. A target without any sample gets one row with x and y empty, so it is never lost.
+std::string observations_csv(const std::vector<TargetObservation>& observations);
 
 // ------------------------------------------------------------ blink timing
 //

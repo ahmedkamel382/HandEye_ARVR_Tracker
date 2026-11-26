@@ -6,7 +6,9 @@ Needs a built os_integration_capi.dll (out/build/...); those tests skip without 
 """
 
 import csv
+import gc
 import math
+import random
 import sys
 import threading
 import time
@@ -638,6 +640,69 @@ def test_non_finite_points_are_never_published(dsp_filter, bad, axis):
     assert dsp_filter.update(point, 2.0) == (osi_capi.FILTER_INVALID, None)
 
 
+@pytest.mark.parametrize("bad, replayed", [(math.inf, True), (-math.inf, False), (math.nan, False)])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_held_sample_with_non_finite_coordinates_follows_the_core_gate(dsp_filter, bad, replayed, axis):
+    """freshness_gate.hpp: detected() is x >= 0 && y >= 0, and a HELD sample's coordinates are never used.
+    So HELD +Inf replays the cached point and keeps the filter history; HELD -Inf or NaN is not a detection and
+    ends tracking. (PR #7's Smoother reset on HELD +Inf: 2705 of 200,000 random frames differed from core.)"""
+    point = (bad, 0.4) if axis == 0 else (0.4, bad)
+    for with_filter in (True, False):
+        filt = dsp_filter if with_filter else None
+        gate = Smoother(filt)
+        gate.apply((0.2, 0.2), TRACKED, 1.0)
+        cached = gate.apply((0.3, 0.3), TRACKED, 1.033)[0]
+        assert gate.apply(point, HELD, 1.066) == ((cached, HELD) if replayed else (None, LOST))
+        after, state = gate.apply((0.4, 0.4), TRACKED, 1.1)
+        assert state == TRACKED
+        if with_filter and replayed:
+            assert after[0] < 0.4           # history kept: still smoothed
+        else:
+            assert after == (0.4, 0.4)      # history cleared (or no filter): the first sample is unsmoothed
+        if filt:
+            filt.reset()
+
+
+def test_smoother_drops_a_non_finite_filter_output_like_core():
+    """freshness_gate.hpp checks the point again after FilterOutcome::Ok and calls lose() (which resets the filter)
+    if it is not finite. The C API never returns such a point (next test); the Tester still applies core's rule."""
+    class InfiniteOk(FakeFilter):
+        def update(self, point, t):
+            self.calls.append(point)
+            return osi_capi.FILTER_OK, (math.inf, point[1])
+    f = InfiniteOk()
+    s = Smoother(f)
+    s._has_history = True                       # as after an earlier published point
+    assert s.apply((0.2, 0.4), TRACKED, 0.0) == (None, LOST)
+    assert f.calls[-1] is None, "the filter was not reset"
+    assert s.apply((0.2, 0.4), HELD, 0.1) == (None, LOST), "nothing may be replayed"
+
+
+@pytest.mark.parametrize("params", [(1.2, 4.0, 1.0), (0.8, 6.0, 1.5)], ids=["hand", "gaze"])
+def test_filter_ok_always_returns_a_finite_point_inside_the_screen(lib, params):
+    """The C API guarantee the Smoother relies on: FILTER_OK always comes with a finite point in [0, 1]."""
+    filt = lib.smoothing_filter(*params)
+    if filt is None:
+        pytest.skip("built without dsp_filter")
+    g = random.Random(7)
+    t = 0.0
+    oks = 0
+    try:
+        for i in range(20000):
+            q = g.random()
+            t += 1e-6 if q < 0.05 else 0.2501 if q < 0.08 else 1e6 if q < 0.081 else g.uniform(0.001, 0.05)
+            v = g.random()
+            x = g.choice([-1e300, -1.0, 0.0, 1.0, 2.0, 1e300]) if v < 0.1 else g.uniform(-0.2, 1.2)
+            status, point = filt.update((x, g.uniform(0.0, 1.0)), t)
+            if status == osi_capi.FILTER_OK:
+                oks += 1
+                assert math.isfinite(point[0]) and math.isfinite(point[1]), (i, x, t, point)
+                assert 0.0 <= point[0] <= 1.0 and 0.0 <= point[1] <= 1.0, (i, x, t, point)
+    finally:
+        filt.close()
+    assert oks > 15000
+
+
 def test_held_without_smoothing_replays_the_last_observation():
     gate = Smoother(None)
     assert gate.apply((0.9, 0.8), HELD, 0.0) == (None, LOST)
@@ -722,6 +787,41 @@ def test_run_checks_dialog_can_be_closed_early(make_app, tk_root, monkeypatch, c
     if not close_first:
         assert "ALL CHECKS PASSED" in text.get("1.0", "end")
 
+
+
+def test_destroyed_windows_leave_no_tk_garbage_for_a_worker_thread(lib, tk_root, monkeypatch, request):
+    """CI: the Tk variables of destroyed Tester windows were freed by a garbage collection that happened to run on a
+    worker thread, where Tkinter raises "main thread is not in main loop". conftest.py now collects after every test
+    on the main thread. This reproduces the hazard, then shows that a main-thread collection leaves nothing behind."""
+    assert "collect_tk_garbage_on_the_main_thread" in request.fixturenames, "conftest.py no longer collects"
+    monkeypatch.setattr(tester_app.TesterApp, "tick", lambda self: None)
+    errors = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda info: errors.append(info.exc_value))
+
+    def leave_a_destroyed_app():
+        window = tk.Toplevel(tk_root)
+        window.withdraw()
+        tester_app.TesterApp(window, lib, lambda text: None)
+        window.destroy()
+
+    def collect_on_a_worker_thread():
+        worker = threading.Thread(target=gc.collect)
+        worker.start()
+        worker.join()
+
+    gc.collect()
+    gc.disable()                                    # only the explicit collections below may run
+    try:
+        leave_a_destroyed_app()
+        collect_on_a_worker_thread()
+        assert errors and all(isinstance(e, RuntimeError) for e in errors), "setup: the hazard did not reproduce"
+        errors.clear()
+        leave_a_destroyed_app()
+        gc.collect()                                # what the conftest fixture does after every test
+        collect_on_a_worker_thread()
+        assert not errors, errors[:3]
+    finally:
+        gc.enable()
 
 # ---------------------------------------------------------------- Space shortcut
 

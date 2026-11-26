@@ -67,6 +67,7 @@ struct Controller {
 int main() {
     run_test("version_and_default_settings", [] {
         require(osi_version() == OSI_CAPI_VERSION, "version mismatch");
+        require(OSI_CAPI_VERSION == 3, "this branch ships C interface version 3");
         const std::string ini = default_ini();
         require(ini.find("[gestures]") != std::string::npos && ini.find("pinch_onset_seconds") != std::string::npos,
                 "default INI incomplete");
@@ -142,6 +143,9 @@ int main() {
         osi_report report{};
         require(osi_update(nullptr, 0.0, nullptr, nullptr, &report) == 0, "null handle update");
         osi_set_active(nullptr, 1);
+        osi_set_clicks_enabled(nullptr, 0);
+        osi_set_inhibited(nullptr, 1);
+        require(osi_release_all(nullptr) == 1, "null release");
         osi_destroy(nullptr);
         require(osi_drain_events(nullptr, nullptr, 0) == 0, "null drain");
     });

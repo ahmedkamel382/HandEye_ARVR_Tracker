@@ -59,7 +59,7 @@ struct GestureSettings {
     // last 0.1-0.4 s, so a sustained closure needs to be much longer.
     double wink_onset_seconds = 0.25;
     double closure_onset_seconds = 1.0;
-    bool closure_toggles_pause = true;
+    bool closure_toggles_pause = true; // closing the eyes pauses control; resuming always needs an explicit command
 };
 
 // Turns raw per-frame gesture states into edge-triggered mouse actions:

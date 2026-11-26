@@ -3,11 +3,90 @@
 #include "app_log.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 
 namespace osi::app {
 namespace {
+
+// Calibration evidence: the raw samples go to a NEW file next to the log (exclusive create, never overwritten), and
+// the log gets every target, the fit whenever it was computed, and the outcome. Returns false when the samples could
+// not be saved, so the caller can say so.
+bool record_range_evidence(const char* kind, const std::vector<TargetObservation>& observations,
+                           const RegionFitResult& result, const std::string& outcome) {
+    bool saved = false;
+    const std::filesystem::path log = AppLog::path();
+    if (log.empty()) {
+        AppLog::warn(std::string(kind) + " calibration evidence NOT saved: there is no log folder");
+    } else {
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+        const int ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+        char stamp[48] = "unknown";
+        std::tm local{};
+        if (localtime_s(&local, &seconds) == 0) {
+            const std::size_t n = std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local);
+            std::snprintf(stamp + n, sizeof(stamp) - n, "_%03d", ms);
+        }
+        std::filesystem::path file;
+        std::FILE* out = nullptr;
+        for (int copy = 1; copy <= 100 && out == nullptr; ++copy) {
+            file = log.parent_path() / (std::string("calibration_") + kind + "_" + stamp +
+                                        (copy > 1 ? "_" + std::to_string(copy) : std::string()) + ".csv");
+            // 'x': creation fails if the file exists, so nothing is ever overwritten
+            const errno_t error = _wfopen_s(&out, file.c_str(), L"wbx");
+            if (error != 0) {
+                out = nullptr;
+                if (error != EEXIST) {
+                    break;
+                }
+            }
+        }
+        if (out == nullptr) {
+            AppLog::warn(std::string(kind) + " calibration evidence NOT saved: cannot create " + to_utf8(file.wstring()));
+        } else {
+            const std::string csv = observations_csv(observations);
+            const bool written = std::fwrite(csv.data(), 1, csv.size(), out) == csv.size();
+            saved = (std::fclose(out) == 0) && written;
+            if (saved) {
+                AppLog::info(std::string(kind) + " calibration evidence saved to " + to_utf8(file.wstring()));
+            } else {
+                AppLog::warn(std::string(kind) + " calibration evidence NOT saved: writing " +
+                             to_utf8(file.wstring()) + " failed");
+            }
+        }
+    }
+    for (const TargetFit& t : result.targets) {
+        char line[240];
+        if (t.samples == 0) {
+            std::snprintf(line, sizeof(line), "%s calibration target %zu (%.2f, %.2f): no usable samples", kind,
+                          t.index + 1, t.target.u, t.target.v);
+        } else {
+            std::snprintf(line, sizeof(line),
+                          "%s calibration target %zu (%.2f, %.2f): %zu samples, median input (%.6f, %.6f), "
+                          "error (%+.6f, %+.6f)",
+                          kind, t.index + 1, t.target.u, t.target.v, t.samples, t.median_x, t.median_y, t.error_u,
+                          t.error_v);
+        }
+        AppLog::info(line);
+    }
+    char line[240];
+    if (result.computed) {
+        const InputRegion& r = result.computed->region;
+        std::snprintf(line, sizeof(line), "%s calibration fit computed: region %.6f %.6f %.6f %.6f, rms %.6f (limit %.2f)",
+                      kind, r.x_min, r.y_min, r.x_max, r.y_max, result.computed->rms_error,
+                      RegionFitOptions{}.max_rms_error);
+    } else {
+        std::snprintf(line, sizeof(line), "%s calibration fit not computed", kind);
+    }
+    AppLog::info(line);
+    AppLog::info(std::string(kind) + " calibration " + outcome);
+    return saved;
+}
 
 constexpr wchar_t kWindowClass[] = L"HandEyeCalibrationWizard";
 constexpr UINT_PTR kTimerId = 1;
@@ -305,7 +384,11 @@ void CalibrationWizard::tick() {
                 enter(Stage::Settle);
             }
         } else if (elapsed >= kTargetTimeoutSeconds) {
-            fail(std::wstring(L"Target ") + std::to_wstring(target_index_ + 1) + L" received only " +
+            const bool saved = record_range_evidence(
+                kind_ == WizardKind::HandRange ? "hand" : "gaze", observations_, fit_input_region(observations_),
+                "aborted: target " + std::to_string(target_index_ + 1) + " timed out");
+            fail((saved ? std::wstring() : std::wstring(L"(The calibration evidence could not be saved.)\n")) +
+                 std::wstring(L"Target ") + std::to_wstring(target_index_ + 1) + L" received only " +
                  std::to_wstring(collected.size()) + L" tracked frames.\n" +
                  (kind_ == WizardKind::HandRange
                       ? L"Keep your hand inside the camera view."
@@ -357,8 +440,11 @@ void CalibrationWizard::tick() {
 
 void CalibrationWizard::complete_range() {
     const RegionFitResult result = fit_input_region(observations_);
+    const bool saved = record_range_evidence(kind_ == WizardKind::HandRange ? "hand" : "gaze", observations_, result,
+                                             result.fit ? std::string("accepted") : "rejected: " + result.error);
+    const std::wstring unsaved = saved ? L"" : L"\n(The calibration evidence could not be saved; see the log.)";
     if (!result.fit) {
-        fail(to_wide(result.error));
+        fail(to_wide(result.error) + unsaved);
         return;
     }
     result_settings_ = settings_;
@@ -374,7 +460,7 @@ void CalibrationWizard::complete_range() {
                   L"Input region: x %.3f → %.3f, y %.3f → %.3f",
                   kind_ == WizardKind::HandRange ? L"Hand" : L"Gaze", result.fit->rms_error * 100.0,
                   region.x_min, region.x_max, region.y_min, region.y_max);
-    result_text_ = text;
+    result_text_ = text + unsaved;
     AppLog::info("calibration fit: " + to_utf8(result_text_));
     enter(Stage::Result);
 }

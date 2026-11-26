@@ -214,6 +214,7 @@ class TesterApp:
         self.engine = TesterEngine(library, self._log_from_engine)      # may log about the saved settings
         self._photo = None
         self._tuning_after = None
+        self._timers = set()     # pending Tk timers, cancelled when the window closes
         self._loading_tuning = False
         self._prev_click_total = 0
         self._screen_trail: List[Tuple[float, float]] = []
@@ -234,7 +235,8 @@ class TesterApp:
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<F5>", lambda e: self.toggle_run())
         root.bind("<space>", self._space_pressed)
-        self.root.after(self.TICK_MS, self.tick)
+        root.bind("<Destroy>", self._window_destroyed, add="+")
+        self._after(self.TICK_MS, self.tick)
         self.log("Ready. Choose what to test, then press Start (F5).")
 
     # ---------------------------------------------------------------- layout
@@ -648,7 +650,7 @@ class TesterApp:
             self.engine.configure(**self._config())
             # Start never rewrites settings; only an edit still waiting for its 250 ms delay is applied now.
             if self._tuning_after:
-                self.root.after_cancel(self._tuning_after)
+                self._cancel_after(self._tuning_after)
                 self._push_tuning()
             self.engine.start()
             self.root.focus_set()       # so Space is the activate / pause shortcut, not a second click on Start
@@ -693,7 +695,7 @@ class TesterApp:
 
     def _cancel_tuning_push(self):
         if self._tuning_after:
-            self.root.after_cancel(self._tuning_after)
+            self._cancel_after(self._tuning_after)
             self._tuning_after = None
 
     def _load_tuning_from_settings(self, replaced: bool = False):
@@ -741,7 +743,7 @@ class TesterApp:
         if self._loading_tuning:
             return
         self._cancel_tuning_push()
-        self._tuning_after = self.root.after(250, self._push_tuning)
+        self._tuning_after = self._after(250, self._push_tuning)
 
     def _push_tuning(self):
         self._tuning_after = None
@@ -872,7 +874,7 @@ class TesterApp:
             if not window.winfo_exists():
                 return          # closed before the checks finished
             if not finished:
-                self.root.after(100, show)
+                self._after(100, show)
                 return
             results = finished[0]
             text.delete("1.0", "end")
@@ -889,7 +891,7 @@ class TesterApp:
             text.configure(state="disabled")
 
         threading.Thread(target=worker, daemon=True).start()
-        self.root.after(100, show)
+        self._after(100, show)
 
     # ---------------------------------------------------------------- refresh
     def tick(self):
@@ -906,7 +908,7 @@ class TesterApp:
             self._update_buttons(snap)
         except Exception as error:   # never let a display glitch kill the window
             self.log_file(f"tick error: {error!r}")
-        self.root.after(self.TICK_MS, self.tick)
+        self._after(self.TICK_MS, self.tick)
 
     def _update_video(self, snap):
         if snap.frame is None:
@@ -1064,6 +1066,39 @@ class TesterApp:
             self.active_button.configure(state="disabled")
         if not snap.recording and self.record_button.cget("text").endswith("recording"):
             self.record_button.configure(text="●  Record CSV")
+
+    # ---------------------------------------------------------------- timers
+    def _after(self, ms: int, func) -> str:
+        """root.after() for this window's own callbacks; they are cancelled when the window is destroyed.
+
+        Tkinter deletes a destroyed window's Python callbacks but not their Tcl timers, and it names callbacks by
+        memory address, so a timer that outlives its window can fire into an unrelated new callback that reused
+        the name (seen as a Scrollable event handler called without its event). Nothing is scheduled once the
+        window is gone, because no <Destroy> would cancel it."""
+        try:
+            if not self.root.winfo_exists():
+                return None
+        except tk.TclError:
+            return None         # the whole Tk interpreter is gone
+        def fire():
+            self._timers.discard(timer)
+            func()
+        fire.__name__ = getattr(func, "__name__", "timer")
+        timer = self.root.after(ms, fire)
+        self._timers.add(timer)
+        return timer
+
+    def _cancel_after(self, timer: str):
+        self._timers.discard(timer)
+        try:
+            self.root.after_cancel(timer)
+        except tk.TclError:
+            pass            # already fired
+
+    def _window_destroyed(self, event):
+        if event.widget is self.root:       # <Destroy> also arrives for every child widget
+            for timer in list(self._timers):
+                self._cancel_after(timer)
 
     def close(self):
         self.engine.stop()                  # the watchdog releases at once, even if a camera read is blocked

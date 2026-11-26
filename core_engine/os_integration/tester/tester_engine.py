@@ -446,13 +446,18 @@ class Smoother:
 
     def apply(self, point, tracking: int, t: float) -> Tuple[Optional[Tuple[float, float]], int]:
         """(point to publish, TRACKED / HELD / LOST)."""
-        detected = (point is not None and math.isfinite(point[0]) and math.isfinite(point[1])
-                    and point[0] >= 0 and point[1] >= 0)            # ModuleOut::detected(); rejects NaN & +-Inf
+        # freshness_gate.hpp, rule for rule. ModuleOut::detected() is x >= 0 && y >= 0: False for NaN and -Inf
+        # (they end tracking even on a HELD sample), True for +Inf. A HELD sample that counts as detected is not a
+        # new observation, so its coordinates are not used: the cached point is replayed (also for +Inf). A TRACKED
+        # sample's coordinates must be finite; a non-finite one ends tracking.
+        detected = point is not None and point[0] >= 0 and point[1] >= 0
         if not detected or tracking not in (osi_capi.TRACKED, osi_capi.HELD):
             return self._lose()
         if tracking == osi_capi.HELD:
             return self._replay()
         if self.filter is None:
+            if not (math.isfinite(point[0]) and math.isfinite(point[1])):
+                return self._lose()
             output = point
         else:
             status, output = self.filter.update(point, t)
@@ -461,9 +466,8 @@ class Smoother:
             if status != osi_capi.FILTER_OK:
                 self.last, self._has_history = None, False  # the filter reset itself
                 return None, osi_capi.LOST
-        if output is None or not (math.isfinite(output[0]) and math.isfinite(output[1])):
-            self.last, self._has_history = None, False
-            return None, osi_capi.LOST
+        if not (math.isfinite(output[0]) and math.isfinite(output[1])):
+            return self._lose()     # core's defensive check after the filter; FILTER_OK always gives a finite point
         self.last = (min(1.0, max(0.0, output[0])), min(1.0, max(0.0, output[1])))
         self._has_history = True
         return self.last, osi_capi.TRACKED
@@ -986,7 +990,7 @@ class TesterEngine:
                 self.event(f"{button.capitalize()} CLICK")
         if report.pause_toggled:
             c.pauses += 1
-            self.event("Eyes closed: output " + ("resumed" if report.active else "paused"))
+            self.event("Pause gesture: output paused (Activate or Space resumes)")
         if report.injection_failed:
             c.refused += 1
         if report.release_pending and not state.release_warned:

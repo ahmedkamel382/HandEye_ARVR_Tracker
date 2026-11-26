@@ -143,10 +143,11 @@ FrameReport OsController::update(const FramePayload& frame) noexcept {
     report.source = source;
     report.cursor = last_cursor_;
 
-    // Pause toggles work while paused (hands-free resume) but not while inhibited.
+    // Safety policy: a gesture may pause control, but only an explicit command (hotkey, menu, Activate) resumes it.
+    // So a pause gesture acts only while control is on, and never while inhibited.
     for (const Action& action : actions) {
-        if (action.type == ActionType::TogglePause && !inhibited_) {
-            set_active(!active_);
+        if (action.type == ActionType::TogglePause && active_ && !inhibited_) {
+            set_active(false);
             report.pause_toggled = true;
         }
     }

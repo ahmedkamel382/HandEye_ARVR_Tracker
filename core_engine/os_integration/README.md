@@ -35,7 +35,7 @@ filters when the tray's Smoothing menu changes (`TrayOptions::on_settings_change
 | `app/` | `handeye_tray.exe`: system-tray app, settings, and calibration wizard. |
 | `capi/` | `os_integration_capi.dll`: a plain-C interface to `OsController` (used by the tester). |
 | `tester/` | **HandEye Tester**: `HandEyeTester.exe` + a test-bench UI for every part of the system. |
-| `tests/` | 100 library and tray tests, 9 C-interface tests and a latency benchmark (no GoogleTest needed). |
+| `tests/` | 110 library and tray tests, 10 C-interface tests and a latency benchmark (no GoogleTest needed). |
 
 ### Library files
 
@@ -168,6 +168,7 @@ available.
 | A cursor move is refused | It is not counted as sent. The target stays owed, also if tracking is lost: it is retried, and no press or click is sent until Windows accepts it. A drop waits up to 0.3 s for its move, then releases where the cursor is. |
 | The tester changes mode or output | It releases held buttons before loading anything, keeps retrying refused releases (camera mode included) and releases after 0.5 s without camera frames. A watchdog thread does this, and handles Esc and Stop, even while a camera read is blocked. |
 | A saved Activate turns the real mouse on | The tester accepts Activate only for the configuration that is already running; Start, Stop and any option change cancel it. |
+| A gesture turns the real mouse on | In the tester's Real mouse mode, eye closure (and a fist set to `toggle_pause`) can pause the output but never resume it; only Activate or Space does. Simulation and the tray keep hands-free resume. |
 | A broken settings file loses calibration | A file with errors is never saved over (tester and tray) or reloaded. Saves edit the file as it is at that moment and keep `<file>.bak`. A UTF-8 byte-order mark is accepted. |
 | A button stays stuck down | Buttons are released on pause, inhibit, settings change, stale input (0.5 s without frames), controller destruction and app exit. A release Windows **refuses** keeps the button tracked as held and is retried every frame and every 250 ms by the tray, with a warning, until Windows accepts it; a click whose release was dropped is detected (`ClickResult::PressedOnly`) and released the same way (team tracker item #8). |
 | Fighting the user's real mouse | A low-level hook detects **physical** mouse input (not injected input) and yields control for 1.5 s. |
@@ -235,8 +236,8 @@ Warnings (`/W4 /permissive-`) apply only to Engineer 5 targets.
 | Check | Result |
 | --- | --- |
 | Debug and Release builds, MSVC 19.44 `/W4 /permissive-` | 0 warnings |
-| `os_integration_tests` | 100 / 100 passed |
-| `os_integration_capi_tests` | 9 / 9 passed |
+| `os_integration_tests` | 110 / 110 passed |
+| `os_integration_capi_tests` | 10 / 10 passed |
 | Tester logic (`pytest core_engine/os_integration/tester/tests`) | 131 / 131 passed |
 | `os_integration_benchmark` (Release, 1M frames) | 66 ns per frame p50 |
 | `os_demo trace` (real cursor, 2 monitors) | 0.00 px max error |
@@ -339,16 +340,22 @@ Other tools can drive the controller without C++ through `capi/osi_capi.h`
 
 ## Known limitations and next steps
 
-* **Uncalibrated gaze is wrong (audit finding #1, open):** run the tray's
-  Calibrate > Gaze range first. With the shipped models and a synthetic
-  straight-ahead input, pitch is -17.72 degrees (y = 0.205), above the top of the
-  default `gaze_region` (0.30), so the cursor sits on the top edge. The same
-  synthetic probe indicates that both axes run opposite to the screen (looking
-  right lowers x, looking up raises y). The default stays a placeholder until
-  neutral pitch and all four directions are measured on a real camera; the
-  wizard fits offset and inverted axes, but in the same synthetic probe eyes-only
-  vertical movement was not monotonic in the pitch model and the wizard rejected
-  the fit. Check that live; if it happens, it is a model question for Engineer 3.
+* **Uncalibrated gaze defaults & live verification (audit finding #1):** on
+  `exp/gaze-e3-e5-joint-candidate`, the gaze models, the fixed vertical Y sign
+  (`y = 0.5 - pitch / 60`) and the default `gaze_region`
+  (`[0.25, 0.58, 0.75, 0.82]`) align all four gaze directions with the screen
+  axes and keep a straight-ahead gaze inside the active region. Run the tray's
+  Calibrate > Gaze range wizard for a per-user fit; it saves
+  `gaze_calibrated = true`. Live cued fixation and wizard verification remain
+  pending before merge to `first-full-working-demo`.
+* **Settings saved before the Y-sign fix** are converted on load. A file is from
+  before the fix when it has neither `settings_version` nor `gaze_calibrated`.
+  Then an old placeholder (`0.3 0.3 0.7 0.7`, `0.25 0.25 0.75 0.75` or
+  `0.25 0.60 0.75 0.80`) becomes the current default with
+  `gaze_calibrated = false`, and any other gaze region gets y -> 1 - y (the same
+  pixel for the same pitch) with `gaze_calibrated = true`. New files are written
+  as `settings_version = 2`. An older build reading a version 2 file would map
+  gaze upside down, so do not mix builds from before and after this change.
 * **Gaze accuracy:** the estimate from `gaze_intent.py` is coarse, so gaze
   pointing is best for large targets. Hand pointing is the precise mode.
 * **Elevated windows:** Windows blocks injected input into apps running as

@@ -1062,7 +1062,8 @@ int main() {
     });
     // ---- R1: settings files ----
     run_test("settings_accept_utf8_bom", [] {
-        const auto loaded = parse_settings("\xEF\xBB\xBF[mapping]\ngaze_region = 0.71 0.33 0.29 0.08\n");
+        const auto loaded =
+            parse_settings("\xEF\xBB\xBF[mapping]\ngaze_region = 0.71 0.33 0.29 0.08\n[app]\nsettings_version = 2\n");
         require(loaded.warnings.empty(), "byte-order mark rejected");
         require_region(loaded.settings.mapping.gaze_region, {0.71, 0.33, 0.29, 0.08}, 1e-12);
     });
@@ -1518,6 +1519,183 @@ int main() {
     run_test("tray_invalid_file_is_never_overwritten", osi_tray_tests::invalid_file_is_never_overwritten);
     run_test("tray_invalid_reload_keeps_running_settings", osi_tray_tests::invalid_reload_keeps_running_settings);
 #endif
+
+    // ================================================================ settings written before the gaze Y-sign fix
+    // Version 1 files map y = 0.5 + pitch/60; version 2 maps y = 0.5 - pitch/60, so y_old = 1 - y_new.
+    run_test("settings_v1_placeholder_gaze_region_becomes_the_new_default", [] {
+        const auto loaded = parse_settings("[mapping]\ngaze_region = 0.3 0.3 0.7 0.7\n");
+        require(loaded.error.empty(), "old default rejected: " + loaded.error);
+        require_region(loaded.settings.mapping.gaze_region, Settings{}.mapping.gaze_region, 1e-12);
+        require(!loaded.migrated.empty(), "migration not reported");
+    });
+    run_test("settings_v1_calibrated_gaze_region_keeps_its_screen_mapping", [] {
+        // A region calibrated under the old sign: the same physical gaze must land on the same pixel.
+        const InputRegion old_region{0.62, 0.21, 0.36, 0.33};
+        const auto loaded = parse_settings("[mapping]\ngaze_region = 0.62 0.21 0.36 0.33\n");
+        const ScreenMapper mapper(kFullHd);
+        for (const double pitch : {-20.0, -13.0, -5.0, 3.0}) {
+            const double old_y = 0.5 + pitch / 60.0;
+            const double new_y = 0.5 - pitch / 60.0;
+            const PixelPoint before = mapper.map(old_region, {0.5, old_y});
+            const PixelPoint after = mapper.map(loaded.settings.mapping.gaze_region, {0.5, new_y});
+            require(before == after, "pitch " + std::to_string(pitch) + ": " + str(before) + " became " + str(after));
+        }
+    });
+    run_test("settings_v2_files_are_not_converted_again", [] {
+        Settings calibrated;
+        calibrated.mapping.gaze_region = {0.71, 0.28, 0.29, 0.62};
+        const std::string text = serialize_settings(calibrated);
+        require(text.find("settings_version = 2") != std::string::npos, "version not written");
+        for (int round = 0; round < 3; ++round) {
+            const auto loaded = parse_settings(text);
+            require(loaded.migrated.empty(), "a current file was converted");
+            require_region(loaded.settings.mapping.gaze_region, calibrated.mapping.gaze_region, 1e-12);
+        }
+    });
+    run_test("settings_v1_without_gaze_region_uses_the_new_default", [] {
+        const auto loaded = parse_settings("[mapping]\nhand_region = 0.1 0.1 0.9 0.9\n");
+        require_region(loaded.settings.mapping.gaze_region, Settings{}.mapping.gaze_region, 1e-12);
+        require_region(loaded.settings.mapping.hand_region, {0.1, 0.1, 0.9, 0.9}, 1e-12);
+    });
+    run_test("settings_from_a_newer_version_are_refused", [] {
+        const auto loaded = parse_settings("[app]\nsettings_version = 3\n");
+        require(!loaded.error.empty(), "a file from a newer version was accepted");
+    });
+
+    // ================================================================ E3 + E5 joint gaze contract
+    run_test("joint_default_gaze_region_avoids_edge_pinning_and_preserves_directions", [] {
+        const Settings defaults;
+        const ScreenMapper mapper(kFullHd);
+
+        // Candidate HGB abs_pitch + ET rel_yaw golden neutral: abs_yaw=+0.837 deg -> norm_x=0.514, abs_pitch=-16.277 deg -> norm_y=0.771
+        const PixelPoint neutral = mapper.map(defaults.mapping.gaze_region, {0.514, 0.771});
+        require(neutral.x > 400 && neutral.x < 1520, "uncalibrated neutral X pinned near horizontal edge");
+        require(neutral.y > 100 && neutral.y < 980, "uncalibrated neutral Y pinned near vertical edge");
+
+        // Directional sweeps inside default region {0.25, 0.58, 0.75, 0.82}
+        const PixelPoint left = mapper.map(defaults.mapping.gaze_region, {0.207, 0.697});
+        const PixelPoint right = mapper.map(defaults.mapping.gaze_region, {0.787, 0.697});
+        const PixelPoint up = mapper.map(defaults.mapping.gaze_region, {0.514, 0.640});
+        const PixelPoint down = mapper.map(defaults.mapping.gaze_region, {0.514, 0.780});
+        require(left.x == 0 && right.x == 1919 && left.x < right.x, "LEFT->RIGHT X direction failed");
+        require(up.y > 0 && down.y < 1079 && up.y < down.y, "UP->DOWN Y direction failed or pinned to edge");
+    });
+    run_test("joint_calibration_fits_candidate_live_gaze_range_non_inverted", [] {
+        // Real live Candidate range observed at 12%/88% targets:
+        // X: ~0.24..0.76 (full-screen 0.16..0.84), Y: ~0.697..0.722 (slope_y ~ 0.0322 >= kMinRegionSpan=0.02)
+        const InputRegion live_truth{0.16, 0.693, 0.84, 0.725};
+        const auto obs = synthetic_observations(live_truth, 42, 0.0018);
+        const auto result = fit_input_region(obs);
+        require(result.fit.has_value(), "Candidate live vertical range rejected: " + result.error);
+        require(result.fit->region.x_min < result.fit->region.x_max, "fitted X should not be inverted");
+        require(result.fit->region.y_min < result.fit->region.y_max, "fitted Y should not be inverted");
+        require(result.fit->rms_error <= 0.12, "RMS error exceeded calibration threshold");
+
+        const ScreenMapper mapper(kFullHd);
+        const PixelPoint top_left = mapper.map(result.fit->region, {0.16, 0.693});
+        const PixelPoint bottom_right = mapper.map(result.fit->region, {0.84, 0.725});
+        require(top_left.x < 100 && top_left.y < 150, "fitted top-left failed");
+        require(bottom_right.x > 1820 && bottom_right.y > 930, "fitted bottom-right failed");
+
+        // Flat / saturated vertical span (< kMinRegionSpan = 0.02) must still be rejected cleanly
+        const auto flat_v = fit_input_region(synthetic_observations({0.20, 0.710, 0.80, 0.722}, 7, 0.0));
+        require(!flat_v.fit && flat_v.error.find("up-down") != std::string::npos,
+                "flat vertical span should be rejected with up-down guidance");
+    });
+    run_test("joint_gaze_safety_calibrating_and_pause_never_click_or_stick", [] {
+        Settings s;
+        s.mapping.cursor_source = CursorSourceMode::GazeOnly;
+        RecordingInputSink sink;
+        OsController c(s, kFullHd, sink);
+        c.set_active(true);
+
+        double t = 0.0;
+        // Calibrating / invalid frames never move cursor or click
+        c.update(gaze_frame(t, std::nullopt, EyeState::Calibrating));
+        t += kDt;
+        require(sink.events.empty(), "calibrating frame sent mouse output");
+
+        // Neutral active frames map inside screen, never pin or false-click
+        for (int i = 0; i < 6; ++i, t += kDt) {
+            c.update(gaze_frame(t, NormalizedPoint{0.514, 0.771}, EyeState::Neutral));
+        }
+        require(count(sink, SinkEvent::Kind::Move) >= 1 && count(sink, SinkEvent::Kind::Click) == 0,
+                "neutral gaze failed to move safely");
+        const auto last_move = last_move_before(sink, sink.events.size());
+        require(last_move && last_move->y > 100 && last_move->y < 980, "neutral gaze stuck to edge");
+
+        // Pause immediately keeps held buttons released
+        c.set_active(false);
+        require(!c.button_held(MouseButton::Left) && !c.button_held(MouseButton::Right),
+                "button stayed held after pause");
+    });
+    run_test("settings_legacy_gaze_migration_and_calibrated_flag", [] {
+        const Settings defaults;
+        require(!defaults.mapping.gaze_calibrated, "defaults should start uncalibrated");
+
+        // Legacy uncalibrated placeholder regions migrate to current default and remain uncalibrated.
+        for (const char* legacy : {"0.3 0.3 0.7 0.7", "0.25 0.25 0.75 0.75", "0.25 0.60 0.75 0.80"}) {
+            const auto loaded = parse_settings(std::string("[mapping]\ngaze_region = ") + legacy + "\n");
+            require(loaded.warnings.empty(), "legacy placeholder generated warnings");
+            require(!loaded.settings.mapping.gaze_calibrated, "legacy placeholder marked calibrated");
+            require_region(loaded.settings.mapping.gaze_region, defaults.mapping.gaze_region, 1e-9);
+        }
+
+        // A custom fitted region with neither settings_version nor gaze_calibrated was saved before the Y-sign fix:
+        // it stays calibrated and is converted to the new convention (y -> 1 - y, same pixels for the same pitch).
+        const auto custom = parse_settings("[mapping]\ngaze_region = 0.20 0.63 0.80 0.81\n");
+        require(custom.warnings.empty(), "custom legacy INI generated warnings");
+        require(custom.settings.mapping.gaze_calibrated, "legacy custom region lost calibrated flag");
+        require_region(custom.settings.mapping.gaze_region, {0.20, 0.37, 0.80, 0.19}, 1e-9);
+
+        // The same region saved by a build that already wrote gaze_calibrated is in the new convention: unchanged.
+        const auto current = parse_settings("[mapping]\ngaze_region = 0.20 0.63 0.80 0.81\ngaze_calibrated = true\n");
+        require(current.settings.mapping.gaze_calibrated, "calibrated flag lost");
+        require_region(current.settings.mapping.gaze_region, {0.20, 0.63, 0.80, 0.81}, 1e-9);
+
+        // Marked not calibrated but still holding an old placeholder: the current default applies.
+        const auto stale = parse_settings("[mapping]\ngaze_region = 0.3 0.3 0.7 0.7\ngaze_calibrated = false\n");
+        require(!stale.settings.mapping.gaze_calibrated, "placeholder marked calibrated");
+        require_region(stale.settings.mapping.gaze_region, defaults.mapping.gaze_region, 1e-9);
+
+        // Explicit gaze_calibrated = true preserves even a region matching a placeholder.
+        Settings explicit_cal;
+        explicit_cal.mapping.gaze_calibrated = true;
+        const auto round_trip = parse_settings(serialize_settings(explicit_cal));
+        require(round_trip.warnings.empty(), "explicit calibrated round-trip warned");
+        require(round_trip.settings.mapping.gaze_calibrated, "gaze_calibrated=true did not round-trip");
+    });
+    run_test("controller_clicks_disabled_keeps_gaze_blink_lock_and_toggle_pause", [] {
+        Settings settings = unit_regions();
+        settings.mapping.cursor_source = CursorSourceMode::GazeOnly;
+        settings.gestures.closure_toggles_pause = true;
+        RecordingInputSink sink;
+        OsController c(settings, kFullHd, sink);
+        c.set_active(true);
+        c.set_clicks_enabled(false);
+        require(!c.clicks_enabled(), "clicks_enabled did not update");
+
+        double t = 0.0;
+        for (int i = 0; i < 8; ++i, t += kDt) {
+            c.update(gaze_frame(t, NormalizedPoint{0.50, 0.77}, EyeState::Neutral));
+        }
+        const std::size_t moves_before_wink = count(sink, SinkEvent::Kind::Move);
+
+        // Closed eye wink causes wild raw coordinates: must freeze cursor AND emit zero clicks.
+        for (int i = 0; i < 12; ++i, t += kDt) {
+            const auto rep = c.update(gaze_frame(t, NormalizedPoint{0.95, 0.05}, EyeState::LeftWink));
+            require(rep.executed.empty(), "clicks-disabled emitted an action during wink");
+        }
+        require(count(sink, SinkEvent::Kind::Move) == moves_before_wink,
+                "cursor moved during wink while clicks disabled");
+        require(count(sink, SinkEvent::Kind::Click) == 0, "click sent while clicks disabled");
+
+        // Bilateral closure still toggles pause.
+        for (int i = 0; i < 40; ++i, t += kDt) {
+            c.update(gaze_frame(t, NormalizedPoint{0.50, 0.77}, EyeState::SustainedClosure));
+        }
+        require(!c.active(), "closure_toggles_pause did not toggle pause when clicks disabled");
+    });
 
     std::cout << "SUMMARY passed=" << passes << " failed=" << failures << '\n';
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

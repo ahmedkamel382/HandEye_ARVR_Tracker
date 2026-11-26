@@ -237,9 +237,9 @@ class TestTreeliteModelDlls:
             assert float(pitch_pred.predict(dmat).item()) == pitch_val_1
             assert float(yaw_pred.predict(dmat).item()) == yaw_val_1
 
-        # Golden regression values for deployed models on first-full-working-demo
-        assert math.isclose(pitch_val_1, -17.71785574, rel_tol=1e-5, abs_tol=1e-5)
-        assert math.isclose(yaw_val_1, 0.00726980, rel_tol=1e-5, abs_tol=1e-5)
+        # Golden regression values for Candidate v2 ET-300 direct abs_pitch + ET-300 rel_yaw models
+        assert math.isclose(pitch_val_1, -14.2937010976, rel_tol=1e-5, abs_tol=1e-5)
+        assert math.isclose(yaw_val_1, 1.1939865343, rel_tol=1e-5, abs_tol=1e-5)
 
         # Batch of realistic feature vectors stays finite and within plausible angular bounds
         rng = np.random.default_rng(42)
@@ -376,9 +376,40 @@ class TestFeatureExtractionAndGeometry:
         assert math.isclose(r_ear, 1.0, abs_tol=1e-9)
 
     def test_mpii_processor_shared_feature_extraction_and_vector_to_pitch_yaw(self):
+        import builtins
+        import importlib.util
+
         stub_detector = StubFaceDetector()
-        with patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector):
-            import mpii_processor as mp_proc
+        real_import = builtins.__import__
+
+        def import_without_dataset_deps(name, globals=None, locals=None, fromlist=(), level=0):
+            if name in ("pandas", "tqdm") or name.startswith(("pandas.", "tqdm.")):
+                raise ModuleNotFoundError(f"Simulated missing optional dataset package: {name}")
+            return real_import(name, globals, locals, fromlist, level)
+
+        saved_modules = {
+            k: sys.modules.pop(k)
+            for k in list(sys.modules)
+            if k == "mpii_processor" or k in ("pandas", "tqdm") or k.startswith(("pandas.", "tqdm."))
+        }
+        try:
+            with (
+                patch.object(builtins, "__import__", side_effect=import_without_dataset_deps),
+                patch("mediapipe.tasks.python.vision.FaceLandmarker.create_from_options", return_value=stub_detector),
+            ):
+                import mpii_processor as imported_mp_proc
+                assert imported_mp_proc.extract_gaze_features is gi.extract_gaze_features
+
+                mpii_path = GAZE_DIR / "mpii_processor.py"
+                spec = importlib.util.spec_from_file_location("mpii_processor_no_pandas", str(mpii_path))
+                assert spec is not None and spec.loader is not None
+                mp_proc = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mp_proc)
+        finally:
+            for k in list(sys.modules):
+                if k == "mpii_processor" or k in ("pandas", "tqdm") or k.startswith(("pandas.", "tqdm.")):
+                    sys.modules.pop(k, None)
+            sys.modules.update(saved_modules)
 
         # Verify mpii_processor reuses the exact same extract_gaze_features function from gaze_intent
         assert mp_proc.extract_gaze_features is gi.extract_gaze_features
@@ -550,13 +581,15 @@ class TestMockedGazeIntentPipeline:
         assert r_calib["state"] == "-1"
         assert float(r_calib["norm_x"]) == -1.0
 
-        # Frame 2 (active): detected=1, state=0, finite norm_x/norm_y in [0, 1]
+        # Frame 2 (active): detected=1, state=0, finite norm_x/norm_y in [0, 1] with vertical sign inversion
         r_active = dict(zip(_DIAG_FIELD_NAMES, rows[3]))
         assert r_active["frame_id"] == "2"
         assert r_active["detected"] == "1"
         assert r_active["state"] == "0"
         assert 0.0 <= float(r_active["norm_x"]) <= 1.0
         assert 0.0 <= float(r_active["norm_y"]) <= 1.0
+        assert math.isclose(float(r_active["norm_x"]), angle_to_norm_coord(float(r_active["abs_yaw_deg"])), abs_tol=1e-9)
+        assert math.isclose(float(r_active["norm_y"]), angle_to_norm_coord(float(r_active["abs_pitch_deg"]), invert=True), abs_tol=1e-9)
 
         # Frame 3 (dropout): detected=0, state=0, norm_x=-1.0
         r_lost = dict(zip(_DIAG_FIELD_NAMES, rows[4]))
@@ -564,6 +597,121 @@ class TestMockedGazeIntentPipeline:
         assert r_lost["detected"] == "0"
         assert r_lost["state"] == "0"
         assert float(r_lost["norm_x"]) == -1.0
+
+    def test_nonfinite_landmarks_pose_and_prediction_rejected_and_recovers(self, mocked_gaze_tracker):
+        tracker, stub = mocked_gaze_tracker
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        ts = 0
+
+        # Non-finite pose matrix directly raises ValueError in get_head_pose_angles
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            bad_pose = make_pose_matrix()
+            bad_pose[1, 2] = bad
+            with pytest.raises(ValueError):
+                get_head_pose_angles(bad_pose)
+        with pytest.raises(ValueError):
+            get_head_pose_angles(np.eye(2, dtype=np.float32))
+
+        # 1. Mid-calibration NaN resets incomplete calibration back to 0
+        for _ in range(10):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.ear_state.current_calibration_frames == 10
+
+        bad_lm = make_synthetic_landmarks()
+        bad_lm[468].x = float("nan")
+        stub.next_landmarks = bad_lm
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+        assert math.isnan(hy) and math.isnan(hp)
+        assert tracker.ear_state.current_calibration_frames == 0
+
+        # Fewer than 478 landmarks -> rejected cleanly without IndexError
+        stub.next_landmarks = make_synthetic_landmarks()[:477]
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+        # Complete full calibration after reset
+        stub.next_landmarks = make_synthetic_landmarks()
+        stub.next_pose = make_pose_matrix()
+        for _ in range(CALIBRATION_FRAMES):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+
+        # 2. Post-calibration valid -> invalid (NaN/+-Inf in landmark, pose, or predictor) -> valid recovery
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is not None and is_valid_output(ay, ap)
+
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            lm_corrupt = make_synthetic_landmarks()
+            lm_corrupt[33].y = bad
+            stub.next_landmarks = lm_corrupt
+            stub.next_pose = make_pose_matrix()
+            ts += 33
+            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+            assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+            stub.next_landmarks = make_synthetic_landmarks()
+            pose_corrupt = make_pose_matrix()
+            pose_corrupt[0, 0] = bad
+            stub.next_pose = pose_corrupt
+            ts += 33
+            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+            assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+        # Model predictor outputting NaN/+Inf is also rejected cleanly
+        class _BadModel:
+            def predict(self, _):
+                return np.array([[float("nan")]], dtype=np.float32)
+
+        orig_yaw_model = tracker.yaw_model
+        tracker.yaw_model = _BadModel()
+        stub.next_landmarks = make_synthetic_landmarks()
+        stub.next_pose = make_pose_matrix()
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+        tracker.yaw_model = orig_yaw_model
+
+        # Valid frame immediately recovers with calibration preserved
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+        assert state == 0 and lms is not None and is_valid_output(ay, ap)
+        assert math.isfinite(hy) and math.isfinite(hp)
+
+    def test_process_frame_nonzero_head_pitch_uses_abs_pitch_without_double_addition(self, mocked_gaze_tracker):
+        tracker, stub = mocked_gaze_tracker
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        ts = 0
+        for _ in range(CALIBRATION_FRAMES):
+            ts += 33
+            tracker.process_frame(blank, ts)
+
+        class _ConstModel:
+            def __init__(self, value: float):
+                self.value = value
+
+            def predict(self, _):
+                return np.array([[self.value]], dtype=np.float32)
+
+        tracker.pitch_model = _ConstModel(-16.25)
+        tracker.yaw_model = _ConstModel(2.5)
+        stub.next_landmarks = make_synthetic_landmarks(iris_left=(0.5, 0.0), iris_right=(0.5, 0.0))
+        stub.next_pose = make_pose_matrix(pitch_deg=15.0, yaw_deg=-5.0, roll_deg=0.0)
+        ts += 33
+        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is not None
+        assert math.isclose(hp, 15.0, abs_tol=1e-4)
+        assert math.isclose(hy, -5.0, abs_tol=1e-4)
+        # pitch_model outputs abs_pitch directly (-16.25), NOT rel_pitch -> ap must NOT be -1.25
+        assert math.isclose(ap, -16.25, abs_tol=1e-4)
+        # yaw_model outputs rel_yaw (+2.5) -> abs_yaw = rel_yaw + head_yaw = -2.5
+        assert math.isclose(ay, -2.5, abs_tol=1e-4)
 
 
     def test_nonfinite_landmarks_pose_and_prediction_rejected_and_recovers(self, mocked_gaze_tracker):
@@ -665,14 +813,24 @@ class TestCoordinateMappingAndCalibrationMath:
         assert math.isclose(angle_to_norm_coord(-30.0), 0.0, abs_tol=1e-9)
         assert math.isclose(angle_to_norm_coord(30.0), 1.0, abs_tol=1e-9)
 
+        # Inverted vertical axis (+pitch UP -> smaller y toward 0.0, -pitch DOWN -> larger y toward 1.0)
+        assert math.isclose(angle_to_norm_coord(0.0, invert=True), 0.5, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(15.0, invert=True), 0.25, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(-15.0, invert=True), 0.75, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(30.0, invert=True), 0.0, abs_tol=1e-9)
+        assert math.isclose(angle_to_norm_coord(-30.0, invert=True), 1.0, abs_tol=1e-9)
+
         # Out-of-span angles clamp cleanly to [0.0, 1.0]
         assert angle_to_norm_coord(-75.0) == 0.0
         assert angle_to_norm_coord(75.0) == 1.0
+        assert angle_to_norm_coord(75.0, invert=True) == 0.0
+        assert angle_to_norm_coord(-75.0, invert=True) == 1.0
 
         # Non-finite angles return sentinel -1.0 (matches C++ GazeNative::setPointer)
         assert angle_to_norm_coord(float("nan")) == -1.0
         assert angle_to_norm_coord(float("inf")) == -1.0
         assert angle_to_norm_coord(float("-inf")) == -1.0
+        assert angle_to_norm_coord(float("nan"), invert=True) == -1.0
 
     def test_is_valid_output_sentinel_guard(self):
         assert is_valid_output(0.0, 0.0)
@@ -713,9 +871,9 @@ class TestTimestampMonotonicityAndFixationStability:
     @pytest.mark.parametrize(
         "fixation_name,iris_xy,head_yaw_deg,expected_side",
         [
-            ("left_screen_fixation", (0.62, 0.0), -14.0, "left"),
+            ("left_screen_fixation", (0.38, 0.0), -10.0, "left"),
             ("center_screen_fixation", (0.50, 0.0), 0.0, "center"),
-            ("right_screen_fixation", (0.38, 0.0), 14.0, "right"),
+            ("right_screen_fixation", (0.62, 0.0), 10.0, "right"),
         ],
     )
     def test_300_frame_sustained_fixation_stability_no_dropouts_or_collapse(

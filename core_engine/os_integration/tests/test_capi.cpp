@@ -204,6 +204,43 @@ int main() {
         require(osi_filter_update(f, &x, &y, 1.04) == OSI_FILTER_OK && x == 0.7 && y == 0.6, "reset kept history");
         osi_filter_destroy(f);
     });
+    run_test("clicks_disabled_keeps_gaze_lock_and_toggle_pause", [] {
+        std::string ini = default_ini();
+        ini += "\n[mapping]\ncursor_source = gaze_only\n[gestures]\nclosure_toggles_pause = true\n";
+        Controller c(ini.c_str());
+        osi_set_active(c.handle, 1);
+        osi_set_clicks_enabled(c.handle, 0);
+
+        osi_report report{};
+        const osi_tracker h = none();
+        double t = 0.0;
+        for (int i = 0; i < 6; ++i, t += kDt) {
+            const osi_tracker g{1, 0.50, 0.77, 0, OSI_TRACKED};
+            osi_update(c.handle, t, &h, &g, &report);
+        }
+        const int32_t base_x = report.cursor_x;
+        const int32_t base_y = report.cursor_y;
+
+        // Left wink with clicks disabled: cursor must stay locked (not jump to 0.90,0.05) and emit zero clicks.
+        for (int i = 0; i < 12; ++i, t += kDt) {
+            const osi_tracker g{1, 0.90, 0.05, 1, OSI_TRACKED};
+            osi_update(c.handle, t, &h, &g, &report);
+            require(report.action_count == 0, "clicks-disabled controller emitted a click action");
+            require(report.cursor_x == base_x && report.cursor_y == base_y,
+                    "cursor moved during wink with clicks disabled");
+        }
+        for (int i = 0; i < 3; ++i, t += kDt) {
+            const osi_tracker g{1, 0.50, 0.77, 0, OSI_TRACKED};
+            osi_update(c.handle, t, &h, &g, &report);
+        }
+
+        // Eye closure pause toggle must remain active even with clicks disabled.
+        for (int i = 0; i < 40; ++i, t += kDt) {
+            const osi_tracker g{1, 0.50, 0.77, 3, OSI_TRACKED};
+            osi_update(c.handle, t, &h, &g, &report);
+        }
+        require(report.active == 0, "TogglePause did not fire when clicks disabled");
+    });
 
     std::printf("SUMMARY passed=%d failed=%d\n", passes, failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

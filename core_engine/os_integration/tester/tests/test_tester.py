@@ -681,6 +681,13 @@ def test_uncalibrated_gaze_is_detected(lib):
     doc = IniDoc(defaults)
     doc.set("mapping", "gaze_region", "0.71 0.33 0.29 0.08")
     assert not gaze_is_uncalibrated(doc.text(), defaults)
+    for legacy in ("0.3 0.3 0.7 0.7", "0.25 0.25 0.75 0.75", "0.25 0.60 0.75 0.80"):
+        legacy_doc = IniDoc(defaults)
+        legacy_doc.set("mapping", "gaze_region", legacy)
+        assert gaze_is_uncalibrated(legacy_doc.text(), defaults)
+    explicit_cal = IniDoc(defaults)
+    explicit_cal.set("mapping", "gaze_calibrated", "true")
+    assert not gaze_is_uncalibrated(explicit_cal.text(), defaults)
 
 
 # ---------------------------------------------------------------- #7 Run checks
@@ -1050,6 +1057,327 @@ def test_middle_click_counts_in_the_accuracy_test(make_app, monkeypatch):
                    counters=tester_engine.Counters(middle_click=1))
     app._update_screen(snap)
     assert seen == [True]
+
+
+def test_gaze_source_matches_engine_vertical_sign_and_directions(monkeypatch):
+    tester_engine.prepare_ai_imports()
+    import gaze_intent as gi
+
+    class FakeTracker:
+        def __init__(self):
+            self.detector = object()
+            self.outputs = iter([
+                (-12.0, 10.0, 0.0, 0.0, 0, [object()]),   # UP-LEFT: negative yaw, positive pitch
+                (12.0, -10.0, 0.0, 0.0, 0, [object()]),   # DOWN-RIGHT: positive yaw, negative pitch
+            ])
+
+        def process_frame(self, rgb, ts):
+            return next(self.outputs)
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(gi, "GazeIntent", FakeTracker)
+    src = tester_engine.GazeSource()
+    blank = np.zeros((16, 16, 3), dtype=np.uint8)
+    try:
+        up_left = src.process(blank)
+        down_right = src.process(blank)
+    finally:
+        src.close()
+
+    assert up_left.point is not None and down_right.point is not None
+    assert up_left.point[0] == pytest.approx(0.3, abs=1e-9)
+    assert up_left.point[1] == pytest.approx(0.5 - 10.0 / 60.0, abs=1e-9)
+    assert down_right.point[0] == pytest.approx(0.7, abs=1e-9)
+    assert down_right.point[1] == pytest.approx(0.5 + 10.0 / 60.0, abs=1e-9)
+    assert up_left.point[0] < down_right.point[0] and up_left.point[1] < down_right.point[1]
+
+
+def test_uncalibrated_default_gaze_region_keeps_candidate_neutral_inside_screen(lib):
+    defaults = IniDoc(lib.default_settings_ini())
+    defaults.set("mapping", "cursor_source", "gaze_only")
+    c = lib.controller(defaults.text(), all_monitors=False, real_mouse=False)
+    try:
+        target, _ = c.geometry()
+        # Candidate HGB abs_pitch + ET rel_yaw golden neutral: abs_yaw=+0.837 deg -> 0.514, abs_pitch=-16.277 deg -> 0.771
+        r = c.update(0.0, None, osi_capi.TrackerInput((0.514, 0.771), 0))
+        assert r.cursor is not None
+        cx, cy = r.cursor
+        assert target[0] + 50 < cx < target[0] + target[2] - 50
+        assert target[1] + 50 < cy < target[1] + target[3] - 50
+    finally:
+        c.close()
+
+
+def test_clicks_disabled_keeps_gaze_blink_lock_and_blocks_clicks(lib, worker, monkeypatch):
+    # Direct C API check
+    doc = IniDoc(lib.default_settings_ini())
+    doc.set("mapping", "cursor_source", "gaze_only")
+    c = lib.controller(doc.text(), all_monitors=False, real_mouse=False)
+    try:
+        c.set_active(True)
+        c.set_clicks_enabled(False)
+        t = 0.0
+        for _ in range(6):
+            r = c.update(t, None, osi_capi.TrackerInput((0.50, 0.77), 0))
+            t += 1.0 / 32.0
+        base_cursor = r.cursor
+        for _ in range(12):
+            rw = c.update(t, None, osi_capi.TrackerInput((0.95, 0.05), 1))
+            assert rw.cursor == base_cursor
+            assert not any(
+                e.kind in (osi_capi.EVENT_CLICK, osi_capi.EVENT_DOWN) for e in c.drain_events()
+            )
+            t += 1.0 / 32.0
+    finally:
+        c.close()
+
+    # Worker _step check: clicks=False must still forward gaze.state (not overwrite with 0)
+    class _WinkGaze(FakeGaze):
+        def process(self, rgb):
+            return tester_engine.GazeObs(point=(0.95, 0.05), state=1, ms=1.0, face=True)
+
+    engine, state, _, cv2 = worker("gaze")
+    state.gaze = _WinkGaze()
+    seen_states = []
+    orig_update = state.controller.update
+
+    def _spy_update(t_val, hand_in, gaze_in):
+        if gaze_in is not None:
+            seen_states.append(gaze_in.state)
+        return orig_update(t_val, hand_in, gaze_in)
+
+    monkeypatch.setattr(state.controller, "update", _spy_update)
+    cfg = replace(state.config, clicks=False)
+    engine._apply_config(state, cfg, engine.settings_text(), cv2)
+    engine._step(state, cfg, cv2)
+    assert seen_states == [1]
+    assert state.controller.count(osi_capi.EVENT_CLICK) == 0
+
+
+
+# ---- [Engineer 5] P1 #4: Non-finite validation & recovery across Tester & osi_capi ----
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, math.nan])
+def test_smoother_rejects_nonfinite_and_recovers(dsp_filter, bad):
+    for filt in (dsp_filter, None):
+        gate = Smoother(filt)
+        pt0, trk0 = gate.apply((0.3, 0.4), TRACKED, 1.0)
+        assert pt0 is not None and trk0 == TRACKED
+        assert gate.apply((bad, 0.4), TRACKED, 1.1) == (None, LOST)
+        assert gate.apply((0.3, bad), TRACKED, 1.2) == (None, LOST)
+        # Held must not replay after invalid reset
+        assert gate.apply((0.3, 0.4), HELD, 1.3) == (None, LOST)
+        # Clean frame recovers immediately
+        pt_rec, trk_rec = gate.apply((0.6, 0.7), TRACKED, 1.4)
+        assert pt_rec is not None and trk_rec == TRACKED
+        assert math.isfinite(pt_rec[0]) and math.isfinite(pt_rec[1])
+
+
+def test_hand_source_rejects_nonfinite_index_and_hand_and_recovers():
+    # Bypass __init__ to test HandSource.process normalization without loading MediaPipe weights
+    blank = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    # Index mode
+    src_idx = tester_engine.HandSource.__new__(tester_engine.HandSource)
+    src_idx.kind = "index"
+
+    class _FakeIdx:
+        def __init__(self, seq):
+            self._seq = iter(seq)
+
+        def track(self, _):
+            return next(self._seq)
+
+    src_idx.tracker = _FakeIdx([
+        type("R", (), {"valid": True, "x": float("inf"), "y": 0.5, "camera_x": 0.5, "camera_y": 0.5, "status": "TRACKING"})(),
+        type("R", (), {"valid": True, "x": 0.4, "y": 0.6, "camera_x": 0.4, "camera_y": 0.6, "status": "TRACKING"})(),
+    ])
+    obs_bad = src_idx.process(blank)
+    assert obs_bad.point is None and obs_bad.tracking == LOST
+    obs_ok = src_idx.process(blank)
+    assert obs_ok.point == (0.4, 0.6) and obs_ok.tracking == TRACKED
+
+    # Hand gesture mode
+    src_hand = tester_engine.HandSource.__new__(tester_engine.HandSource)
+    src_hand.kind = "hand"
+
+    class _FakeHand:
+        def __init__(self):
+            self.status = "DETECTED"
+            self._last_bbox = None
+            self.last_confidence = 0.9
+            self._seq = iter([
+                (float("nan"), 0.5, 1),
+                (float("inf"), 0.5, 1),
+                (0.25, 0.75, 1),
+            ])
+
+        def process_frame(self, _):
+            return next(self._seq)
+
+    src_hand.tracker = _FakeHand()
+    for _ in range(2):
+        bad_obs = src_hand.process(blank)
+        assert bad_obs.point is None and bad_obs.tracking == LOST
+    ok_obs = src_hand.process(blank)
+    assert ok_obs.point == (0.25, 0.75) and ok_obs.tracking == TRACKED and ok_obs.state == 1
+
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, math.nan])
+def test_osi_capi_rejects_nonfinite_tracker_points_and_recovers(lib, bad):
+    ini = lib.default_settings_ini()
+    c = lib.controller(ini, all_monitors=False, real_mouse=False)
+    try:
+        c.set_active(True)
+        # Before any valid sample, non-finite input must not produce a cursor
+        r0 = c.update(0.05, osi_capi.TrackerInput((bad, 0.5), 0, TRACKED), None)
+        assert r0.cursor is None and not r0.moved
+
+        # Establish a valid cursor, then inject non-finite X and Y
+        good = c.update(0.10, osi_capi.TrackerInput((0.5, 0.5), 0, TRACKED), None)
+        assert good.cursor is not None and good.moved
+        r1 = c.update(0.20, osi_capi.TrackerInput((bad, 0.5), 0, TRACKED), None)
+        assert not r1.moved and r1.cursor == good.cursor
+        r2 = c.update(0.30, osi_capi.TrackerInput((0.5, bad), 0, TRACKED), None)
+        assert not r2.moved and r2.cursor == good.cursor
+
+        # Next clean sample moves cleanly to the new position
+        rec = c.update(0.40, osi_capi.TrackerInput((0.6, 0.4), 0, TRACKED), None)
+        assert rec.moved and rec.cursor is not None and rec.cursor != good.cursor
+    finally:
+        c.close()
+
+
+def test_old_placeholder_gaze_region_counts_as_uncalibrated(lib):
+    old = IniDoc(lib.default_settings_ini())
+    old.lines = [line for line in old.lines if not line.startswith("settings_version")]
+    old.set("mapping", "gaze_region", "0.3 0.3 0.7 0.7")
+    assert gaze_is_uncalibrated(old.text(), lib.default_settings_ini())
+
+
+# ---------------------------------------------------------------- real mouse: gestures may pause, never resume
+
+class ClosedEyes:
+    """Eyes closed for the whole test (gaze state 3 = sustained closure)."""
+
+    def process(self, frame):
+        return GazeObs(point=(0.5, 0.5), state=3, face=True)
+
+    def close(self):
+        pass
+
+
+class Fist:
+    def process(self, frame):
+        return HandObs(point=(0.5, 0.5), state=2, tracking=TRACKED, status="DETECTED")
+
+    def close(self):
+        pass
+
+
+def run_for(engine, state, config, cv2, seconds):
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        time.sleep(0.015)
+        engine._step(state, config, cv2)
+
+
+def start_paused(state, config, active=False):
+    state.config = config
+    state.controller.set_active(active)
+    state.last_report = osi_capi.Report(active=active)
+
+
+@pytest.mark.parametrize("clicks", [True, False])
+def test_real_mouse_eye_closure_never_switches_output_on(worker, monkeypatch, clicks):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True, clicks=clicks)   # record-only controller: no real output
+    start_paused(state, config)
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)                         # closure onset is 1.0 s
+    assert not state.last_report.active
+
+
+def test_real_mouse_eye_closure_still_pauses(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True)
+    start_paused(state, config, active=True)                         # switched on with Activate
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active
+
+
+def test_simulation_eye_closure_still_resumes(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    config = replace(state.config, real_mouse=False)
+    start_paused(state, config)
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert state.last_report.active
+
+
+def test_real_mouse_fist_toggle_never_switches_output_on(worker, monkeypatch, lib):
+    engine, state, log, cv2 = worker("hand")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    doc = IniDoc(lib.default_settings_ini())
+    doc.set("gestures", "fist_action", "toggle_pause")
+    assert state.controller.apply_settings(doc.text()) is None
+    state.zone = IniDoc(doc.text())
+    config = replace(state.config, real_mouse=True)
+    start_paused(state, config)
+    state.hand = Fist()
+    run_for(engine, state, config, cv2, 0.8)                         # fist onset is 0.3 s
+    assert not state.last_report.active
+
+
+def test_real_mouse_clicks_disabled_keeps_blink_lock_pauses_and_never_resumes(worker, monkeypatch):
+    engine, state, log, cv2 = worker("gaze")
+    monkeypatch.setattr(engine, "_escape_pressed", lambda: False)
+    monkeypatch.setattr(engine, "_physical_mouse_check", lambda *args: False)
+    config = replace(state.config, real_mouse=True, clicks=False)   # keep worker's record-only controller
+    start_paused(state, config, active=True)
+    state.controller.set_clicks_enabled(config.clicks)
+
+    gaze_seq = iter([
+        *([GazeObs(point=(0.50, 0.77), state=0, face=True)] * 6),
+        *([GazeObs(point=(0.95, 0.05), state=1, face=True)] * 10),   # left wink with noisy coordinates
+    ])
+
+    class _SeqGaze:
+        def process(self, frame):
+            return next(gaze_seq, GazeObs(point=(0.50, 0.77), state=0, face=True))
+
+        def close(self):
+            pass
+
+    state.gaze = _SeqGaze()
+    for _ in range(6):
+        time.sleep(0.015)
+        engine._step(state, config, cv2)
+    base_cursor = state.last_report.cursor
+    assert base_cursor is not None
+
+    # During wink with real_mouse=True and clicks=False: blink lock freezes cursor and emits zero clicks.
+    for _ in range(10):
+        time.sleep(0.015)
+        engine._step(state, config, cv2)
+        assert state.last_report.cursor == base_cursor
+    assert state.controller.count(osi_capi.EVENT_CLICK) == 0
+
+    # 1 s eye closure pauses active real-mouse output even with clicks=False, then never resumes it.
+    state.gaze = ClosedEyes()
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active
+    assert state.controller.count(osi_capi.EVENT_CLICK) == 0
+    run_for(engine, state, config, cv2, 1.6)
+    assert not state.last_report.active
 
 
 # ============================================================ 23 Nov: same input validation as core_engine

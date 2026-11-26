@@ -365,6 +365,9 @@ void CalibrationWizard::complete_range() {
     InputRegion& region = kind_ == WizardKind::HandRange ? result_settings_.mapping.hand_region
                                                          : result_settings_.mapping.gaze_region;
     region = result.fit->region;
+    if (kind_ == WizardKind::GazeRange) {
+        result_settings_.mapping.gaze_calibrated = true;
+    }
     wchar_t text[512];
     std::swprintf(text, 512,
                   L"%ls range measured.\nAverage error: %.1f%% of the screen.\n"

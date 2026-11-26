@@ -87,11 +87,16 @@ class GazeDiagnosticPayload:
 _DIAG_FIELD_NAMES = tuple(f.name for f in fields(GazeDiagnosticPayload))
 
 
-def angle_to_norm_coord(angle_deg: float) -> float:
-    """Mirrors GazeNative::setPointer: clamp01(0.5 + angle_deg / 60.0), or -1.0 when non-finite."""
+def angle_to_norm_coord(angle_deg: float, invert: bool = False) -> float:
+    """Mirrors GazeNative::setPointer: clamp01(0.5 +- angle_deg / 60.0), or -1.0 when non-finite.
+
+    Horizontal yaw uses invert=False (0.5 + yaw / 60.0: left -> 0, right -> 1).
+    Vertical pitch uses invert=True (0.5 - pitch / 60.0: up (+pitch) -> 0, down (-pitch) -> 1).
+    """
     if not math.isfinite(angle_deg):
         return -1.0
-    return max(0.0, min(1.0, 0.5 + angle_deg / SPAN_DEG))
+    signed_deg = -angle_deg if invert else angle_deg
+    return max(0.0, min(1.0, 0.5 + signed_deg / SPAN_DEG))
 
 
 def is_valid_output(abs_yaw: float, abs_pitch: float) -> bool:
@@ -474,12 +479,11 @@ class GazeIntent:
             )
             gaze_batch = tl2cgen.DMatrix(gaze_features)
 
-            # Get Relative Eye-in-Socket predictions
-            rel_pitch = float(self.pitch_model.predict(gaze_batch).item())
+            # gaze_pitch.dll predicts direct absolute world pitch (y_abs_pitch = true_pitch);
+            # gaze_yaw.dll predicts relative eye-in-socket yaw (y_rel_yaw = true_yaw - head_yaw).
+            abs_pitch = float(self.pitch_model.predict(gaze_batch).item())
             rel_yaw = float(self.yaw_model.predict(gaze_batch).item())
-
-            # RECOMBINE: Calculate Absolute World Gaze
-            abs_pitch = rel_pitch + head_pitch
+            rel_pitch = abs_pitch - head_pitch
             abs_yaw = rel_yaw + head_yaw
 
             if not all(math.isfinite(v) for v in (rel_pitch, rel_yaw, abs_pitch, abs_yaw)):
@@ -489,7 +493,7 @@ class GazeIntent:
 
             if self._diag_writer is not None:
                 nx = angle_to_norm_coord(abs_yaw)
-                ny = angle_to_norm_coord(abs_pitch)
+                ny = angle_to_norm_coord(abs_pitch, invert=True)
                 self._write_diag_row(GazeDiagnosticPayload(
                     frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
                     detected=1 if (nx >= 0.0 and ny >= 0.0) else 0, state=state,

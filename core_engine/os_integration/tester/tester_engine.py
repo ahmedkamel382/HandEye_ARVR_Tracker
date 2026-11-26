@@ -56,6 +56,7 @@ MODES: Dict[str, Mode] = {m.key: m for m in [
 ]}
 
 HAND_STATES = {0: "neutral", 1: "pinch", 2: "fist"}
+HAND_FIST, EYES_CLOSED = 2, 3
 EYE_STATES = {-1: "calibrating", 0: "neutral", 1: "left wink", 2: "right wink", 3: "eyes closed"}
 TRACKING_NAMES = {osi_capi.TRACKED: "tracked", osi_capi.HELD: "held", osi_capi.LOST: "lost"}
 
@@ -359,17 +360,24 @@ class HandSource:
         if self.kind == "index":
             r = self.tracker.track(bgr)
             obs.status = r.status
-            if r.valid and r.x is not None:
-                obs.point = (float(r.x), float(r.y))
-                obs.camera_point = (float(r.camera_x), float(r.camera_y))
-                obs.tracking = osi_capi.TRACKED
+            if r.valid and r.x is not None and r.y is not None:
+                rx, ry = float(r.x), float(r.y)
+                if math.isfinite(rx) and math.isfinite(ry):
+                    obs.point = (rx, ry)
+                    cx = float(r.camera_x) if r.camera_x is not None else rx
+                    cy = float(r.camera_y) if r.camera_y is not None else ry
+                    obs.camera_point = (cx, cy) if (math.isfinite(cx) and math.isfinite(cy)) else obs.point
+                    obs.tracking = osi_capi.TRACKED
         else:
             x, y, state = self.tracker.process_frame(bgr)
             obs.status = str(getattr(self.tracker, "status", ""))
             obs.tracking = {"DETECTED": osi_capi.TRACKED, "RECOVERED_ROI": osi_capi.TRACKED,
                             "HELD": osi_capi.HELD}.get(obs.status, osi_capi.LOST)
-            if x >= 0 and y >= 0 and obs.tracking != osi_capi.LOST:
-                obs.point = (float(x), float(y))
+            fx, fy = float(x), float(y)
+            if not (math.isfinite(fx) and math.isfinite(fy)):
+                obs.tracking = osi_capi.LOST
+            elif fx >= 0 and fy >= 0 and obs.tracking != osi_capi.LOST:
+                obs.point = (fx, fy)
                 obs.camera_point = obs.point
                 obs.state = int(state)
             bbox = getattr(self.tracker, "_last_bbox", None)   # read-only, for drawing
@@ -407,8 +415,11 @@ class GazeSource:
         obs = GazeObs(state=int(state), yaw=yaw, pitch=pitch, head_yaw=head_yaw, head_pitch=head_pitch,
                       landmarks=landmarks, face=landmarks is not None)
         if self.module.is_valid_output(yaw, pitch):
-            # Same mapping as the engine (GazeNative::setPointer): 0.5 + angle / 60, clamped.
-            obs.point = (self.module.angle_to_norm_coord(yaw), self.module.angle_to_norm_coord(pitch))
+            # Same mapping as the engine (GazeNative::setPointer): X = 0.5 + yaw / 60, Y = 0.5 - pitch / 60, clamped.
+            obs.point = (
+                self.module.angle_to_norm_coord(yaw),
+                self.module.angle_to_norm_coord(pitch, invert=True),
+            )
         obs.ms = (time.perf_counter() - start) * 1000.0
         return obs
 
@@ -435,14 +446,13 @@ class Smoother:
 
     def apply(self, point, tracking: int, t: float) -> Tuple[Optional[Tuple[float, float]], int]:
         """(point to publish, TRACKED / HELD / LOST)."""
-        detected = point is not None and point[0] >= 0 and point[1] >= 0    # ModuleOut::detected(); False for NaN
+        detected = (point is not None and math.isfinite(point[0]) and math.isfinite(point[1])
+                    and point[0] >= 0 and point[1] >= 0)            # ModuleOut::detected(); rejects NaN & +-Inf
         if not detected or tracking not in (osi_capi.TRACKED, osi_capi.HELD):
             return self._lose()
         if tracking == osi_capi.HELD:
             return self._replay()
         if self.filter is None:
-            if not (math.isfinite(point[0]) and math.isfinite(point[1])):
-                return self._lose()
             output = point
         else:
             status, output = self.filter.update(point, t)
@@ -451,6 +461,9 @@ class Smoother:
             if status != osi_capi.FILTER_OK:
                 self.last, self._has_history = None, False  # the filter reset itself
                 return None, osi_capi.LOST
+        if output is None or not (math.isfinite(output[0]) and math.isfinite(output[1])):
+            self.last, self._has_history = None, False
+            return None, osi_capi.LOST
         self.last = (min(1.0, max(0.0, output[0])), min(1.0, max(0.0, output[1])))
         self._has_history = True
         return self.last, osi_capi.TRACKED
@@ -706,16 +719,44 @@ class TesterEngine:
             if not cap.isOpened():
                 cap = cv2.VideoCapture(config.camera_index)
             # The same requests, in the same order, as core_engine's openSource().
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+            cap.set(cv2.CAP_PROP_FOURCC, mjpg)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
             cap.set(cv2.CAP_PROP_FPS, 60)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cap, "get"):
+                try:
+                    raw_fc = cap.get(cv2.CAP_PROP_FOURCC)
+                    fc_int = int(round(raw_fc)) if math.isfinite(raw_fc) and raw_fc > 0 else 0
+                    if fc_int != mjpg:
+                        cap.set(cv2.CAP_PROP_FOURCC, mjpg)
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
+                        cap.set(cv2.CAP_PROP_FPS, 60)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open camera {config.camera_index}. Close other apps using it "
                                    f"(Zoom, Teams, the engine) or pick another camera.")
             state.cap = cap
-            self.event(f"Camera {config.camera_index} opened")
+            cam_info = ""
+            if hasattr(cap, "get"):
+                try:
+                    fc_raw = cap.get(cv2.CAP_PROP_FOURCC)
+                    fc_int = int(round(fc_raw)) if math.isfinite(fc_raw) and fc_raw > 0 else 0
+                    fc_bytes = fc_int.to_bytes(4, "little", signed=False) if fc_int else b""
+                    fc_str = fc_bytes.decode("ascii") if len(fc_bytes) == 4 and all(32 <= b <= 126 for b in fc_bytes) else (
+                        f"0x{fc_int:08X}" if fc_int else "NONE")
+                    neg_w = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+                    neg_h = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                    neg_fps = cap.get(cv2.CAP_PROP_FPS)
+                    auto_exp = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                    cam_info = f" ({neg_w}x{neg_h} FOURCC={fc_str} reported={neg_fps:.1f} FPS auto_exp={auto_exp:.3g})"
+                except Exception:
+                    cam_info = ""
+            self.event(f"Camera {config.camera_index} opened{cam_info}")
         # Trackers (reloaded only when their options change)
         hand_key = (mode.hand, config.lowlight, config.roi_recovery, round(config.index_alpha, 3)) if mode.hand else None
         if hand_key != state.hand_key:
@@ -765,6 +806,8 @@ class TesterEngine:
             self.event("Output: REAL MOUSE (paused - press Activate)" if config.real_mouse
                        else "Output: simulation (the real mouse is never touched)")
         state.rebuild_smoothers(self.lib, config, settings)
+        if state.controller and hasattr(state.controller, "set_clicks_enabled"):
+            state.controller.set_clicks_enabled(config.clicks)
         self._publish(smoothing_available=state.smoothing_available)
         if old is None or old.mode != config.mode:
             self.event(f"Mode: {mode.title}")
@@ -834,18 +877,26 @@ class TesterEngine:
         hand = state.hand.process(bgr) if state.hand else HandObs()     # trackers mirror internally
         gaze = state.gaze.process(cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)) if state.gaze else GazeObs()
 
-        # Inputs for Engineer 5's OsController
+        # Inputs for Engineer 5's OsController: always pass raw states so wink/blink cursor lock and
+        # closure-pause stay active even when config.clicks is False (OsController suppresses clicks cleanly).
+        # Real mouse: only Activate (button or Space) switches output on. A gesture that toggles pause may still pause,
+        # but while output is paused it is withheld, so it can never switch the real mouse on by itself.
+        no_resume = config.real_mouse and not state.last_report.active
         hand_in = None
         if mode.hand:
             point, tracking = state.hand_smoother.apply(hand.point, hand.tracking, t)
-            hand_state = hand.state if (config.clicks and mode.hand == "gesture") else 0
+            hand_state = hand.state if mode.hand == "gesture" else 0
+            if no_resume and hand_state == HAND_FIST and state.zone.get("gestures", "fist_action") == "toggle_pause":
+                hand_state = 0
             hand_in = osi_capi.TrackerInput(point, hand_state, tracking)
         gaze_in = None
         if mode.gaze:
             gaze_tracking = osi_capi.TRACKED if gaze.point is not None else osi_capi.LOST
             point, tracking = (state.gaze_smoother.apply(gaze.point, gaze_tracking, t) if mode.gaze == "pointer"
                                else (None, osi_capi.LOST))
-            eye_state = gaze.state if (config.clicks or gaze.state == -1) else 0
+            eye_state = gaze.state
+            if no_resume and eye_state == EYES_CLOSED:
+                eye_state = 0
             gaze_in = osi_capi.TrackerInput(point, eye_state, tracking)
 
         controller = state.controller
@@ -965,9 +1016,26 @@ def _changes_control(old: TesterConfig, new: TesterConfig) -> bool:
     return replace(old, **drawing) != new
 
 
+LEGACY_PLACEHOLDER_GAZE_REGIONS = (
+    (0.3, 0.3, 0.7, 0.7),
+    (0.25, 0.25, 0.75, 0.75),
+    (0.25, 0.60, 0.75, 0.80),
+)
+
+
 def gaze_is_uncalibrated(settings: str, defaults: str) -> bool:
+    doc = IniDoc(settings)
     fallback = _region(IniDoc(defaults).get("mapping", "gaze_region"), None)
-    return _region(IniDoc(settings).get("mapping", "gaze_region"), fallback) == fallback
+    region = _region(doc.get("mapping", "gaze_region"), fallback)
+    cal = (doc.get("mapping", "gaze_calibrated") or "").strip().lower()
+    if region in LEGACY_PLACEHOLDER_GAZE_REGIONS:
+        return True
+    if cal in ("true", "1", "yes", "on"):
+        return False
+    if region == fallback:
+        return True
+    # Custom non-placeholder region (e.g. legacy INI or manual edit): treat as calibrated.
+    return False
 
 
 class _WorkerState:

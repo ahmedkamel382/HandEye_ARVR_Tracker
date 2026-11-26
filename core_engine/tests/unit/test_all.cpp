@@ -403,15 +403,37 @@ static void t_gaze_adds_head_pose_and_outputs_raw() {
     const float c30 = float(std::cos(30 * 3.14159265358979323846 / 180)), s30 = float(std::sin(30 * 3.14159265358979323846 / 180));
     const float ry[16] = { c30, 0, s30, 0, 0, 1, 0, 0, -s30, 0, c30, 0, 0, 0, 0, 1 };
     f.setPose(ry);
-    r.pitch_out = 5.0; r.yaw_out = -10.0;                                  // eye-in-socket angles from the models
+    r.pitch_out = 5.0; r.yaw_out = -10.0;                                  // pitch=abs_pitch, yaw=rel_yaw
     r.calibrate(f);
-    ModuleOut o = r.run(f);                                                // EMA removed: expect exact sum immediately
+    ModuleOut o = r.run(f);                                                // EMA removed: expect exact direct/sum immediately
     CHECK_NEAR(o.head_yaw_deg, 30.0, 1e-4);
-    CHECK_NEAR(o.yaw_deg, 20.0, 1e-4);                                     // -10.0 (eye) + 30.0 (head)
-    CHECK_NEAR(o.pitch_deg, 5.0, 1e-4);                                    // 5.0 (eye) + 0.0 (head)
+    CHECK_NEAR(o.yaw_deg, 20.0, 1e-4);                                     // -10.0 (rel_yaw) + 30.0 (head_yaw)
+    CHECK_NEAR(o.pitch_deg, 5.0, 1e-4);                                    // 5.0 (direct abs_pitch)
     CHECK_NEAR(o.x, 0.5 + o.yaw_deg / GazeNative::kSpanDeg, 1e-6);         // the 0..1 pointer for the OS stage
+    CHECK_NEAR(o.y, 0.5 - o.pitch_deg / GazeNative::kSpanDeg, 1e-6);       // +pitch (UP) maps toward 0.0
     for (int i = 0; i < 80; ++i) o = r.run(f);
-    CHECK_NEAR(o.yaw_deg, 20.0, 0.01);                                     // remains exactly rel + head
+    CHECK_NEAR(o.yaw_deg, 20.0, 0.01);                                     // remains exact
+
+    // Verify non-zero head_pitch is NOT added twice to abs_pitch from gaze_pitch.dll
+    const float c15 = float(std::cos(15 * 3.14159265358979323846 / 180)), s15 = float(std::sin(15 * 3.14159265358979323846 / 180));
+    const float rx15[16] = { 1, 0, 0, 0, 0, c15, -s15, 0, 0, s15, c15, 0, 0, 0, 0, 1 };
+    f.setPose(rx15);
+    r.pitch_out = -8.0; r.yaw_out = 2.0;
+    GazeDiagRow diag_row;
+    const ModuleOut op = r.g.process(f.p.data(), f.count(), FacePts::W, FacePts::H, &diag_row);
+    CHECK_NEAR(op.head_pitch_deg, 15.0, 1e-4);
+    CHECK_NEAR(op.pitch_deg, -8.0, 1e-4);                                  // stays direct abs_pitch = -8.0 (not -8 + 15 = +7)
+    CHECK_NEAR(diag_row.abs_pitch_deg, -8.0, 1e-4);
+    CHECK_NEAR(diag_row.rel_pitch_deg, -23.0, 1e-4);                       // abs_pitch - head_pitch = -8 - 15 = -23
+
+    // Directional contract: LEFT->RIGHT increases x, UP->DOWN increases y
+    FacePts f0(0.3, 0.3);
+    r.pitch_out = 10.0; r.yaw_out = -12.0;                                 // UP-LEFT
+    const ModuleOut up_left = r.run(f0);
+    r.pitch_out = -10.0; r.yaw_out = 12.0;                                 // DOWN-RIGHT
+    const ModuleOut down_right = r.run(f0);
+    CHECK(up_left.x < 0.5f && down_right.x > 0.5f && up_left.x < down_right.x);
+    CHECK(up_left.y < 0.5f && down_right.y > 0.5f && up_left.y < down_right.y);
 }
 
 static bool double_bits_eq(double a, double b) {
@@ -593,12 +615,12 @@ static void run_gaze_diag_off_vs_on_and_csv_reconstruction(
             const double rec_sy   = 0.5 * (rec_l_iy + rec_r_iy);
 
             const float gf[kPoseFeatures] = { float(rec_sx), float(rec_sy), float(hp_csv), float(hy_csv), float(hr_csv) };
-            const double rec_rp = pitch->predict(gf);
+            const double rec_ap = pitch->predict(gf);
             const double rec_ry = yaw->predict(gf);
-            const double rec_ap = rec_rp + hp_csv;
+            const double rec_rp = rec_ap - hp_csv;
             const double rec_ay = rec_ry + hy_csv;
             const double rec_nx = double(float(std::max(0.0, std::min(1.0, 0.5 + rec_ay / GazeNative::kSpanDeg))));
-            const double rec_ny = double(float(std::max(0.0, std::min(1.0, 0.5 + rec_ap / GazeNative::kSpanDeg))));
+            const double rec_ny = double(float(std::max(0.0, std::min(1.0, 0.5 - rec_ap / GazeNative::kSpanDeg))));
 
             const double errs[12] = {
                 std::fabs(l_ix_csv - rec_l_ix), std::fabs(r_ix_csv - rec_r_ix), std::fabs(sx_csv - rec_sx),

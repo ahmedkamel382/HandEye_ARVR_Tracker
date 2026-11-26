@@ -15,6 +15,10 @@ namespace osi {
 
 enum class ScreenTarget : std::uint8_t { PrimaryMonitor, VirtualDesktop };
 
+// 1: gaze y = 0.5 + pitch/60 (files written before the Y-sign fix; they have no settings_version).
+// 2: gaze y = 0.5 - pitch/60. Version 1 gaze regions are converted on load (y -> 1 - y).
+inline constexpr int kSettingsVersion = 2;
+
 // Mirrors dsp::FilterConfig so this module does not depend on dsp_filter.
 // The defaults are Engineer 4's kInitialHandConfig / kInitialGazeConfig.
 struct FilterSettings {
@@ -26,8 +30,10 @@ struct FilterSettings {
 struct MappingSettings {
     // Hand: the central 70% of the frame covers the whole screen.
     InputRegion hand_region{0.15, 0.15, 0.85, 0.85};
-    // Gaze: placeholder band until the calibration wizard measures the user.
-    InputRegion gaze_region{0.30, 0.30, 0.70, 0.70};
+    // Gaze: centered around the HGB abs_pitch webcam-above-screen pitch offset (~-12 deg -> norm_y ~0.70)
+    // until the calibration wizard measures the individual user.
+    InputRegion gaze_region{0.25, 0.58, 0.75, 0.82};
+    bool gaze_calibrated = false;
     CursorSourceMode cursor_source = CursorSourceMode::HandPreferred;
     ScreenTarget screen_target = ScreenTarget::PrimaryMonitor;
     double source_switch_seconds = 0.20;
@@ -40,6 +46,7 @@ struct StabilizationSettings {
 };
 
 struct AppSettings {
+    int settings_version = kSettingsVersion; // the meaning of the saved values; always written as the current one
     bool start_active = false; // tray app starts paused until the user enables it
     double physical_mouse_yield_seconds = 1.5;
     double stale_input_seconds = 0.5; // release buttons when frames stop arriving
@@ -63,6 +70,8 @@ struct SettingsLoadResult {
     // The first warning other than an unknown key, or why the file could not be
     // read. When set, `settings` is incomplete: never save it over that file.
     std::string error;
+    // Non-empty when the file was written by an older version and was converted; says what changed.
+    std::string migrated;
 };
 
 // INI-style "key = value" lines grouped in [sections] (a UTF-8 byte-order mark is accepted); '#' and ';' start

@@ -35,6 +35,7 @@ import csv
 import math
 import os
 import sys
+from typing import Optional
 
 import mediapipe as mp
 import numpy as np
@@ -226,17 +227,80 @@ def _pack_hand(result, diag=None, seq: int = 0, ts_ms: int = 0, mode: str = "") 
 
 
 _FACE_N = 478           # expected face mesh + iris landmarks
+_BLENDSHAPE_ROWS = 3    # 8 eye-aligned blendshapes + 1 sentinel packed into 3 rows of 3 float32
+_PACKED_FACE_LEGACY = _FACE_N + _POSE_ROWS                      # 484
+_PACKED_FACE_WITH_BLENDSHAPES = _PACKED_FACE_LEGACY + _BLENDSHAPE_ROWS  # 487
+
+# Empirically verified on MPIIFaceGaze (unflipped and cv::flip mirrored frames):
+# MediaPipe FaceMesh LEFT_EYE (33,160,158,133,153,144) is always image-left (user physical left eye
+# in mirrored webcam frames -> state 1 Left Wink) and corresponds to MediaPipe ARKit *Right blendshapes.
+# RIGHT_EYE (362,385,387,263,373,380) is always image-right (-> state 2 Right Wink) and corresponds to *Left.
+EYE_BLENDSHAPE_NAMES = (
+    "eyeBlinkRight",      # slot 0: bs_blink_l    (LEFT_EYE)
+    "eyeBlinkLeft",       # slot 1: bs_blink_r    (RIGHT_EYE)
+    "eyeLookDownRight",   # slot 2: bs_lookdown_l (LEFT_EYE)
+    "eyeLookDownLeft",    # slot 3: bs_lookdown_r (RIGHT_EYE)
+    "eyeSquintRight",     # slot 4: bs_squint_l   (LEFT_EYE)
+    "eyeSquintLeft",      # slot 5: bs_squint_r   (RIGHT_EYE)
+    "eyeWideRight",       # slot 6: bs_wide_l     (LEFT_EYE)
+    "eyeWideLeft",        # slot 7: bs_wide_r     (RIGHT_EYE)
+)
 
 
-def pack_face(face_lms, pose_matrix):
-    """Validate and pack one face + 4x4 pose matrix. Returns (packed (484, 3) float32 or _EMPTY, diag dict).
-    Rejects (returns _EMPTY) unless there are exactly 478 landmarks, a 16-element pose matrix,
-    and every landmark/pose entry is finite."""
+_BLENDSHAPE_EPS = np.float32(1e-4)
+_BLENDSHAPE_LO = np.float32(-_BLENDSHAPE_EPS)
+_BLENDSHAPE_HI = np.float32(1.0) + _BLENDSHAPE_EPS
+_BLENDSHAPE_SENTINEL = np.float32(1.0)
+
+
+def extract_eye_blendshapes(face_blendshapes) -> Optional[np.ndarray]:
+    """Extract the 8 canonical eye-aligned blendshapes into a float32 array of shape (8,).
+
+    Accepts minor float32/TFLite rounding overshoot within [-1e-4, 1.0 + 1e-4] and clamps
+    accepted values into [0.0, 1.0]. Returns None if any required channel is missing,
+    non-finite, or outside [-1e-4, 1.0 + 1e-4] (mirrored 1:1 in gaze_math.hpp).
+    """
+    if face_blendshapes is None:
+        return None
+    try:
+        if isinstance(face_blendshapes, dict):
+            scores = face_blendshapes
+        else:
+            scores = {getattr(c, "category_name", ""): getattr(c, "score", float("nan"))
+                      for c in face_blendshapes}
+        vals = [float(scores[name]) for name in EYE_BLENDSHAPE_NAMES]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    arr = np.asarray(vals, dtype=np.float32)
+    if not np.isfinite(arr).all():
+        return None
+    if bool((arr < _BLENDSHAPE_LO).any() or (arr > _BLENDSHAPE_HI).any()):
+        return None
+    return np.clip(arr, np.float32(0.0), np.float32(1.0))
+
+
+def pack_face(face_lms, pose_matrix, face_blendshapes=None):
+    """Validate and pack one face + 4x4 pose matrix (+ optional 8 eye blendshapes).
+
+    Explicit observation-integrity policies (mirrored in hybrid_blink_spec.json & gaze_math.hpp):
+      1. Missing blendshapes (face_blendshapes is None):
+         Returns legacy (484, 3) float32; downstream HybridBlinkDetector / GazeNative silently
+         falls back to EAR-only hybrid mode (detector_mode='hybrid_ear_only').
+      2. Invalid/corrupted blendshapes (face_blendshapes provided, but missing a required
+         channel, non-finite, or outside [-1e-4, 1.0 + 1e-4]):
+         Rejects the ENTIRE face observation (_EMPTY, valid=False, reason='blendshapes') so
+         pointer is dropped and state=0 (Neutral), matching PR #3's strict all-or-nothing
+         observation integrity policy (no partial-corruption pass-through).
+      3. Valid blendshapes:
+         Clamps values within [-1e-4, 1.0 + 1e-4] into [0.0, 1.0] and returns (487, 3) float32
+         with rows 484..486 holding the 8 eye-aligned blendshapes + 1.0f sentinel at [486, 2].
+    """
     n_face = len(face_lms) if face_lms else 0
     pose_arr = np.asarray(pose_matrix, dtype=np.float32) if pose_matrix is not None else np.empty(0, dtype=np.float32)
     diag = {
         "has_face": n_face > 0,
         "has_pose": pose_arr.size > 0,
+        "has_blendshapes": face_blendshapes is not None,
         "n_face": n_face,
         "pose_size": int(pose_arr.size),
         "packed_n": 0,
@@ -249,17 +313,27 @@ def pack_face(face_lms, pose_matrix):
     pts = _to_array(face_lms[:_FACE_N])
     pose = np.zeros((_POSE_ROWS, 3), dtype=np.float32)
     pose.reshape(-1)[:16] = pose_arr.reshape(-1)
-    packed = np.concatenate([pts, pose])
+    parts = [pts, pose]
+    if face_blendshapes is not None:
+        bs_vec = extract_eye_blendshapes(face_blendshapes)
+        if bs_vec is None:
+            diag["reason"] = "blendshapes"
+            return _EMPTY, diag
+        bs_rows = np.zeros((_BLENDSHAPE_ROWS, 3), dtype=np.float32)
+        bs_rows.reshape(-1)[:8] = bs_vec
+        bs_rows.reshape(-1)[8] = _BLENDSHAPE_SENTINEL
+        parts.append(bs_rows)
+    packed = np.concatenate(parts)
     if not np.isfinite(packed).all():
         diag["reason"] = "nonfinite"
         return _EMPTY, diag
-    diag["packed_n"] = _FACE_N + _POSE_ROWS
+    diag["packed_n"] = int(packed.shape[0])
     diag["valid"] = True
     return packed, diag
 
 
 class FaceLandmarkExtractor:
-    """478 face-mesh points (468 mesh + 10 iris) + the head-pose matrix. Same MediaPipe settings as gaze_intent.py."""
+    """478 face-mesh points (468 mesh + 10 iris) + head-pose matrix + 8 eye blendshapes."""
 
     def __init__(self):
         options = vision.FaceLandmarkerOptions(
@@ -269,6 +343,7 @@ class FaceLandmarkExtractor:
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
+            output_face_blendshapes=True,                    # eyeBlink/LookDown/Squint/Wide for HybridBlinkDetector
             output_facial_transformation_matrixes=True,      # head pose, needed by the gaze models
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
@@ -278,7 +353,8 @@ class FaceLandmarkExtractor:
         result = self.detector.detect_for_video(mp_image, int(timestamp_ms))
         if not result.face_landmarks or not result.facial_transformation_matrixes:
             return _EMPTY
-        packed, _ = pack_face(result.face_landmarks[0], result.facial_transformation_matrixes[0])
+        bs = result.face_blendshapes[0] if getattr(result, "face_blendshapes", None) else None
+        packed, _ = pack_face(result.face_landmarks[0], result.facial_transformation_matrixes[0], bs)
         return packed
 
     def shutdown(self):

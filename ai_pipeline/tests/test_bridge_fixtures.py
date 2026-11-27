@@ -106,3 +106,79 @@ def test_pack_face_rejects_nonfinite_and_recovers():
     # Next clean frame recovers immediately
     p, d = le.pack_face(lms(478), pose)
     assert p.shape == (484, 3) and d["valid"] and d["packed_n"] == 484
+
+
+class _BS:
+    def __init__(self, category_name: str, score: float):
+        self.category_name = category_name
+        self.score = score
+
+
+def _make_eye_blendshapes(**overrides: float):
+    base = {
+        "eyeBlinkRight": 0.05,
+        "eyeBlinkLeft": 0.06,
+        "eyeLookDownRight": 0.10,
+        "eyeLookDownLeft": 0.11,
+        "eyeSquintRight": 0.04,
+        "eyeSquintLeft": 0.03,
+        "eyeWideRight": 0.02,
+        "eyeWideLeft": 0.01,
+    }
+    base.update(overrides)
+    return [_BS(k, v) for k, v in base.items()]
+
+
+def test_pack_face_with_eye_blendshapes_and_canonical_polarity():
+    pose = np.eye(4, dtype=np.float32)
+    bs = _make_eye_blendshapes(eyeBlinkRight=0.82, eyeBlinkLeft=0.14)
+    packed, diag = le.pack_face(lms(478), pose, bs)
+    assert packed.shape == (487, 3) and packed.dtype == np.float32
+    assert diag["valid"] and diag["packed_n"] == 487 and diag["has_blendshapes"] is True
+    assert np.isfinite(packed).all()
+
+    # Canonical eye-aligned polarity lock (empirically verified on mirrored + unflipped frames):
+    # slot 0 (bs_blink_l -> image-left LEFT_EYE -> state=1 Left Click) = eyeBlinkRight
+    # slot 1 (bs_blink_r -> image-right RIGHT_EYE -> state=2 Right Click) = eyeBlinkLeft
+    assert np.isclose(packed[484, 0], 0.82, atol=1e-6)
+    assert np.isclose(packed[484, 1], 0.14, atol=1e-6)
+    assert np.isclose(packed[484, 2], 0.10, atol=1e-6)  # eyeLookDownRight -> bs_look_down_l
+    assert np.isclose(packed[485, 0], 0.11, atol=1e-6)  # eyeLookDownLeft  -> bs_look_down_r
+    assert np.isclose(packed[486, 2], 1.0, atol=1e-6)   # blendshape validity sentinel
+
+
+def test_pack_face_rejects_invalid_blendshapes_and_recovers():
+    pose = np.eye(4, dtype=np.float32)
+
+    # Missing required blendshape channel
+    incomplete = [b for b in _make_eye_blendshapes() if b.category_name != "eyeBlinkRight"]
+    p, d = le.pack_face(lms(478), pose, incomplete)
+    assert p.shape == (0, 3) and not d["valid"] and d["reason"] == "blendshapes"
+
+    # Non-finite and out-of-[0, 1] range blendshape values
+    for bad_val in (float("nan"), float("inf"), float("-inf"), -0.01, 1.01):
+        bs = _make_eye_blendshapes(eyeBlinkLeft=bad_val)
+        p, d = le.pack_face(lms(478), pose, bs)
+        assert p.shape == (0, 3) and not d["valid"] and d["reason"] == "blendshapes"
+
+    # Clean recovery
+    p, d = le.pack_face(lms(478), pose, _make_eye_blendshapes())
+    assert p.shape == (487, 3) and d["valid"]
+
+
+def test_pack_face_blendshape_float_tolerance_and_clamping():
+    pose = np.eye(4, dtype=np.float32)
+
+    # Minor TFLite / float32 rounding overshoot within [-1e-4, 1.0 + 1e-4] is accepted and clamped to [0, 1]
+    bs_tol = _make_eye_blendshapes(eyeBlinkRight=-1e-6, eyeBlinkLeft=1.0000001)
+    p, d = le.pack_face(lms(478), pose, bs_tol)
+    assert p.shape == (487, 3) and d["valid"] and d["packed_n"] == 487
+    assert p[484, 0] == 0.0 and p[484, 1] == 1.0
+    assert np.isclose(p[486, 2], 1.0, atol=1e-6)
+
+    # Genuine out-of-range values beyond +-1e-4 still reject the whole face observation
+    for bad_val in (-0.01, -2e-4, 1.0 + 2e-4, 1.01):
+        bs_bad = _make_eye_blendshapes(eyeBlinkRight=bad_val)
+        p_bad, d_bad = le.pack_face(lms(478), pose, bs_bad)
+        assert p_bad.shape == (0, 3) and not d_bad["valid"] and d_bad["reason"] == "blendshapes"
+

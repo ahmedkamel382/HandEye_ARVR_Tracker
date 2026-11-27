@@ -134,6 +134,8 @@ struct Config {
     std::string filter  = "auto";           // auto | dsp (Eng 4) | builtin
     std::vector<double> hand_filter, gaze_filter;   // optional "min_cutoff,beta,d_cutoff" overrides (Hz, -, Hz)
     std::string gaze_diag_log;                      // optional per-frame gaze diagnostic CSV (--gaze-diag-log FILE.csv)
+    std::string blink_diag_log;                     // optional per-frame blink diagnostic CSV (--blink-diag-log FILE.csv)
+    std::string blink_mode = "hybrid";              // hybrid | legacy (default hybrid; legacy uses gesture_model.dll)
     std::string dsp_record_dir;             // opt-in numerical diagnostics; empty = no recorder
     core::HandParams   hand;
 };
@@ -384,13 +386,16 @@ void aiBody(Pipeline& P) {
         P.ai_failed.store(true);
         return;
     }
+    const core::BlinkMode blink_mode =
+        (cfg.blink_mode == "legacy") ? core::BlinkMode::LegacyForest : core::BlinkMode::Hybrid;
     std::printf("[ai] ready | gaze: %s | hand: %s%s\n",
-                cfg.use_gaze ? (std::string("face landmarks + native math, models = ") + gaze_models.wink->name() + " + pitch/yaw").c_str() : "off",
+                cfg.use_gaze ? (std::string("face landmarks + native math, blink = ") + cfg.blink_mode +
+                                ", models = " + gaze_models.wink->name() + " + pitch/yaw").c_str() : "off",
                 cfg.use_hand ? (std::string("hand landmarks + native features, model = ") + hand_model->name()).c_str() : "off",
                 cfg.hand_roi > 0 ? " | hand ROI crop ON" : "");
     P.ai_ready.store(true);
 
-    core::GazeNative gaze(gaze_models.wink.get(), gaze_models.pitch.get(), gaze_models.yaw.get());
+    core::GazeNative gaze(gaze_models.wink.get(), gaze_models.pitch.get(), gaze_models.yaw.get(), 30, 10, blink_mode);
     core::HandNative handn(hand_model.get(), cfg.hand);
     const cv::Size fs = P.pool.size();
     const int roi = std::min({cfg.hand_roi, fs.width, fs.height});
@@ -399,7 +404,7 @@ void aiBody(Pipeline& P) {
     bool hand_valid = false;                         // ROI state lives here: the AI thread is its only user
     float last_hx = 0.f, last_hy = 0.f;
     std::vector<float> face_pts, hand_pts;           // reused buffers: no per-frame allocation after warm-up
-    face_pts.reserve(size_t(core::GazeNative::kPacked) * 3);
+    face_pts.reserve(size_t(core::GazeNative::kPackedWithBlendshapes) * 3);
     hand_pts.reserve(size_t(core::kHandPacked) * 3);
 
     std::ofstream gaze_diag_out;
@@ -412,6 +417,17 @@ void aiBody(Pipeline& P) {
         }
     }
     const bool log_gaze_diag = gaze_diag_out.is_open();
+
+    std::ofstream blink_diag_out;
+    if (!cfg.blink_diag_log.empty()) {
+        blink_diag_out.open(cfg.blink_diag_log, std::ios::out | std::ios::trunc);
+        if (!blink_diag_out.is_open()) {
+            std::fprintf(stderr, "[warning] could not open --blink-diag-log file: %s\n", cfg.blink_diag_log.c_str());
+        } else {
+            blink_diag_out << core::kBlinkDiagCsvHeader << '\n';
+        }
+    }
+    const bool log_blink_diag = blink_diag_out.is_open();
 
     int64_t last_ts = -1;
     uint64_t err_printed = 0;
@@ -445,16 +461,36 @@ void aiBody(Pipeline& P) {
         if (cfg.use_gaze) {
             const auto t_g = Clock::now();
             const int n = face.call(frame, ts, face_pts);
-            if (!cfg.dsp_record_dir.empty()) r.gaze_landmarks = n;
+            if (!cfg.dsp_record_dir.empty()) {
+                // dsp_filter/evaluation/import_vs_trace.py:103 and evaluate_holds.py:161 strictly assert
+                // gaze_landmarks in (-1, 0, 484) without modifying dsp_filter/. Normalize 487 -> 484 here;
+                // --blink-diag-log exposes the active payload regime via detector_mode ('hybrid_bs_ear' vs 'hybrid_ear_only').
+                r.gaze_landmarks = (n == core::GazeNative::kPackedWithBlendshapes)
+                                       ? core::GazeNative::kPacked
+                                       : n;
+            }
+            core::GazeDiagRow diag_row;
+            core::BlinkDiagRow blink_row;
+            core::GazeDiagRow* diag_ptr = log_gaze_diag ? &diag_row : nullptr;
+            core::BlinkDiagRow* blink_ptr = log_blink_diag ? &blink_row : nullptr;
+            if (n >= 0) {
+                r.gaze = gaze.process(face_pts.data(), n, fs.width, fs.height, diag_ptr, ts, blink_ptr, r.capture_s);
+            } else {
+                // P0 fix: n == -1 (Python exception) must also reset GazeNative's temporal blink state, matching n == 0.
+                gaze.process(nullptr, 0, fs.width, fs.height, diag_ptr, ts, blink_ptr, r.capture_s);
+                r.gaze = core::ModuleOut{};
+            }
             if (log_gaze_diag) {
-                core::GazeDiagRow diag_row;
-                r.gaze = (n >= 0) ? gaze.process(face_pts.data(), n, fs.width, fs.height, &diag_row) : core::ModuleOut{};
                 diag_row.frame_id = r.frame_id;
                 diag_row.ts_ms = r.ts_ms;
                 diag_row.capture_s = r.capture_s;
                 gaze_diag_out << core::formatGazeDiagCsvRow(diag_row) << '\n';
-            } else {
-                r.gaze = (n >= 0) ? gaze.process(face_pts.data(), n, fs.width, fs.height) : core::ModuleOut{};
+            }
+            if (log_blink_diag) {
+                blink_row.frame_id = r.frame_id;
+                blink_row.ts_ms = r.ts_ms;
+                blink_row.capture_s = r.capture_s;
+                blink_diag_out << core::formatBlinkDiagCsvRow(blink_row) << '\n';
             }
             r.gaze_ms = usBetween(t_g, Clock::now()) / 1000.0;
         }
@@ -515,6 +551,10 @@ void aiBody(Pipeline& P) {
         gaze_diag_out.flush();
         gaze_diag_out.close();
     }
+    if (log_blink_diag) {
+        blink_diag_out.flush();
+        blink_diag_out.close();
+    }
     if (cfg.preview) cv::destroyAllWindows();
     face.shutdown();                                           // releases MediaPipe resources
     hand.shutdown();
@@ -537,6 +577,8 @@ void usage() {
 "modules:  --no-gaze | --no-hand | --hand-roi N (experimental crop) | --gaze-models DIR (default <ai-root>/gaze_intent/models)\n"
 "          --hand-forest auto|treelite|sklearn | --hand-model FILE.pkl (default assets/hand_gesture_rf.pkl)\n"
 "          --gaze-diag-log FILE.csv (optional per-frame gaze diagnostic CSV; disabled by default)\n"
+"          --blink-diag-log FILE.csv (optional per-frame blink v2 diagnostic CSV; disabled by default)\n"
+"          --blink-mode hybrid|legacy (default hybrid; legacy uses gesture_model.dll)\n"
 "hand:     --hand-anchor tip|knuckle|mid   (pointer source, margins and calibration: tray app / os_integration.ini)\n"
 "filter:   --filter auto|dsp|builtin (auto = Eng 4's dsp_filter when compiled in) | --no-filter\n"
 "          --hand-filter MIN,BETA,DCUT | --gaze-filter MIN,BETA,DCUT   (Hz, -, Hz; tune with real recordings)\n"
@@ -628,6 +670,14 @@ Config parseArgs(int argc, char** argv, bool& ok) {
         else if (a == "--site")           c.site = next();
         else if (a == "--gaze-models")    c.gaze_models = next();
         else if (a == "--gaze-diag-log")  { c.gaze_diag_log = next(); if (c.gaze_diag_log.empty()) { std::fprintf(stderr, "--gaze-diag-log needs FILE.csv\n"); ok = false; } }
+        else if (a == "--blink-diag-log") { c.blink_diag_log = next(); if (c.blink_diag_log.empty()) { std::fprintf(stderr, "--blink-diag-log needs FILE.csv\n"); ok = false; } }
+        else if (a == "--blink-mode") {
+            c.blink_mode = next();
+            if (c.blink_mode != "hybrid" && c.blink_mode != "legacy") {
+                std::fprintf(stderr, "--blink-mode must be hybrid or legacy\n");
+                ok = false;
+            }
+        }
         else if (a == "--selftest-hand-forest") c.selftest_hand = next();
         else if (a == "--hand-forest")    c.hand_forest = next();
         else if (a == "--hand-model")     c.hand_model = next();

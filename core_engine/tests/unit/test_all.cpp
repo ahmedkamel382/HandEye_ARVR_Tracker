@@ -233,9 +233,15 @@ static void t_hand_anchor_clamp_and_fallback() {
 struct FacePts {
     std::vector<float> p = std::vector<float>(GazeNative::kPacked * 3, 0.f);
     static constexpr int W = 640, H = 480;
-    int count() const { return GazeNative::kPacked; }
+    int count() const { return static_cast<int>(p.size() / 3); }
     void set(int i, double x, double y) { p[3 * i] = float(x); p[3 * i + 1] = float(y); p[3 * i + 2] = 0.f; }
     void setPose(const float(&m)[16]) { for (int i = 0; i < 16; ++i) p[3 * GazeNative::kFacePoints + i] = m[i]; }
+    void setBlendshapes(const float(&bs)[8], float sentinel = GazeNative::kBlendshapeMarker) {
+        p.resize(GazeNative::kPackedWithBlendshapes * 3, 0.f);
+        const size_t base = static_cast<size_t>(GazeNative::kPacked) * 3;
+        for (int i = 0; i < 8; ++i) p[base + static_cast<size_t>(i)] = bs[i];
+        p[base + 8] = sentinel;
+    }
     void eye(const int(&i)[6], double x0, double y0, double ear) {
         const double w = 64.0;                             // eye width in pixels
         const double v = ear * w;                          // each vertical gap in pixels
@@ -263,15 +269,18 @@ struct GazeRig {
     LambdaForest wink{ [this](const float* f) { for (int i = 0; i < kGazeFeatures; ++i) wink_in[i] = f[i]; ++wink_calls; return 0; } };
     LambdaRegressor pitch{ [this](const float* f) { for (int i = 0; i < kPoseFeatures; ++i) pose_in[i] = f[i]; return pitch_out; } };
     LambdaRegressor yaw{ [this](const float*) { return yaw_out; } };
-    GazeNative g{ &wink, &pitch, &yaw };
-    ModuleOut run(const FacePts& f) { return g.process(f.p.data(), f.count(), FacePts::W, FacePts::H); }
-    void calibrate(const FacePts& f) { for (int i = 0; i < 30; ++i) run(f); }
+    GazeNative g;
+    explicit GazeRig(BlinkMode mode = BlinkMode::Hybrid) : g(&wink, &pitch, &yaw, 30, 10, mode) {}
+    ModuleOut run(const FacePts& f, int64_t ts_ms = -1, BlinkDiagRow* bdiag = nullptr, double capture_s = -1.0) {
+        return g.process(f.p.data(), f.count(), FacePts::W, FacePts::H, nullptr, ts_ms, bdiag, capture_s);
+    }
+    void calibrate(const FacePts& f) { for (int i = 0; i < 30; ++i) run(f, (i + 1) * 33); }
 };
 static bool all_angles_nan(const ModuleOut& o) {
     return std::isnan(o.yaw_deg) && std::isnan(o.pitch_deg) && std::isnan(o.head_yaw_deg) && std::isnan(o.head_pitch_deg);
 }
 static void t_gaze_calibration_and_features() {
-    GazeRig r;
+    GazeRig r(BlinkMode::LegacyForest);
     FacePts open(0.30, 0.30);
     for (int i = 0; i < 29; ++i) {
         ModuleOut o = r.run(open);
@@ -296,6 +305,13 @@ static void t_gaze_calibration_and_features() {
     CHECK_NEAR(r.wink_in[0], 0.25, 1e-3);
     CHECK_NEAR(r.wink_in[3], 1.0, 1e-3);
     CHECK_NEAR(r.wink_in[1], 0.25, 1e-3);                                  // min over the window drops immediately
+
+    // Default BlinkMode::Hybrid calibrates in 30 frames and does not invoke legacy forest
+    GazeRig rh;
+    rh.calibrate(open);
+    CHECK(rh.g.calibrated() && rh.wink_calls == 0);
+    ModuleOut oh = rh.run(open, 1000);
+    CHECK(oh.detected() && oh.state == 0 && rh.wink_calls == 0);
 }
 static void t_gaze_no_face_and_recalibrate() {
     GazeRig r;
@@ -327,7 +343,7 @@ static void t_gaze_calibration_ignores_zero_ear() {
 // EarFeatureState.reset_tracking_state(): face lost -> history cleared; unfinished calibration restarts; finished one kept.
 static void t_gaze_face_loss_resets_tracking_state() {
     {   // unfinished calibration restarts, and the baseline is built only from the frames after the loss
-        GazeRig r;
+        GazeRig r(BlinkMode::LegacyForest);
         FacePts dim(0.15, 0.15), open(0.30, 0.30);
         for (int i = 0; i < 20; ++i) r.run(dim);
         ModuleOut lost = r.g.process(nullptr, 0, 640, 480);
@@ -340,7 +356,7 @@ static void t_gaze_face_loss_resets_tracking_state() {
         CHECK_NEAR(r.wink_in[0], 1.0, 1e-4);                               // baseline 0.30 only (a mixed baseline would give ~1.5)
     }
     {   // calibrated: the rolling window is cleared, the baseline survives
-        GazeRig r;
+        GazeRig r(BlinkMode::LegacyForest);
         FacePts open(0.30, 0.30), wink(0.075, 0.30);
         r.calibrate(open);
         r.run(open);
@@ -988,7 +1004,7 @@ static void t_gaze_nonfinite_never_fresh_and_recovers() {
 
     // 2. Post-calibration: NaN / +-Inf in landmarks, pose matrix, and regressor outputs + recovery.
     {
-        GazeRig r;
+        GazeRig r(BlinkMode::LegacyForest);
         OneEuroPoint flt(1.0, 8.0, 1.0);
         FreshnessGate gate;
         FacePts open(0.30, 0.30), wink(0.075, 0.30);
@@ -1077,6 +1093,221 @@ static void t_gaze_nonfinite_never_fresh_and_recovers() {
     }
 }
 
+// Hybrid Blink v2: P0 degenerate-eye & TlModel NaN safety, P1 blendshapes (n=487) bounds & polarity lock,
+// P2 poisoned startup calibration, symmetric blink guard, sympathetic squint, downward gaze immunity,
+// Schmitt hysteresis, FPS invariance, and 22-column BlinkDiagRow without altering 32-column GazeDiagRow.
+static void t_hybrid_blink_v2_safety_and_state_machine() {
+    // 1. Degenerate eye (|p1 - p4| == 0) is rejected cleanly as state == 0 (never 3 Closure)
+    {
+        GazeRig r;
+        FacePts open(0.30, 0.30);
+        r.calibrate(open);
+        FacePts deg = open;
+        deg.p[3 * 133 + 0] = deg.p[3 * 33 + 0];
+        deg.p[3 * 133 + 1] = deg.p[3 * 33 + 1];
+        deg.p[3 * 133 + 2] = deg.p[3 * 33 + 2];
+        BlinkDiagRow drow;
+        ModuleOut o = r.run(deg, 1500, &drow);
+        CHECK(!o.detected() && o.state == 0 && all_angles_nan(o));
+        CHECK(drow.detected == 0 && drow.state == 0);
+    }
+
+    // 2. n == 487 blendshapes bounds rejection (out-of-[0,1] or NaN -> state == 0) + canonical polarity lock
+    {
+        GazeRig r;
+        const float open_bs[8] = { 0.05f, 0.05f, 0.10f, 0.10f, 0.04f, 0.04f, 0.02f, 0.02f };
+        FacePts open(0.30, 0.30);
+        open.setBlendshapes(open_bs);
+        CHECK(open.count() == GazeNative::kPackedWithBlendshapes);
+
+        // Interleave 10 blink-poisoned frames during startup -> rejected, 30 open frames finish calibration
+        int64_t ts = 0;
+        const float blink_bs[8] = { 0.88f, 0.88f, 0.10f, 0.10f, 0.10f, 0.10f, 0.0f, 0.0f };
+        FacePts blink_f(0.08, 0.08);
+        blink_f.setBlendshapes(blink_bs);
+        for (int i = 0; i < 40; ++i) {
+            ts += 33;
+            r.run((i % 4 == 0) ? blink_f : open, ts);
+        }
+        CHECK(r.g.calibrated());
+        BlinkDiagRow base_row;
+        ts += 33;
+        r.run(open, ts, &base_row);
+        CHECK_NEAR(base_row.base_ear_l, 0.30, 1e-4);
+        CHECK_NEAR(base_row.base_ear_r, 0.30, 1e-4);
+
+        // Out-of-range blendshape rejected cleanly
+        FacePts bad_bs = open;
+        const float oob[8] = { 1.25f, 0.05f, 0.10f, 0.10f, 0.04f, 0.04f, 0.02f, 0.02f };
+        bad_bs.setBlendshapes(oob);
+        ts += 33;
+        ModuleOut obad = r.run(bad_bs, ts);
+        CHECK(!obad.detected() && obad.state == 0);
+
+        // Slot 0 (bs_blink_l = eyeBlinkRight) + LEFT_EYE -> state == 1 (Left Wink / Left Click)
+        FacePts left_w(0.08, 0.30);
+        const float lbs[8] = { 0.85f, 0.05f, 0.10f, 0.10f, 0.25f, 0.04f, 0.0f, 0.02f };
+        left_w.setBlendshapes(lbs);
+        ModuleOut ol;
+        BlinkDiagRow brow;
+        for (int i = 0; i < 6; ++i) { ts += 33; ol = r.run(left_w, ts, &brow); }
+        CHECK(ol.detected() && ol.state == 1);
+        CHECK(brow.detected == 1 && brow.state == 1 && std::string(brow.detector_mode) == "hybrid_bs_ear");
+        CHECK(split_csv(kBlinkDiagCsvHeader).size() == 22);
+        CHECK(split_csv(formatBlinkDiagCsvRow(brow)).size() == 22);
+
+        // Back to neutral
+        for (int i = 0; i < 6; ++i) { ts += 33; r.run(open, ts); }
+
+        // Slot 1 (bs_blink_r = eyeBlinkLeft) + RIGHT_EYE -> state == 2 (Right Wink / Right Click)
+        FacePts right_w(0.30, 0.08);
+        const float rbs[8] = { 0.05f, 0.85f, 0.10f, 0.10f, 0.04f, 0.25f, 0.02f, 0.0f };
+        right_w.setBlendshapes(rbs);
+        ModuleOut orw;
+        for (int i = 0; i < 6; ++i) { ts += 33; orw = r.run(right_w, ts); }
+        CHECK(orw.detected() && orw.state == 2);
+
+        // Back to neutral
+        for (int i = 0; i < 6; ++i) { ts += 33; r.run(open, ts); }
+
+        // Sympathetic squint left wink (c_L high, c_R moderate) -> state == 1
+        FacePts symp(0.08, 0.18);
+        const float sbs[8] = { 0.88f, 0.50f, 0.10f, 0.10f, 0.30f, 0.20f, 0.0f, 0.0f };
+        symp.setBlendshapes(sbs);
+        ModuleOut osymp;
+        for (int i = 0; i < 8; ++i) { ts += 33; osymp = r.run(symp, ts); }
+        CHECK(osymp.state == 1);
+
+        // Back to neutral
+        for (int i = 0; i < 6; ++i) { ts += 33; r.run(open, ts); }
+
+        // Symmetric blink never emits 1 or 2
+        for (int i = 0; i < 6; ++i) {
+            ts += 33;
+            ModuleOut ob = r.run(blink_f, ts);
+            CHECK(ob.state == 0 || ob.state == 3);
+        }
+
+        // Back to neutral
+        for (int i = 0; i < 6; ++i) { ts += 33; r.run(open, ts); }
+
+        // Downward gaze (lookDown=0.65, pitch=+10 deg, mild EAR droop 0.21) -> stays 0
+        FacePts down_f(0.21, 0.21);
+        constexpr double D = 3.14159265358979323846 / 180.0;
+        const float c10 = float(std::cos(10 * D)), s10 = float(std::sin(10 * D));
+        const float rx10[16] = { 1, 0, 0, 0, 0, c10, -s10, 0, 0, s10, c10, 0, 0, 0, 0, 1 };
+        down_f.setPose(rx10);
+        const float dbs[8] = { 0.24f, 0.24f, 0.65f, 0.65f, 0.05f, 0.05f, 0.0f, 0.0f };
+        down_f.setBlendshapes(dbs);
+        for (int i = 0; i < 12; ++i) {
+            ts += 33;
+            ModuleOut od = r.run(down_f, ts);
+            CHECK(od.state == 0);
+        }
+
+        // Back to neutral
+        for (int i = 0; i < 6; ++i) { ts += 33; r.run(open, ts); }
+
+        // Real quick left wink with elevated MediaPipe eyeLookDown=0.55 (eyelid-descent artifact):
+        // open-eye lookDown gate releases penalty when norm_ear=0.30, and 15ms attack EMA enters state==1 within <=2 frames!
+        FacePts ld_wink(0.09, 0.23);
+        const float ldw_bs[8] = { 0.50f, 0.34f, 0.55f, 0.55f, 0.68f, 0.34f, 0.0f, 0.0f };
+        ld_wink.setBlendshapes(ldw_bs);
+        bool entered_fast = false;
+        for (int i = 0; i < 2; ++i) {
+            ts += 33;
+            ModuleOut ow = r.run(ld_wink, ts);
+            if (ow.state == 1) entered_fast = true;
+        }
+        CHECK(entered_fast);
+
+        // Blendshape float32 rounding tolerance [-1e-4, 1+1e-4] accepted & clamped to [0, 1]; outside rejected
+        {
+            FacePts tol_f(0.30, 0.30);
+            const float tbs[8] = { -1e-6f, 1.0000001f, 0.10f, 0.10f, 0.04f, 0.04f, 0.02f, 0.02f };
+            tol_f.setBlendshapes(tbs, 1.0f + 1e-6f);
+            BlinkDiagRow trow;
+            ts += 33;
+            ModuleOut otol = r.run(tol_f, ts, &trow);
+            CHECK(otol.detected());
+            CHECK_NEAR(trow.bs_blink_l, 0.0, 1e-12);
+            CHECK_NEAR(trow.bs_blink_r, 1.0, 1e-12);
+
+            for (float bad_v : { -0.01f, -2e-4f, 1.0002f, 1.01f }) {
+                FacePts oob_f(0.30, 0.30);
+                const float bbs[8] = { bad_v, 0.05f, 0.10f, 0.10f, 0.04f, 0.04f, 0.02f, 0.02f };
+                oob_f.setBlendshapes(bbs);
+                ts += 33;
+                ModuleOut oob_out = r.run(oob_f, ts);
+                CHECK(!oob_out.detected() && oob_out.state == 0);
+            }
+        }
+
+        // Row-486 col-2 (slot 8) validity sentinel enforcement: 0.0f, 2.0f, NaN MUST be rejected
+        {
+            const float nan_f = std::numeric_limits<float>::quiet_NaN();
+            for (float bad_marker : { 0.0f, 2.0f, nan_f }) {
+                FacePts bad_m(0.30, 0.30);
+                bad_m.setBlendshapes(open_bs, bad_marker);
+                ts += 33;
+                ModuleOut om = r.run(bad_m, ts);
+                CHECK(!om.detected() && om.state == 0);
+            }
+        }
+    }
+
+    // 3. Real capture_s drives wall-clock EMA (and >250ms gap reset) even when artificial ts_ms ticks by +1 ms
+    {
+        GazeRig r;
+        const float open_bs[8] = { 0.05f, 0.05f, 0.10f, 0.10f, 0.04f, 0.04f, 0.02f, 0.02f };
+        FacePts open(0.30, 0.30);
+        open.setBlendshapes(open_bs);
+        r.calibrate(open);
+
+        // Seed smooth state at capture_s = 1.000, ts_ms = 1000
+        BlinkDiagRow row0;
+        r.run(open, 1000, &row0, 1.000);
+        CHECK_NEAR(row0.score_l, 0.0, 1e-6);
+
+        // Step ts_ms by artificial +1 ms (1001), while real capture_s advances +0.080 s (1.080):
+        // With capture_s dt=0.080s and tau_attack=0.015s -> alpha = 1 - exp(-0.080/0.015) = 0.9952 (enters state 1 immediately).
+        // If ts_ms dt=0.001s had been used -> alpha = 0.0645 (score would stay < 0.07, state 0).
+        FacePts left_w(0.08, 0.30);
+        const float lbs[8] = { 0.85f, 0.05f, 0.10f, 0.10f, 0.25f, 0.04f, 0.0f, 0.02f };
+        left_w.setBlendshapes(lbs);
+        BlinkDiagRow row1;
+        ModuleOut o1 = r.run(left_w, 1001, &row1, 1.080);
+        CHECK(o1.detected() && o1.state == 1 && row1.score_l > 0.80);
+
+        // Now advance ts_ms by only +1 ms (1002), while real capture_s jumps +0.300 s (> 0.250 s gap):
+        // EMA MUST reset immediately to raw_score (~0.0 on open eye) and state == 0.
+        BlinkDiagRow row2;
+        ModuleOut o2 = r.run(open, 1002, &row2, 1.380);
+        CHECK(o2.detected() && o2.state == 0 && row2.score_l < 0.01);
+    }
+
+    // 4. BlinkMode::LegacyForest invokes legacy wink forest and reports detector_mode == "legacy_rf"
+    {
+        GazeRig r(BlinkMode::LegacyForest);
+        FacePts open(0.30, 0.30);
+        r.calibrate(open);
+        BlinkDiagRow lrow;
+        ModuleOut ol = r.run(open, 1000, &lrow, 1.0);
+        CHECK(ol.detected() && ol.state == 0 && r.wink_calls == 1);
+        CHECK(std::string(lrow.detector_mode) == "legacy_rf");
+    }
+
+    // 5. TlModel::classify rejects NaN features cleanly -> returns 0 Neutral (never 3 Closure)
+    {
+        const std::string dir = resolve_gaze_models_dir();
+        if (!dir.empty() && std::filesystem::exists(dir + "/gesture_model.dll")) {
+            TlForest f(dir + "/gesture_model.dll");
+            const float nan_feat[6] = { std::numeric_limits<float>::quiet_NaN(), 1.f, 0.f, 1.f, 1.f, 0.f };
+            CHECK(f.predict(nan_feat) == 0);
+        }
+    }
+}
+
 int main() {
     struct T { const char* name; void (*fn)(); };
     const T tests[] = {
@@ -1104,6 +1335,7 @@ int main() {
         { "gaze: head pose added, raw absolute", t_gaze_adds_head_pose_and_outputs_raw },
         { "gaze: diag OFF vs ON + 32-col CSV reconstruction (shipped DLLs)", t_gaze_diag_shipped_dlls },
         { "gaze: absent DLL error + fallback diag OFF vs ON + CSV reconstruction", t_gaze_absent_dll_and_fallback_diag },
+        { "blink v2: hybrid safety, blendshapes, polarity, hysteresis, 22-col CSV", t_hybrid_blink_v2_safety_and_state_machine },
     };
     int failed_tests = 0;
     for (const T& t : tests) {

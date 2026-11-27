@@ -7,6 +7,7 @@
 //
 // Windows only (it is a .dll). Elsewhere the constructor throws.
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
@@ -83,7 +84,24 @@ public:
     TlModel& operator=(const TlModel&) = delete;
 
     // Class with the highest score (first one wins a tie, like numpy.argmax).
-    int classify(const float* f) { run(f); int best = 0; for (int k = 1; k < n_class_; ++k) if (value(k) > value(best)) best = k; return best; }
+    // P0 safety guard: any non-finite input feature or non-finite leaf output defaults safely to 0 (Neutral),
+    // preventing Treelite's default-left NaN branch from ever firing class 3 (Sustained Closure).
+    int classify(const float* f) {
+        if (!f || n_feat_ <= 0 || n_class_ <= 0) return 0;
+        for (int i = 0; i < n_feat_; ++i) {
+            if (!std::isfinite(f[i])) return 0;
+        }
+        run(f);
+        double best_v = value(0);
+        if (!std::isfinite(best_v)) return 0;
+        int best = 0;
+        for (int k = 1; k < n_class_; ++k) {
+            const double vk = value(k);
+            if (!std::isfinite(vk)) return 0;
+            if (vk > best_v) { best_v = vk; best = k; }
+        }
+        return (best >= 0 && best < n_class_) ? best : 0;
+    }
     double regress(const float* f) { run(f); return value(0); }
     const std::string& path() const { return path_; }
 

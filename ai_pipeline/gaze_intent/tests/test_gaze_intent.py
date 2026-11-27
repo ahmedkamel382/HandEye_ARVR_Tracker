@@ -813,9 +813,12 @@ class TestHybridBlinkV2AndSafety:
         assert spec["calibration"]["calibration_frames"] == CALIBRATION_FRAMES
         assert math.isclose(spec["closure_scoring"]["fusion_weight_bs"], gi.HYBRID_FUSION_W_BS, abs_tol=1e-12)
         assert math.isclose(spec["closure_scoring"]["fusion_weight_ear"], gi.HYBRID_FUSION_W_EAR, abs_tol=1e-12)
+        assert math.isclose(spec["closure_scoring"]["lookdown_gate_ear_lo"], gi.HYBRID_LD_GATE_EAR_LO, abs_tol=1e-12)
+        assert math.isclose(spec["closure_scoring"]["lookdown_gate_ear_hi"], gi.HYBRID_LD_GATE_EAR_HI, abs_tol=1e-12)
         assert math.isclose(spec["hysteresis"]["close_thresh"], gi.HYBRID_CLOSE_THRESH, abs_tol=1e-12)
         assert math.isclose(spec["hysteresis"]["open_thresh"], gi.HYBRID_OPEN_THRESH, abs_tol=1e-12)
-        assert math.isclose(spec["temporal_smoothing"]["ema_tau_seconds"], gi.HYBRID_EMA_TAU_S, abs_tol=1e-12)
+        assert math.isclose(spec["temporal_smoothing"]["ema_tau_attack_seconds"], gi.HYBRID_EMA_TAU_ATTACK_S, abs_tol=1e-12)
+        assert math.isclose(spec["temporal_smoothing"]["ema_tau_release_seconds"], gi.HYBRID_EMA_TAU_RELEASE_S, abs_tol=1e-12)
 
     def test_degenerate_eye_and_legacy_nan_guard_never_emit_closure(self, mocked_gaze_tracker):
         tracker, stub = mocked_gaze_tracker
@@ -1004,4 +1007,30 @@ class TestHybridBlinkV2AndSafety:
         assert active_b["detected"] == "1"
         assert active_b["state"] == "0"
 
+    def test_open_eye_lookdown_gate_and_asymmetric_fast_attack_ema(self):
+        d = HybridBlinkDetector()
+        for _ in range(CALIBRATION_FRAMES):
+            d.update_calibration(0.30, 0.30, -4.0, -0.08, (0.11, 0.18, 0.32, 0.34, 0.32, 0.26, 0.0, 0.0))
+        assert d.is_calibrated
 
+        # 1. Start from neutral open-eye frame
+        ts = 1000
+        st0, cl0, cr0, *_ = d.step(0.30, 0.30, -4.0, -0.08, ts, (0.11, 0.18, 0.32, 0.34, 0.32, 0.26, 0.0, 0.0))
+        assert st0 == 0 and cl0 < 0.05 and cr0 < 0.05
+
+        # 2. Real quick left wink with elevated bs_lookdown=0.55 (eyelid-descent artifact):
+        #    MUST enter state=1 within <=2 frames (<=66 ms) and NEVER be suppressed by bs_lookdown.
+        entered_frame = None
+        for f_idx in range(1, 5):
+            ts += 33
+            st, cl, cr, *_ = d.step(0.09, 0.23, -4.0, -0.03, ts, (0.50, 0.34, 0.55, 0.55, 0.68, 0.34, 0.0, 0.0))
+            if st == 1 and entered_frame is None:
+                entered_frame = f_idx
+        assert entered_frame is not None and entered_frame <= 2, f"Slow/missed wink onset: frame={entered_frame}"
+
+        # 3. Return to open-eye downward gaze (norm_ear=0.70, bs_lookdown=0.65, sy=+0.02, pitch=+10 deg):
+        #    open_gate == 1.0 -> full lookDown compensation keeps state == 0.
+        for _ in range(10):
+            ts += 33
+            st, cl, cr, *_ = d.step(0.21, 0.21, 10.0, 0.02, ts, (0.24, 0.24, 0.65, 0.65, 0.10, 0.10, 0.0, 0.0))
+        assert st == 0 and cl < gi.HYBRID_CLOSE_THRESH and cr < gi.HYBRID_CLOSE_THRESH

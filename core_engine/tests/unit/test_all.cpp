@@ -1204,6 +1204,22 @@ static void t_hybrid_blink_v2_safety_and_state_machine() {
             ModuleOut od = r.run(down_f, ts);
             CHECK(od.state == 0);
         }
+
+        // Back to neutral
+        for (int i = 0; i < 6; ++i) { ts += 33; r.run(open, ts); }
+
+        // Real quick left wink with elevated MediaPipe eyeLookDown=0.55 (eyelid-descent artifact):
+        // open-eye lookDown gate releases penalty when norm_ear=0.30, and 15ms attack EMA enters state==1 within <=2 frames!
+        FacePts ld_wink(0.09, 0.23);
+        const float ldw_bs[8] = { 0.50f, 0.34f, 0.55f, 0.55f, 0.68f, 0.34f, 0.0f, 0.0f };
+        ld_wink.setBlendshapes(ldw_bs);
+        bool entered_fast = false;
+        for (int i = 0; i < 2; ++i) {
+            ts += 33;
+            ModuleOut ow = r.run(ld_wink, ts);
+            if (ow.state == 1) entered_fast = true;
+        }
+        CHECK(entered_fast);
     }
 
     // 3. TlModel::classify rejects NaN features cleanly -> returns 0 Neutral (never 3 Closure)

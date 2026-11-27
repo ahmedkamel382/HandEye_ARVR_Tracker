@@ -501,29 +501,32 @@ namespace core {
         static constexpr double kAdaptMaxBsLookDown = 0.35;
 
         static constexpr double kBsLookDownDeadzone = 0.20;
-        static constexpr double kBsLookDownGain     = 0.25;
+        static constexpr double kBsLookDownGain     = 0.30;
         static constexpr double kBsDenomMin         = 0.35;
+        static constexpr double kLdGateEarLo        = 0.34;
+        static constexpr double kLdGateEarHi        = 0.48;
 
         static constexpr double kEarSyGain          = 0.90;
         static constexpr double kEarSyMaxDelta      = 0.20;
         static constexpr double kEarPitchGain       = 0.14;
         static constexpr double kEarPitchMaxDeg     = 25.0;
-        static constexpr double kEarLookDownGain    = 0.18;
+        static constexpr double kEarLookDownGain    = 0.24;
         static constexpr double kEarMaxDroopComp    = 0.30;
-        static constexpr double kEarOpenRef         = 0.95;
-        static constexpr double kEarClosedSpan      = 0.62;
+        static constexpr double kEarOpenRef         = 0.92;
+        static constexpr double kEarClosedSpan      = 0.55;
 
-        static constexpr double kFusionWBs          = 0.80;
-        static constexpr double kFusionWEar         = 0.20;
+        static constexpr double kFusionWBs          = 0.55;
+        static constexpr double kFusionWEar         = 0.45;
 
-        static constexpr double kEmaTauS            = 0.040;
+        static constexpr double kEmaTauAttackS      = 0.015;
+        static constexpr double kEmaTauReleaseS     = 0.030;
         static constexpr double kMaxGapS            = 0.250;
         static constexpr double kDefaultDtS         = 1.0 / 30.0;
 
-        static constexpr double kCloseThresh        = 0.52;
-        static constexpr double kOpenThresh         = 0.32;
-        static constexpr double kWinkAsymEnter      = 0.22;
-        static constexpr double kWinkAsymExit       = 0.12;
+        static constexpr double kCloseThresh        = 0.48;
+        static constexpr double kOpenThresh         = 0.30;
+        static constexpr double kWinkAsymEnter      = 0.18;
+        static constexpr double kWinkAsymExit       = 0.10;
         static constexpr double kWinkOtherMax       = 0.65;
         static constexpr double kSymBand            = 0.14;
 
@@ -606,14 +609,19 @@ namespace core {
 
             const double sy_down = clampRange(sy - base_sy_, 0.0, kEarSyMaxDelta);
             const double pitch_down = clampRange(head_pitch_deg, 0.0, kEarPitchMaxDeg) / kEarPitchMaxDeg;
-            const double ld_excess_l = has_bs ? std::max(0.0, bs_ld_l - kBsLookDownDeadzone) : 0.0;
-            const double ld_excess_r = has_bs ? std::max(0.0, bs_ld_r - kBsLookDownDeadzone) : 0.0;
+            const double base_droop = kEarSyGain * sy_down + kEarPitchGain * pitch_down;
+            const double gate_span = kLdGateEarHi - kLdGateEarLo;
+            const double open_gate_l = clampUnit(((norm_l + base_droop) - kLdGateEarLo) / gate_span);
+            const double open_gate_r = clampUnit(((norm_r + base_droop) - kLdGateEarLo) / gate_span);
+
+            const double ld_excess_l = has_bs ? (std::max(0.0, bs_ld_l - kBsLookDownDeadzone) * open_gate_l) : 0.0;
+            const double ld_excess_r = has_bs ? (std::max(0.0, bs_ld_r - kBsLookDownDeadzone) * open_gate_r) : 0.0;
 
             const double droop_l = clampRange(
-                kEarSyGain * sy_down + kEarPitchGain * pitch_down + kEarLookDownGain * ld_excess_l,
+                base_droop * open_gate_l + kEarLookDownGain * ld_excess_l,
                 0.0, kEarMaxDroopComp);
             const double droop_r = clampRange(
-                kEarSyGain * sy_down + kEarPitchGain * pitch_down + kEarLookDownGain * ld_excess_r,
+                base_droop * open_gate_r + kEarLookDownGain * ld_excess_r,
                 0.0, kEarMaxDroopComp);
             const double norm_l_comp = norm_l + droop_l;
             const double norm_r_comp = norm_r + droop_r;
@@ -650,9 +658,12 @@ namespace core {
                     eye_closed_r_ = false;
                     prev_state_ = 0;
                 } else {
-                    const double alpha = 1.0 - std::exp(-dt_s / kEmaTauS);
-                    score_l_ = score_l_ + alpha * (raw_score_l - score_l_);
-                    score_r_ = score_r_ + alpha * (raw_score_r - score_r_);
+                    const double tau_l = (raw_score_l > score_l_) ? kEmaTauAttackS : kEmaTauReleaseS;
+                    const double tau_r = (raw_score_r > score_r_) ? kEmaTauAttackS : kEmaTauReleaseS;
+                    const double alpha_l = 1.0 - std::exp(-dt_s / tau_l);
+                    const double alpha_r = 1.0 - std::exp(-dt_s / tau_r);
+                    score_l_ = score_l_ + alpha_l * (raw_score_l - score_l_);
+                    score_r_ = score_r_ + alpha_r * (raw_score_r - score_r_);
                 }
             }
             last_ts_ms_ = ts_ms;

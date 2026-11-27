@@ -46,29 +46,32 @@
   },
   "closure_scoring": {
     "bs_lookdown_deadzone": 0.20,
-    "bs_lookdown_gain": 0.25,
+    "bs_lookdown_gain": 0.30,
     "bs_denom_min": 0.35,
+    "lookdown_gate_ear_lo": 0.34,
+    "lookdown_gate_ear_hi": 0.48,
     "ear_sy_gain": 0.90,
     "ear_sy_max_delta": 0.20,
     "ear_pitch_gain": 0.14,
     "ear_pitch_max_deg": 25.0,
-    "ear_lookdown_gain": 0.18,
+    "ear_lookdown_gain": 0.24,
     "ear_max_droop_comp": 0.30,
-    "ear_open_ref": 0.95,
-    "ear_closed_span": 0.62,
-    "fusion_weight_bs": 0.80,
-    "fusion_weight_ear": 0.20
+    "ear_open_ref": 0.92,
+    "ear_closed_span": 0.55,
+    "fusion_weight_bs": 0.55,
+    "fusion_weight_ear": 0.45
   },
   "temporal_smoothing": {
-    "ema_tau_seconds": 0.040,
+    "ema_tau_attack_seconds": 0.015,
+    "ema_tau_release_seconds": 0.030,
     "max_gap_seconds": 0.250,
     "default_dt_seconds": 0.03333333333333333
   },
   "hysteresis": {
-    "close_thresh": 0.52,
-    "open_thresh": 0.32,
-    "wink_asym_enter": 0.22,
-    "wink_asym_exit": 0.12,
+    "close_thresh": 0.48,
+    "open_thresh": 0.30,
+    "wink_asym_enter": 0.18,
+    "wink_asym_exit": 0.10,
     "wink_other_max": 0.65,
     "sym_band": 0.14
   }

@@ -71,29 +71,33 @@ HYBRID_ADAPT_MAX_BS_BLINK = 0.25
 HYBRID_ADAPT_MAX_BS_LOOKDOWN = 0.35
 
 HYBRID_BS_LOOKDOWN_DEADZONE = 0.20
-HYBRID_BS_LOOKDOWN_GAIN = 0.25
+HYBRID_BS_LOOKDOWN_GAIN = 0.30
 HYBRID_BS_DENOM_MIN = 0.35
+HYBRID_LD_GATE_EAR_LO = 0.34
+HYBRID_LD_GATE_EAR_HI = 0.48
 
 HYBRID_EAR_SY_GAIN = 0.90
 HYBRID_EAR_SY_MAX_DELTA = 0.20
 HYBRID_EAR_PITCH_GAIN = 0.14
 HYBRID_EAR_PITCH_MAX_DEG = 25.0
-HYBRID_EAR_LOOKDOWN_GAIN = 0.18
+HYBRID_EAR_LOOKDOWN_GAIN = 0.24
 HYBRID_EAR_MAX_DROOP_COMP = 0.30
-HYBRID_EAR_OPEN_REF = 0.95
-HYBRID_EAR_CLOSED_SPAN = 0.62
+HYBRID_EAR_OPEN_REF = 0.92
+HYBRID_EAR_CLOSED_SPAN = 0.55
 
-HYBRID_FUSION_W_BS = 0.80
-HYBRID_FUSION_W_EAR = 0.20
+HYBRID_FUSION_W_BS = 0.55
+HYBRID_FUSION_W_EAR = 0.45
 
-HYBRID_EMA_TAU_S = 0.040
+HYBRID_EMA_TAU_ATTACK_S = 0.015
+HYBRID_EMA_TAU_RELEASE_S = 0.030
+HYBRID_EMA_TAU_S = HYBRID_EMA_TAU_RELEASE_S
 HYBRID_MAX_GAP_S = 0.250
 HYBRID_DEFAULT_DT_S = 1.0 / 30.0
 
-HYBRID_CLOSE_THRESH = 0.52
-HYBRID_OPEN_THRESH = 0.32
-HYBRID_WINK_ASYM_ENTER = 0.22
-HYBRID_WINK_ASYM_EXIT = 0.12
+HYBRID_CLOSE_THRESH = 0.48
+HYBRID_OPEN_THRESH = 0.30
+HYBRID_WINK_ASYM_ENTER = 0.18
+HYBRID_WINK_ASYM_EXIT = 0.10
 HYBRID_WINK_OTHER_MAX = 0.65
 HYBRID_SYM_BAND = 0.14
 
@@ -636,17 +640,24 @@ class HybridBlinkDetector:
         bs_ld_r = blendshapes[3] if has_bs else 0.0
 
         # 1. Pitch & downward-gaze compensated EAR closure score e_L, e_R in [0, 1]
+        # Open-eye gate: when an eye is physically closed (norm_ear + base_droop <= HYBRID_LD_GATE_EAR_LO),
+        # MediaPipe eyeLookDown rises from upper-eyelid descent rather than downward gaze and must not suppress winks.
         sy_down = _clamp(sy - self.baseline_sy, 0.0, HYBRID_EAR_SY_MAX_DELTA)
         pitch_down = _clamp(head_pitch_deg, 0.0, HYBRID_EAR_PITCH_MAX_DEG) / HYBRID_EAR_PITCH_MAX_DEG
-        ld_excess_l = max(0.0, bs_ld_l - HYBRID_BS_LOOKDOWN_DEADZONE) if has_bs else 0.0
-        ld_excess_r = max(0.0, bs_ld_r - HYBRID_BS_LOOKDOWN_DEADZONE) if has_bs else 0.0
+        base_droop = HYBRID_EAR_SY_GAIN * sy_down + HYBRID_EAR_PITCH_GAIN * pitch_down
+        gate_span = HYBRID_LD_GATE_EAR_HI - HYBRID_LD_GATE_EAR_LO
+        open_gate_l = _clamp01(((norm_l + base_droop) - HYBRID_LD_GATE_EAR_LO) / gate_span)
+        open_gate_r = _clamp01(((norm_r + base_droop) - HYBRID_LD_GATE_EAR_LO) / gate_span)
+
+        ld_excess_l = (max(0.0, bs_ld_l - HYBRID_BS_LOOKDOWN_DEADZONE) * open_gate_l) if has_bs else 0.0
+        ld_excess_r = (max(0.0, bs_ld_r - HYBRID_BS_LOOKDOWN_DEADZONE) * open_gate_r) if has_bs else 0.0
 
         droop_l = _clamp(
-            HYBRID_EAR_SY_GAIN * sy_down + HYBRID_EAR_PITCH_GAIN * pitch_down + HYBRID_EAR_LOOKDOWN_GAIN * ld_excess_l,
+            base_droop * open_gate_l + HYBRID_EAR_LOOKDOWN_GAIN * ld_excess_l,
             0.0, HYBRID_EAR_MAX_DROOP_COMP,
         )
         droop_r = _clamp(
-            HYBRID_EAR_SY_GAIN * sy_down + HYBRID_EAR_PITCH_GAIN * pitch_down + HYBRID_EAR_LOOKDOWN_GAIN * ld_excess_r,
+            base_droop * open_gate_r + HYBRID_EAR_LOOKDOWN_GAIN * ld_excess_r,
             0.0, HYBRID_EAR_MAX_DROOP_COMP,
         )
         norm_l_comp = norm_l + droop_l
@@ -655,7 +666,7 @@ class HybridBlinkDetector:
         ear_score_l = _clamp01((HYBRID_EAR_OPEN_REF - norm_l_comp) / HYBRID_EAR_CLOSED_SPAN)
         ear_score_r = _clamp01((HYBRID_EAR_OPEN_REF - norm_r_comp) / HYBRID_EAR_CLOSED_SPAN)
 
-        # 2. Primary blendshape score (resting-baseline-subtracted + lookDown compensated) + EAR fusion
+        # 2. Primary blendshape score (resting-baseline-subtracted + open-gated lookDown) + EAR fusion
         if has_bs:
             denom_l = max(HYBRID_BS_DENOM_MIN, 1.0 - self.baseline_bs_left)
             denom_r = max(HYBRID_BS_DENOM_MIN, 1.0 - self.baseline_bs_right)
@@ -669,7 +680,7 @@ class HybridBlinkDetector:
             raw_score_r = ear_score_r
             mode = "hybrid_ear_only"
 
-        # 3. Wall-clock EMA smoothing (FPS- and frame-skip-invariant)
+        # 3. Asymmetric attack/release wall-clock EMA smoothing (fast 15 ms onset, crisp 30 ms release)
         if not self._has_smooth:
             self.score_l = raw_score_l
             self.score_r = raw_score_r
@@ -686,9 +697,12 @@ class HybridBlinkDetector:
                 self._eye_closed_r = False
                 self.prev_state = 0
             else:
-                alpha = 1.0 - math.exp(-dt_s / HYBRID_EMA_TAU_S)
-                self.score_l = self.score_l + alpha * (raw_score_l - self.score_l)
-                self.score_r = self.score_r + alpha * (raw_score_r - self.score_r)
+                tau_l = HYBRID_EMA_TAU_ATTACK_S if raw_score_l > self.score_l else HYBRID_EMA_TAU_RELEASE_S
+                tau_r = HYBRID_EMA_TAU_ATTACK_S if raw_score_r > self.score_r else HYBRID_EMA_TAU_RELEASE_S
+                alpha_l = 1.0 - math.exp(-dt_s / tau_l)
+                alpha_r = 1.0 - math.exp(-dt_s / tau_r)
+                self.score_l = self.score_l + alpha_l * (raw_score_l - self.score_l)
+                self.score_r = self.score_r + alpha_r * (raw_score_r - self.score_r)
         self._last_ts_ms = ts_ms
 
         # 4. Deterministic Schmitt-trigger hysteresis + contralateral asymmetry arbitration

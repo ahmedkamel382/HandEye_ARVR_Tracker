@@ -317,9 +317,11 @@ def _face_accepted(result) -> bool:
     matrices = getattr(result, "facial_transformation_matrixes", None)
     if matrices is None or len(matrices) == 0 or np.shape(matrices[0]) != (4, 4):
         return False
+    blendshapes_list = getattr(result, "face_blendshapes", None)
+    blendshapes = blendshapes_list[0] if blendshapes_list else None
     try:
         with np.errstate(over="ignore", invalid="ignore"):
-            return pack_face(faces[0], matrices[0])[1]["valid"]
+            return pack_face(faces[0], matrices[0], blendshapes)[1]["valid"]
     except (AttributeError, OverflowError, TypeError, ValueError):
         return False
 

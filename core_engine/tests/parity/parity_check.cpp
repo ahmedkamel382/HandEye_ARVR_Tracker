@@ -4,9 +4,11 @@
 //   usage: core_parity_check <recording.txt> <gaze models dir>
 //
 // Input text format:
-//   S                     start a new gaze sequence (fresh GazeNative: calibration starts over)
-//   F W H n  x y z ...    face frame  (n = 484 packed landmarks + head-pose matrix rows, or 0 = no face)
-//   H W H n  x y z ...    hand frame  (n = 42 packed image+world landmarks, or 0 = no hand; ONE stateful tracker)
+//   S                        start a new gaze sequence (fresh GazeNative: calibration starts over)
+//   F W H n  x y z ...       face frame without timestamp (n = 484 or 487, or 0 = no face)
+//   FT W H ts_ms n x y z ... face frame with explicit timestamp ms (n = 484 or 487, or 0 = no face)
+//   H W H n  x y z ...       hand frame  (n = 42 packed image+world landmarks, or 0 = no hand; ONE stateful tracker)
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <memory>
@@ -40,14 +42,20 @@ int main(int argc, char** argv) {
     while (in >> tag) {
         if (tag == "S") { gaze = newGaze(); continue; }
         int W = 0, H = 0, n = 0;
-        in >> W >> H >> n;
+        int64_t ts_ms = -1;
+        if (tag == "FT") {
+            in >> W >> H >> ts_ms >> n;
+        } else {
+            in >> W >> H >> n;
+        }
         pts.assign(size_t(n) * 3, 0.f);
         for (auto& v : pts) in >> v;
         if (!in) { std::fprintf(stderr, "truncated recording\n"); return 2; }
-        core::ModuleOut o = (tag == "F") ? gaze->process(pts.data(), n, W, H)
-                                         : hand.process(pts.data(), n);
-        if (tag == "F") std::printf("%.9g %.9g %d\n", o.yaw_deg, o.pitch_deg, o.state);
-        else            std::printf("%.9g %.9g %d\n", double(o.x), double(o.y), o.state);
+        const bool is_face = (tag == "F" || tag == "FT");
+        core::ModuleOut o = is_face ? gaze->process(pts.data(), n, W, H, nullptr, ts_ms)
+                                    : hand.process(pts.data(), n);
+        if (is_face) std::printf("%.9g %.9g %d\n", o.yaw_deg, o.pitch_deg, o.state);
+        else         std::printf("%.9g %.9g %d\n", double(o.x), double(o.y), o.state);
     }
     return 0;
 }

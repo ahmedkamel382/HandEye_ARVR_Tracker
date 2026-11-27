@@ -1,0 +1,75 @@
+{
+  "schema_version": "hybrid_blink_v2",
+  "description": "Shared bit-for-bit constants for HybridBlinkDetector mirrored in ai_pipeline/gaze_intent/gaze_intent.py and core_engine/include/gaze_math.hpp.",
+  "bridge_packing": {
+    "face_landmarks": 478,
+    "pose_rows": 6,
+    "legacy_packed_rows": 484,
+    "blendshape_rows": 3,
+    "packed_with_blendshapes_rows": 487,
+    "blendshape_valid_range": [0.0, 1.0],
+    "eye_aligned_blendshape_slots": [
+      { "slot": 0, "field": "bs_blink_l",    "mediapipe_name": "eyeBlinkRight",    "eye": "LEFT_EYE(33,160,158,133,153,144) -> state 1 Left Wink" },
+      { "slot": 1, "field": "bs_blink_r",    "mediapipe_name": "eyeBlinkLeft",     "eye": "RIGHT_EYE(362,385,387,263,373,380) -> state 2 Right Wink" },
+      { "slot": 2, "field": "bs_lookdown_l", "mediapipe_name": "eyeLookDownRight", "eye": "LEFT_EYE" },
+      { "slot": 3, "field": "bs_lookdown_r", "mediapipe_name": "eyeLookDownLeft",  "eye": "RIGHT_EYE" },
+      { "slot": 4, "field": "bs_squint_l",   "mediapipe_name": "eyeSquintRight",   "eye": "LEFT_EYE" },
+      { "slot": 5, "field": "bs_squint_r",   "mediapipe_name": "eyeSquintLeft",    "eye": "RIGHT_EYE" },
+      { "slot": 6, "field": "bs_wide_l",     "mediapipe_name": "eyeWideRight",     "eye": "LEFT_EYE" },
+      { "slot": 7, "field": "bs_wide_r",     "mediapipe_name": "eyeWideLeft",      "eye": "RIGHT_EYE" }
+    ],
+    "polarity_proof": "Empirically verified on MPIIFaceGaze p00/day01 (0005.jpg, 0030.jpg, 0031.jpg) in BOTH unflipped and cv::flip mirrored frames: MediaPipe FaceMesh LEFT_EYE (33..144) is always image-left (user physical left eye in mirrored webcam frames) and maps to ARKit *Right blendshapes; RIGHT_EYE (362..380) is always image-right (user physical right eye) and maps to ARKit *Left blendshapes."
+  },
+  "calibration": {
+    "calibration_frames": 30,
+    "min_ear_with_blendshapes": 0.12,
+    "min_ear_without_blendshapes": 0.08,
+    "max_bilateral_asym": 0.35,
+    "max_head_pitch_deg": 20.0,
+    "max_blendshape_blink": 0.35,
+    "ear_trim_low_frac": 0.20,
+    "ear_trim_high_frac": 0.90,
+    "ear_quantile": 0.75,
+    "bs_trim_low_frac": 0.10,
+    "bs_trim_high_frac": 0.80,
+    "bs_quantile": 0.25,
+    "max_base_bs": 0.25,
+    "default_base_sy": -0.08
+  },
+  "adaptive_ema": {
+    "alpha": 0.005,
+    "max_bilateral_asym": 0.25,
+    "max_head_pitch_deg": 15.0,
+    "max_raw_score": 0.22,
+    "max_bs_blink": 0.25,
+    "max_bs_lookdown": 0.35
+  },
+  "closure_scoring": {
+    "bs_lookdown_deadzone": 0.20,
+    "bs_lookdown_gain": 0.25,
+    "bs_denom_min": 0.35,
+    "ear_sy_gain": 0.90,
+    "ear_sy_max_delta": 0.20,
+    "ear_pitch_gain": 0.14,
+    "ear_pitch_max_deg": 25.0,
+    "ear_lookdown_gain": 0.18,
+    "ear_max_droop_comp": 0.30,
+    "ear_open_ref": 0.95,
+    "ear_closed_span": 0.62,
+    "fusion_weight_bs": 0.80,
+    "fusion_weight_ear": 0.20
+  },
+  "temporal_smoothing": {
+    "ema_tau_seconds": 0.040,
+    "max_gap_seconds": 0.250,
+    "default_dt_seconds": 0.03333333333333333
+  },
+  "hysteresis": {
+    "close_thresh": 0.52,
+    "open_thresh": 0.32,
+    "wink_asym_enter": 0.22,
+    "wink_asym_exit": 0.12,
+    "wink_other_max": 0.65,
+    "sym_band": 0.14
+  }
+}

@@ -44,11 +44,14 @@ class _Detector:
         self.next_hand = []          # image landmarks of the hand
         self.next_world = []         # world landmarks of the hand
         self.next_pose = np.eye(4, dtype=np.float32)   # facial transformation matrix of the face
+        self.next_blendshapes = None  # optional list of blendshape category objects, or None
 
     def detect_for_video(self, image, ts):
+        has_bs = bool(self.next_face) and (self.next_blendshapes is not None)
         return types.SimpleNamespace(
             face_landmarks=[self.next_face] if self.next_face else [],
             facial_transformation_matrixes=[self.next_pose] if self.next_face else [],
+            face_blendshapes=[self.next_blendshapes] if has_bs else [],
             hand_landmarks=[self.next_hand] if self.next_hand else [],
             hand_world_landmarks=[self.next_world] if self.next_world else [])
 
@@ -98,29 +101,111 @@ def fmt(arr):
     return " ".join("%.9g" % v for v in arr.reshape(-1).tolist())
 
 
+# Canonical eye-aligned blendshape order matching landmark_extractors.EYE_BLENDSHAPE_NAMES
+_BS_NAMES = (
+    "eyeBlinkRight",      # slot 0: bs_blink_l (image-left LEFT_EYE)
+    "eyeBlinkLeft",       # slot 1: bs_blink_r (image-right RIGHT_EYE)
+    "eyeLookDownRight",   # slot 2: bs_look_down_l
+    "eyeLookDownLeft",    # slot 3: bs_look_down_r
+    "eyeSquintRight",     # slot 4: bs_squint_l
+    "eyeSquintLeft",      # slot 5: bs_squint_r
+    "eyeWideRight",       # slot 6: bs_wide_l
+    "eyeWideLeft",        # slot 7: bs_wide_r
+)
+
+
+def make_bs_objs(vals):
+    return [types.SimpleNamespace(category_name=name, score=float(v)) for name, v in zip(_BS_NAMES, vals)]
+
+
+def pack_face_with_optional_bs(lm, pose, bs_vals):
+    base = syn.pack_face(lm, pose)
+    if bs_vals is None:
+        return base
+    extra = np.zeros((3, 3), dtype=np.float32)
+    extra[0, 0], extra[0, 1], extra[0, 2] = bs_vals[0], bs_vals[1], bs_vals[2]
+    extra[1, 0], extra[1, 1], extra[1, 2] = bs_vals[3], bs_vals[4], bs_vals[5]
+    extra[2, 0], extra[2, 1], extra[2, 2] = bs_vals[6], bs_vals[7], 0.0
+    return np.vstack((base, extra)).astype(np.float32)
+
+
 # ---------------------------------------------------------------- scenario generators --------------------
 def gen_face_sequences(rng, frames):
-    """Yield sequences (list of landmark arrays, 'None' = no face). Eyes open at first (calibration), then
-    random wink / blink / closure segments with random openness, moving iris, noise, dropouts."""
+    """Yield sequences of (lm_or_None, bs_vals_or_None, dt_ms) covering both n=484 (EAR-only)
+    and n=487 (blendshape + EAR) hybrid blink regimes, including poisoned startup, winks,
+    sympathetic squint, symmetric blinks, downward gaze, threshold jitter, degenerate eye corners,
+    dropouts, and irregular 15/30/60 FPS timestamps."""
     seqs = []
-    per_seq = max(200, frames // 4)
-    for _ in range(4):
+    per_seq = max(220, frames // 4)
+    for seq_idx in range(4):
+        use_bs = (seq_idx % 2 == 1)
         seq, kl, kr, iris = [], 1.0, 1.0, np.array([0.5, 0.5])
+        bs = [0.06, 0.06, 0.10, 0.10, 0.04, 0.04, 0.02, 0.02]
         left = 0
         for i in range(per_seq):
+            # Variable FPS: 15 FPS (66ms), 30 FPS (33ms), 60 FPS (16ms)
+            dt_ms = (16, 33, 66)[(seq_idx + i // 40) % 3]
+            if i < 40 and seq_idx == 1 and (i % 5 == 0):
+                # Blink-poisoned startup frame
+                lm_f = syn.make_face(0.25, 0.25, tuple(iris), rng=rng, noise=0.0005)
+                bs_f = [0.85, 0.85, 0.10, 0.10, 0.10, 0.10, 0.0, 0.0]
+                seq.append((lm_f, bs_f, dt_ms))
+                continue
             if left == 0:
-                left = int(rng.integers(15, 60))
+                left = int(rng.integers(12, 45))
                 if i > 45:
-                    mode = rng.integers(0, 6)
-                    kl = [1.0, 0.25, 1.0, 0.25, float(rng.uniform(0.1, 1.2)), 1.0][mode]
-                    kr = [1.0, 1.0, 0.25, 0.25, float(rng.uniform(0.1, 1.2)), 0.0 if rng.random() < .1 else 1.0][mode]
+                    mode = int(rng.integers(0, 9))
+                    if mode == 0:      # open neutral
+                        kl, kr = 1.0, 1.0
+                        bs = [0.05, 0.05, 0.10, 0.10, 0.04, 0.04, 0.02, 0.02]
+                    elif mode == 1:    # firm left wink
+                        kl, kr = 0.25, 1.0
+                        bs = [0.85, 0.08, 0.10, 0.10, 0.25, 0.05, 0.01, 0.02]
+                    elif mode == 2:    # firm right wink
+                        kl, kr = 1.0, 0.25
+                        bs = [0.08, 0.85, 0.10, 0.10, 0.05, 0.25, 0.02, 0.01]
+                    elif mode == 3:    # symmetric blink / closure
+                        kl, kr = 0.22, 0.22
+                        bs = [0.88, 0.88, 0.15, 0.15, 0.10, 0.10, 0.0, 0.0]
+                    elif mode == 4:    # sympathetic-squint left wink
+                        kl, kr = 0.25, 0.65
+                        bs = [0.88, 0.50, 0.10, 0.10, 0.30, 0.20, 0.0, 0.0]
+                    elif mode == 5:    # downward gaze with heavy lid droop
+                        kl, kr = 0.62, 0.62
+                        bs = [0.22, 0.22, 0.68, 0.68, 0.05, 0.05, 0.0, 0.0]
+                    elif mode == 6:    # near-threshold +-0.02 jitter around 0.52
+                        kl, kr = 0.50, 1.0
+                        bs = [0.54, 0.06, 0.10, 0.10, 0.05, 0.05, 0.0, 0.0]
+                    elif mode == 7:    # random openness
+                        kl = float(rng.uniform(0.15, 1.15))
+                        kr = float(rng.uniform(0.15, 1.15))
+                        bs = [
+                            float(np.clip(1.0 - kl, 0.0, 1.0)),
+                            float(np.clip(1.0 - kr, 0.0, 1.0)),
+                            float(rng.uniform(0.0, 0.7)),
+                            float(rng.uniform(0.0, 0.7)),
+                            0.05, 0.05, 0.02, 0.02,
+                        ]
+                    else:              # occasional degenerate / closed right eye
+                        kl, kr = 1.0, (0.0 if rng.random() < 0.2 else 1.0)
+                        bs = [0.05, 0.05, 0.10, 0.10, 0.04, 0.04, 0.02, 0.02]
             left -= 1
             iris = np.clip(iris + rng.normal(0, 0.04, 2), 0.0, 1.0)
             if i > 45 and rng.random() < 0.03:
-                seq.append(None)
+                seq.append((None, None, dt_ms))
                 continue
-            seq.append(syn.make_face(kl, kr, tuple(iris), center=(0.5 + rng.normal(0, .02), 0.5 + rng.normal(0, .02)),
-                                     size=float(rng.uniform(0.18, 0.3)), rng=rng, noise=0.0008))
+            lm_f = syn.make_face(kl, kr, tuple(iris), center=(0.5 + rng.normal(0, .02), 0.5 + rng.normal(0, .02)),
+                                 size=float(rng.uniform(0.18, 0.3)), rng=rng, noise=0.0008)
+            # Inject occasional degenerate collapsed eye corner (h_dist == 0) post-calibration
+            if i > 60 and rng.random() < 0.01:
+                lm_f[133] = lm_f[33]
+            bs_out = None
+            if use_bs:
+                jitter = rng.normal(0.0, 0.015, 2)
+                bs_out = list(bs)
+                bs_out[0] = float(np.clip(bs_out[0] + jitter[0], 0.0, 1.0))
+                bs_out[1] = float(np.clip(bs_out[1] + jitter[1], 0.0, 1.0))
+            seq.append((lm_f, bs_out, dt_ms))
         seqs.append(seq)
     return seqs
 
@@ -205,22 +290,27 @@ def main():
     rng = np.random.default_rng(a.seed)
     lines, expected, kinds = [], [], []
 
-    # ---- gaze: 4 sequences x 2 resolutions ----
+    # ---- gaze: 4 sequences x 2 resolutions (both n=484 EAR-only and n=487 blendshapes+EAR) ----
     for (w, h) in ((W, H), (W2, H2)):
         for seq in gen_face_sequences(rng, a.frames // 2):
             gi = gaze_mod.GazeIntent()
             lines.append("S")
             blank = np.zeros((h, w, 3), dtype=np.uint8)
-            for ts, lm in enumerate(seq):
+            ts_ms = 0
+            for lm, bs_vals, dt_ms in seq:
+                ts_ms += int(dt_ms)
                 pose = random_pose(rng)
+                bs_f32 = [float(np.float32(v)) for v in bs_vals] if bs_vals is not None else None
                 detector.next_face = as_objs(lm) if lm is not None else []
                 detector.next_pose = pose
-                final_yaw, final_pitch, head_yaw, head_pitch, state, landmarks = gi.process_frame(blank, ts * 16 + 1)
+                detector.next_blendshapes = make_bs_objs(bs_f32) if (lm is not None and bs_f32 is not None) else None
+                final_yaw, final_pitch, head_yaw, head_pitch, state, landmarks = gi.process_frame(blank, ts_ms)
                 expected.append((final_yaw, final_pitch, state)); kinds.append("gaze")
-                packed = syn.pack_face(lm, pose) if lm is not None else None      # what the engine receives
+                packed = pack_face_with_optional_bs(lm, pose, bs_f32) if lm is not None else None
                 n = 0 if packed is None else len(packed)
-                lines.append(f"F {w} {h} {n} " + (fmt(packed) if packed is not None else ""))
+                lines.append(f"FT {w} {h} {ts_ms} {n} " + (fmt(packed) if packed is not None else ""))
             gi.shutdown()
+            detector.next_blendshapes = None
 
     # ---- hand ----
     # HandNative (the C++ side under test) does not run Python ROI recovery,

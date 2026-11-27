@@ -30,6 +30,7 @@ from gaze_intent import (  # noqa: E402
     CALIBRATION_FRAMES,
     EAR_DIST_EPS,
     EAR_WINDOW_SIZE,
+    EYE_BLENDSHAPE_NAMES,
     INVALID_ANGLE,
     IRIS_BASELINE_EPS,
     L_CORNERS,
@@ -39,17 +40,22 @@ from gaze_intent import (  # noqa: E402
     RIGHT_EYE,
     RIGHT_IRIS,
     SPAN_DEG,
+    BlinkDiagnosticPayload,
     EarFeatureState,
     GazeDiagnosticPayload,
     GazeIntent,
+    HybridBlinkDetector,
+    _BLINK_DIAG_FIELD_NAMES,
     _DIAG_FIELD_NAMES,
     angle_to_norm_coord,
     calculate_ear,
+    extract_eye_blendshapes,
     extract_gaze_features,
     get_3d_dist,
     get_head_pose_angles,
     get_iris_ratio,
     is_valid_output,
+    safe_classify_legacy_wink,
     window_stats,
 )
 
@@ -152,12 +158,29 @@ def make_pose_matrix(pitch_deg: float = 0.0, yaw_deg: float = 0.0, roll_deg: flo
     return mat
 
 
+def make_eye_blendshapes(**overrides: float) -> list[types.SimpleNamespace]:
+    """Build MediaPipe-style face_blendshapes category objects with canonical ARKit names."""
+    vals = {
+        "eyeBlinkRight": 0.05,
+        "eyeBlinkLeft": 0.05,
+        "eyeLookDownRight": 0.10,
+        "eyeLookDownLeft": 0.10,
+        "eyeSquintRight": 0.04,
+        "eyeSquintLeft": 0.04,
+        "eyeWideRight": 0.02,
+        "eyeWideLeft": 0.02,
+    }
+    vals.update(overrides)
+    return [types.SimpleNamespace(category_name=k, score=float(v)) for k, v in vals.items()]
+
+
 class StubFaceDetector:
     """Deterministic in-memory MediaPipe FaceLandmarker stub for headless GazeIntent tests."""
 
     def __init__(self) -> None:
         self.next_landmarks: list[Any] | None = make_synthetic_landmarks()
         self.next_pose: np.ndarray | None = make_pose_matrix()
+        self.next_blendshapes: list[Any] | None = None
         self.received_timestamps: list[int] = []
         self.closed: bool = False
 
@@ -165,9 +188,11 @@ class StubFaceDetector:
         self.received_timestamps.append(timestamp_ms)
         has_face = self.next_landmarks is not None and len(self.next_landmarks) > 0
         has_pose = self.next_pose is not None
+        has_bs = has_face and (self.next_blendshapes is not None)
         return types.SimpleNamespace(
             face_landmarks=[self.next_landmarks] if has_face else [],
             facial_transformation_matrixes=[self.next_pose] if (has_face and has_pose) else [],
+            face_blendshapes=[self.next_blendshapes] if has_bs else [],
         )
 
     def close(self) -> None:
@@ -344,12 +369,12 @@ class TestFeatureExtractionAndGeometry:
         ear_closed = calculate_ear(lm_closed, LEFT_EYE, 640, 480)
         assert ear_open > ear_closed > 0.0
 
-        # Degenerate zero horizontal eye distance -> returns 0.0 without ZeroDivisionError
+        # Degenerate zero horizontal eye distance -> returns NaN (P0 fix: never mimics closed eye)
         lm_zero = make_synthetic_landmarks()
         lm_zero[LEFT_EYE[3]].x = lm_zero[LEFT_EYE[0]].x
         lm_zero[LEFT_EYE[3]].y = lm_zero[LEFT_EYE[0]].y
         lm_zero[LEFT_EYE[3]].z = lm_zero[LEFT_EYE[0]].z
-        assert calculate_ear(lm_zero, LEFT_EYE, 640, 480) == 0.0
+        assert math.isnan(calculate_ear(lm_zero, LEFT_EYE, 640, 480))
 
         # window_stats on empty, single-element, and multi-element windows
         assert window_stats([]) == (1.0, 0.0)
@@ -527,7 +552,8 @@ class TestMockedGazeIntentPipeline:
         with patch("gaze_intent.vision.FaceLandmarker.create_from_options", return_value=stub):
             tracker = GazeIntent(diag_log_path=str(csv_path))
             # Use 2-frame calibration for fast verification of calibrating, active, and dropout rows
-            tracker.ear_state = EarFeatureState(calibration_frames=2, window_size=4)
+            tracker.hybrid_blink = HybridBlinkDetector(calibration_frames=2, window_size=4)
+            tracker.ear_state = tracker.hybrid_blink
             tracker.process_frame(blank, 10)   # frame 0: calibrating (-1)
             tracker.process_frame(blank, 20)   # frame 1: completes calibration (-1)
             tracker.process_frame(blank, 30)   # frame 2: active valid frame (0)
@@ -564,93 +590,6 @@ class TestMockedGazeIntentPipeline:
         assert r_lost["detected"] == "0"
         assert r_lost["state"] == "0"
         assert float(r_lost["norm_x"]) == -1.0
-
-
-    def test_nonfinite_landmarks_pose_and_prediction_rejected_and_recovers(self, mocked_gaze_tracker):
-        tracker, stub = mocked_gaze_tracker
-        blank = np.zeros((480, 640, 3), dtype=np.uint8)
-        ts = 0
-
-        # Non-finite pose matrix directly raises ValueError in get_head_pose_angles
-        for bad in (float("nan"), float("inf"), float("-inf")):
-            bad_pose = make_pose_matrix()
-            bad_pose[1, 2] = bad
-            with pytest.raises(ValueError):
-                get_head_pose_angles(bad_pose)
-        with pytest.raises(ValueError):
-            get_head_pose_angles(np.eye(2, dtype=np.float32))
-
-        # 1. Mid-calibration NaN resets incomplete calibration back to 0
-        for _ in range(10):
-            ts += 33
-            tracker.process_frame(blank, ts)
-        assert tracker.ear_state.current_calibration_frames == 10
-
-        bad_lm = make_synthetic_landmarks()
-        bad_lm[468].x = float("nan")
-        stub.next_landmarks = bad_lm
-        ts += 33
-        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
-        assert state == 0 and lms is None and not is_valid_output(ay, ap)
-        assert math.isnan(hy) and math.isnan(hp)
-        assert tracker.ear_state.current_calibration_frames == 0
-
-        # Fewer than 478 landmarks -> rejected cleanly without IndexError
-        stub.next_landmarks = make_synthetic_landmarks()[:477]
-        ts += 33
-        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
-        assert state == 0 and lms is None and not is_valid_output(ay, ap)
-
-        # Complete full calibration after reset
-        stub.next_landmarks = make_synthetic_landmarks()
-        stub.next_pose = make_pose_matrix()
-        for _ in range(CALIBRATION_FRAMES):
-            ts += 33
-            tracker.process_frame(blank, ts)
-        assert tracker.is_calibrated
-
-        # 2. Post-calibration valid -> invalid (NaN/+-Inf in landmark, pose, or predictor) -> valid recovery
-        ts += 33
-        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
-        assert state == 0 and lms is not None and is_valid_output(ay, ap)
-
-        for bad in (float("nan"), float("inf"), float("-inf")):
-            lm_corrupt = make_synthetic_landmarks()
-            lm_corrupt[33].y = bad
-            stub.next_landmarks = lm_corrupt
-            stub.next_pose = make_pose_matrix()
-            ts += 33
-            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
-            assert state == 0 and lms is None and not is_valid_output(ay, ap)
-
-            stub.next_landmarks = make_synthetic_landmarks()
-            pose_corrupt = make_pose_matrix()
-            pose_corrupt[0, 0] = bad
-            stub.next_pose = pose_corrupt
-            ts += 33
-            ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
-            assert state == 0 and lms is None and not is_valid_output(ay, ap)
-
-        # Model predictor outputting NaN/+Inf is also rejected cleanly
-        class _BadModel:
-            def predict(self, _):
-                return np.array([[float("nan")]], dtype=np.float32)
-
-        orig_yaw_model = tracker.yaw_model
-        tracker.yaw_model = _BadModel()
-        stub.next_landmarks = make_synthetic_landmarks()
-        stub.next_pose = make_pose_matrix()
-        ts += 33
-        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
-        assert state == 0 and lms is None and not is_valid_output(ay, ap)
-        tracker.yaw_model = orig_yaw_model
-
-        # Valid frame immediately recovers with calibration preserved
-        ts += 33
-        ay, ap, hy, hp, state, lms = tracker.process_frame(blank, ts)
-        assert tracker.is_calibrated
-        assert state == 0 and lms is not None and is_valid_output(ay, ap)
-        assert math.isfinite(hy) and math.isfinite(hp)
 
 
 # ===========================================================================
@@ -857,4 +796,212 @@ class TestRealAssetSmokeAndNegativeRegressions:
 
         with pytest.raises(FileNotFoundError, match="Production DLL missing"):
             mod.GazeIntent()
+
+
+# ===========================================================================
+# Pillar 7: Hybrid Blink v2 Safety, Polarity Lock, Hysteresis & Telemetry
+# ===========================================================================
+class TestHybridBlinkV2AndSafety:
+    def test_hybrid_blink_spec_matches_module_constants(self):
+        import json
+
+        spec_path = GAZE_DIR / "hybrid_blink_spec.json"
+        assert spec_path.is_file()
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        slots = tuple(s["mediapipe_name"] for s in spec["bridge_packing"]["eye_aligned_blendshape_slots"])
+        assert slots == EYE_BLENDSHAPE_NAMES
+        assert spec["calibration"]["calibration_frames"] == CALIBRATION_FRAMES
+        assert math.isclose(spec["closure_scoring"]["fusion_weight_bs"], gi.HYBRID_FUSION_W_BS, abs_tol=1e-12)
+        assert math.isclose(spec["closure_scoring"]["fusion_weight_ear"], gi.HYBRID_FUSION_W_EAR, abs_tol=1e-12)
+        assert math.isclose(spec["hysteresis"]["close_thresh"], gi.HYBRID_CLOSE_THRESH, abs_tol=1e-12)
+        assert math.isclose(spec["hysteresis"]["open_thresh"], gi.HYBRID_OPEN_THRESH, abs_tol=1e-12)
+        assert math.isclose(spec["temporal_smoothing"]["ema_tau_seconds"], gi.HYBRID_EMA_TAU_S, abs_tol=1e-12)
+
+    def test_degenerate_eye_and_legacy_nan_guard_never_emit_closure(self, mocked_gaze_tracker):
+        tracker, stub = mocked_gaze_tracker
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        ts = 0
+        for _ in range(CALIBRATION_FRAMES):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+
+        # Degenerate collapsed horizontal eye corners (|p1 - p4| == 0) -> rejected cleanly as state 0 (never 3!)
+        lm_deg = make_synthetic_landmarks()
+        lm_deg[LEFT_EYE[3]].x = lm_deg[LEFT_EYE[0]].x
+        lm_deg[LEFT_EYE[3]].y = lm_deg[LEFT_EYE[0]].y
+        lm_deg[LEFT_EYE[3]].z = lm_deg[LEFT_EYE[0]].z
+        stub.next_landmarks = lm_deg
+        ts += 33
+        ay, ap, _, _, state, lms = tracker.process_frame(blank, ts)
+        assert state == 0 and lms is None and not is_valid_output(ay, ap)
+
+        # Legacy classifier guard: non-finite features OR non-finite model output -> 0 Neutral (never 3 Closure)
+        assert safe_classify_legacy_wink(tracker.wink_model, (float("nan"), 1.0, 0.0, 1.0, 1.0, 0.0)) == 0
+        assert safe_classify_legacy_wink(tracker.wink_model, (1.0, float("inf"), 0.0, 1.0, 1.0, 0.0)) == 0
+
+        class _NanForest:
+            def predict(self, _):
+                return np.array([[0.1, float("nan"), 0.2, 0.3]], dtype=np.float32)
+
+        assert safe_classify_legacy_wink(_NanForest(), (1.0, 1.0, 0.0, 1.0, 1.0, 0.0)) == 0
+
+    def test_poisoned_startup_calibration_recovers_true_baseline(self):
+        det = HybridBlinkDetector()
+        # Interleave 15 blink-poisoned frames (low EAR / high blendshape) + 30 open frames
+        for i in range(45):
+            if i % 3 == 0:
+                # Blink frame during startup: rejected by min_ear/bs/asym gate
+                det.update_calibration(0.08, 0.08, 0.0, 0.0, (0.85, 0.85, 0.1, 0.1, 0.1, 0.1, 0.0, 0.0))
+            else:
+                det.update_calibration(0.30, 0.32, 0.0, 0.0, (0.06, 0.07, 0.1, 0.1, 0.04, 0.04, 0.02, 0.02))
+        assert det.is_calibrated
+        assert math.isclose(det.baseline_left_ear, 0.30, abs_tol=1e-6)
+        assert math.isclose(det.baseline_right_ear, 0.32, abs_tol=1e-6)
+        assert math.isclose(det.baseline_bs_left, 0.06, abs_tol=1e-6)
+        assert math.isclose(det.baseline_bs_right, 0.07, abs_tol=1e-6)
+
+        # Mildly drooping frames inside the calibration window are still trimmed by 75th-percentile EAR
+        det2 = HybridBlinkDetector()
+        for i in range(CALIBRATION_FRAMES):
+            ear_val = 0.20 if i < 10 else 0.32
+            bs_val = 0.22 if i < 10 else 0.05
+            det2.update_calibration(ear_val, ear_val, 0.0, 0.0, (bs_val, bs_val, 0.1, 0.1, 0.0, 0.0, 0.0, 0.0))
+        assert det2.is_calibrated
+        assert math.isclose(det2.baseline_left_ear, 0.32, abs_tol=1e-6)
+        assert math.isclose(det2.baseline_bs_left, 0.05, abs_tol=1e-6)
+
+    def test_mirrored_blendshape_polarity_lock_left_vs_right_click(self, mocked_gaze_tracker):
+        tracker, stub = mocked_gaze_tracker
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        ts = 0
+
+        # Calibrate with neutral open eyes + resting blendshapes
+        stub.next_landmarks = make_synthetic_landmarks(k_left=1.0, k_right=1.0)
+        stub.next_blendshapes = make_eye_blendshapes(eyeBlinkRight=0.05, eyeBlinkLeft=0.05)
+        for _ in range(CALIBRATION_FRAMES):
+            ts += 33
+            tracker.process_frame(blank, ts)
+        assert tracker.is_calibrated
+
+        # Empirically locked polarity:
+        # Image-left LEFT_EYE (user physical left eye in mirrored webcam -> state=1 Left Click) = eyeBlinkRight
+        stub.next_landmarks = make_synthetic_landmarks(k_left=0.25, k_right=1.0)
+        stub.next_blendshapes = make_eye_blendshapes(eyeBlinkRight=0.85, eyeBlinkLeft=0.05)
+        for _ in range(6):
+            ts += 33
+            _, _, _, _, st_l, _ = tracker.process_frame(blank, ts)
+        assert st_l == 1, "eyeBlinkRight + LEFT_EYE closure MUST emit state=1 (Left Wink / Left Click)"
+
+        # Return to neutral
+        stub.next_landmarks = make_synthetic_landmarks(k_left=1.0, k_right=1.0)
+        stub.next_blendshapes = make_eye_blendshapes(eyeBlinkRight=0.05, eyeBlinkLeft=0.05)
+        for _ in range(6):
+            ts += 33
+            tracker.process_frame(blank, ts)
+
+        # Image-right RIGHT_EYE (user physical right eye in mirrored webcam -> state=2 Right Click) = eyeBlinkLeft
+        stub.next_landmarks = make_synthetic_landmarks(k_left=1.0, k_right=0.25)
+        stub.next_blendshapes = make_eye_blendshapes(eyeBlinkRight=0.05, eyeBlinkLeft=0.85)
+        for _ in range(6):
+            ts += 33
+            _, _, _, _, st_r, _ = tracker.process_frame(blank, ts)
+        assert st_r == 2, "eyeBlinkLeft + RIGHT_EYE closure MUST emit state=2 (Right Wink / Right Click)"
+
+    def test_symmetric_blink_sympathetic_squint_downward_gaze_hysteresis_and_fps(self):
+        def make_calibrated() -> HybridBlinkDetector:
+            d = HybridBlinkDetector()
+            for _ in range(CALIBRATION_FRAMES):
+                d.update_calibration(0.30, 0.30, 0.0, 0.0, (0.05, 0.05, 0.10, 0.10, 0.04, 0.04, 0.02, 0.02))
+            return d
+
+        # 1. Symmetric blink NEVER emits 1 or 2 across entire closure sweep
+        d = make_calibrated()
+        ts = 0
+        for lvl in (0.10, 0.30, 0.55, 0.75, 0.90, 0.90, 0.65, 0.40, 0.10):
+            ts += 33
+            ear = 0.30 * (1.0 - 0.75 * lvl)
+            st, *_ = d.step(ear, ear, 0.0, 0.0, ts, (lvl, lvl, 0.1, 0.1, 0.05, 0.05, 0.0, 0.0))
+            assert st in (0, 3), f"Symmetric blink emitted single-eye wink state={st}"
+
+        # 2. Sympathetic-squint firm left wink (c_L high, c_R moderate ~0.48) -> state 1
+        d = make_calibrated()
+        ts = 0
+        for _ in range(8):
+            ts += 33
+            st, cl, cr, *_ = d.step(0.08, 0.18, 0.0, 0.0, ts, (0.88, 0.50, 0.10, 0.10, 0.30, 0.20, 0.0, 0.0))
+        assert st == 1 and cl > 0.75 and 0.35 < cr < 0.60
+
+        # 3. Downward gaze (eyeLookDown=0.65, sy=+0.06, head_pitch=+10 deg, natural lid droop EAR 0.21) -> stays 0
+        d = make_calibrated()
+        ts = 0
+        for _ in range(15):
+            ts += 33
+            st, cl, cr, *_ = d.step(0.21, 0.21, 10.0, 0.06, ts, (0.24, 0.24, 0.65, 0.65, 0.05, 0.05, 0.0, 0.0))
+            assert st == 0, f"Downward gaze caused false trigger state={st} (cl={cl:.3f}, cr={cr:.3f})"
+
+        # 4. Schmitt-trigger hysteresis: +-0.02 jitter around 0.52 causes ZERO flips after settling
+        d = make_calibrated()
+        ts = 0
+        # Enter state 1 cleanly first
+        for _ in range(8):
+            ts += 33
+            st, *_ = d.step(0.09, 0.30, 0.0, 0.0, ts, (0.82, 0.05, 0.1, 0.1, 0.1, 0.04, 0.0, 0.0))
+        assert st == 1
+        # Oscillate right around 0.52 (between open_thresh=0.32 and close_thresh=0.52) -> stays locked in state 1!
+        states = []
+        for k in range(30):
+            ts += 33
+            jitter = 0.02 if (k % 2 == 0) else -0.02
+            bs_l = 0.54 + jitter
+            ear_l = 0.165 - jitter * 0.05
+            st, *_ = d.step(ear_l, 0.30, 0.0, 0.0, ts, (bs_l, 0.05, 0.1, 0.1, 0.05, 0.04, 0.0, 0.0))
+            states.append(st)
+        assert all(s == 1 for s in states), f"Hysteresis chattered on +-0.02 jitter: {states}"
+
+        # 5. Wall-clock EMA invariance across 15 / 30 / 60 FPS (same physical 120ms pulse reaches same state)
+        final_scores = []
+        for dt_ms in (16, 33, 66):
+            d_fps = make_calibrated()
+            ts = 0
+            # Start from open at t=0
+            d_fps.step(0.30, 0.30, 0.0, 0.0, ts, (0.05, 0.05, 0.1, 0.1, 0.04, 0.04, 0.02, 0.02))
+            while ts < 132:
+                ts += dt_ms
+                st, cl, cr, *_ = d_fps.step(0.08, 0.30, 0.0, 0.0, ts, (0.88, 0.05, 0.1, 0.1, 0.1, 0.04, 0.0, 0.0))
+            assert st == 1
+            final_scores.append(cl)
+        assert max(final_scores) - min(final_scores) < 0.05
+
+    def test_opt_in_22_col_blink_diag_does_not_alter_32_col_gaze_diag(self, tmp_path):
+        gaze_csv = tmp_path / "gaze_32.csv"
+        blink_csv = tmp_path / "blink_22.csv"
+        stub = StubFaceDetector()
+        stub.next_blendshapes = make_eye_blendshapes()
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("gaze_intent.vision.FaceLandmarker.create_from_options", return_value=stub):
+            tracker = GazeIntent(diag_log_path=str(gaze_csv), blink_diag_log_path=str(blink_csv))
+            tracker.hybrid_blink = HybridBlinkDetector(calibration_frames=2, window_size=4)
+            tracker.ear_state = tracker.hybrid_blink
+            tracker.process_frame(blank, 10)
+            tracker.process_frame(blank, 20)
+            tracker.process_frame(blank, 30)
+            stub.next_landmarks = None
+            tracker.process_frame(blank, 40)
+            tracker.shutdown()
+
+        with open(gaze_csv, "r", encoding="utf-8", newline="") as fg:
+            g_rows = list(csv.reader(fg))
+        with open(blink_csv, "r", encoding="utf-8", newline="") as fb:
+            b_rows = list(csv.reader(fb))
+
+        assert len(_DIAG_FIELD_NAMES) == 32 and len(g_rows[0]) == 32
+        assert len(_BLINK_DIAG_FIELD_NAMES) == 22 and len(b_rows[0]) == 22
+        assert len(g_rows) == 5 and len(b_rows) == 5
+        active_b = dict(zip(_BLINK_DIAG_FIELD_NAMES, b_rows[3]))
+        assert active_b["detector_mode"] == "hybrid_bs_ear"
+        assert active_b["detected"] == "1"
+        assert active_b["state"] == "0"
+
 

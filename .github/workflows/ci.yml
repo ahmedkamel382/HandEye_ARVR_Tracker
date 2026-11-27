@@ -95,7 +95,7 @@ jobs:
   cpp-engine-and-e2e:
     name: C++ Engine, Parity & E2E Pipeline
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
 
     steps:
       - name: Checkout Code
@@ -115,74 +115,152 @@ jobs:
           pip install -r requirements.txt
           pip install pybind11
 
-      - name: Fix tl2cgen Windows DLL Path Issue & Prepare vcpkg Cache Dir
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+
+      - name: Prepare tl2cgen Path, Overlay Triplet & vcpkg ABI Cache Key
+        id: vcpkg-env
         shell: pwsh
         run: |
           $pythonDir = Split-Path (Get-Command python).Source
           $libBinPath = Join-Path $pythonDir "Library\bin"
           New-Item -ItemType Directory -Force -Path $libBinPath | Out-Null
+
           $vcpkgCache = Join-Path $env:RUNNER_TEMP "vcpkg-archives"
           New-Item -ItemType Directory -Force -Path $vcpkgCache | Out-Null
+
+          $tripletDir = Join-Path $env:RUNNER_TEMP "vcpkg-triplets"
+          New-Item -ItemType Directory -Force -Path $tripletDir | Out-Null
+          $tripletFile = Join-Path $tripletDir "x64-windows.cmake"
+          @(
+            "set(VCPKG_TARGET_ARCHITECTURE x64)"
+            "set(VCPKG_CRT_LINKAGE dynamic)"
+            "set(VCPKG_LIBRARY_LINKAGE dynamic)"
+            "set(VCPKG_BUILD_TYPE release)"
+          ) | Set-Content -Path $tripletFile -Encoding utf8
+
+          $tripletHash = (Get-FileHash -LiteralPath $tripletFile -Algorithm SHA256).Hash.ToLowerInvariant()
+          $clCmd = Get-Command cl.exe -ErrorAction Stop
+          $clHash = (Get-FileHash -LiteralPath $clCmd.Source -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $vcpkgRev = "unknown"
+          if ($env:VCPKG_INSTALLATION_ROOT) {
+            if (Test-Path -LiteralPath (Join-Path $env:VCPKG_INSTALLATION_ROOT ".git")) {
+              $gitRev = git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD 2>$null
+              if ($LASTEXITCODE -eq 0 -and $gitRev) {
+                $vcpkgRev = $gitRev.Trim()
+              }
+            }
+            if ($vcpkgRev -eq "unknown") {
+              $vcpkgExe = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
+              if (Test-Path -LiteralPath $vcpkgExe) {
+                $verLine = (& $vcpkgExe version 2>$null | Select-Object -First 1)
+                if ($verLine) { $vcpkgRev = $verLine.Trim() }
+              }
+            }
+          }
+
+          $imageOs = if ($env:ImageOS) { $env:ImageOS } else { "windows" }
+          $imageVer = if ($env:ImageVersion) { $env:ImageVersion } else { "local" }
+          $vscmdVer = if ($env:VSCMD_VER) { $env:VSCMD_VER } else { "unknown" }
+          $vcToolsVer = if ($env:VCToolsVersion) { $env:VCToolsVersion } else { "unknown" }
+          $winSdkVer = if ($env:WindowsSDKVersion) { $env:WindowsSDKVersion.TrimEnd('\') } else { "unknown" }
+
+          $fingerprint = @(
+            "image_os=$imageOs"
+            "image_ver=$imageVer"
+            "vscmd_ver=$vscmdVer"
+            "vctools_ver=$vcToolsVer"
+            "winsdk_ver=$winSdkVer"
+            "cl_sha256=$clHash"
+            "vcpkg_rev=$vcpkgRev"
+            "triplet_sha256=$tripletHash"
+          ) -join "`n"
+          $sha256 = [System.Security.Cryptography.SHA256]::Create()
+          try {
+            $shaBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($fingerprint))
+          } finally {
+            $sha256.Dispose()
+          }
+          $envHash = ([System.BitConverter]::ToString($shaBytes) -replace '-', '').ToLowerInvariant().Substring(0, 16)
+
+          Write-Host "vcpkg ABI fingerprint inputs:"
+          Write-Host $fingerprint
+          Write-Host "Computed vcpkg env_hash: $envHash"
+
           "VCPKG_DEFAULT_BINARY_CACHE=$vcpkgCache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_BINARY_SOURCES=clear;files,$vcpkgCache,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_OVERLAY_TRIPLETS_DIR=$tripletDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "LOCALAPPDATA_PATH=$env:LOCALAPPDATA" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "env_hash=$envHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "image_ver=$imageVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Restore vcpkg Binary Archives
         id: vcpkg-cache
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.temp }}\vcpkg-archives
-          key: ${{ runner.os }}-vcpkg-rel-v1-${{ hashFiles('vcpkg.json') }}
+          key: ${{ runner.os }}-vcpkg-rel-v2-${{ steps.vcpkg-env.outputs.env_hash }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            ${{ runner.os }}-vcpkg-rel-v1-
+            ${{ runner.os }}-vcpkg-rel-v2-${{ steps.vcpkg-env.outputs.env_hash }}-
 
-      - name: Setup MSVC Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@v1.13.0
-
-      - name: Configure Release-Only vcpkg Overlay Triplet & CMake (with Retry)
+      - name: Configure CMake & Install vcpkg Dependencies (with Retry)
+        id: cmake-configure
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
-          $tripletDir = Join-Path $env:RUNNER_TEMP "vcpkg-triplets"
-          New-Item -ItemType Directory -Force -Path $tripletDir | Out-Null
-          @(
-            "set(VCPKG_TARGET_ARCHITECTURE x64)"
-            "set(VCPKG_CRT_LINKAGE dynamic)"
-            "set(VCPKG_LIBRARY_LINKAGE dynamic)"
-            "set(VCPKG_BUILD_TYPE release)"
-          ) | Set-Content -Path (Join-Path $tripletDir "x64-windows.cmake") -Encoding utf8
+          $preCount = (Get-ChildItem -LiteralPath $env:VCPKG_DEFAULT_BINARY_CACHE -Recurse -File -Filter "*.zip" -ErrorAction SilentlyContinue | Measure-Object).Count
+          Write-Host "vcpkg binary cache dir: $env:VCPKG_DEFAULT_BINARY_CACHE (pre-existing .zip archives: $preCount)"
+          Write-Host "VCPKG_BINARY_SOURCES=$env:VCPKG_BINARY_SOURCES"
 
           $pythonPath = (Get-Command python).Source
           $ninjaPath = (Get-Command ninja).Source
           $configured = $false
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            Write-Host "CMake configure attempt $attempt of 3..."
-            cmake -B build `
-              -G "Ninja" `
-              -DCMAKE_MAKE_PROGRAM="$ninjaPath" `
-              -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-              -DVCPKG_TARGET_TRIPLET="x64-windows" `
-              -DVCPKG_OVERLAY_TRIPLETS="$tripletDir" `
-              -DPython3_EXECUTABLE="$pythonPath" `
-              -DCMAKE_BUILD_TYPE=Release `
-              -DDSP_BUILD_BENCHMARKS=ON `
-              -DOSI_BUILD_BENCHMARKS=ON
-            if ($LASTEXITCODE -eq 0) {
-              $configured = $true
-              break
+          try {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              Write-Host "CMake configure attempt $attempt of 3..."
+              cmake -B build `
+                -G "Ninja" `
+                -DCMAKE_MAKE_PROGRAM="$ninjaPath" `
+                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+                -DVCPKG_TARGET_TRIPLET="x64-windows" `
+                -DVCPKG_OVERLAY_TRIPLETS="$env:VCPKG_OVERLAY_TRIPLETS_DIR" `
+                -DPython3_EXECUTABLE="$pythonPath" `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DDSP_BUILD_BENCHMARKS=ON `
+                -DOSI_BUILD_BENCHMARKS=ON
+              if ($LASTEXITCODE -eq 0) {
+                $configured = $true
+                break
+              }
+              if ($attempt -lt 3) {
+                Write-Warning "CMake configure attempt $attempt failed (exit $LASTEXITCODE); retrying in 15s..."
+                Start-Sleep -Seconds 15
+              }
             }
-            if ($attempt -lt 3) {
-              Write-Warning "CMake configure attempt $attempt failed (exit $LASTEXITCODE); retrying in 15s..."
-              Start-Sleep -Seconds 15
-            }
+          } finally {
+            $postCount = (Get-ChildItem -LiteralPath $env:VCPKG_DEFAULT_BINARY_CACHE -Recurse -File -Filter "*.zip" -ErrorAction SilentlyContinue | Measure-Object).Count
+            $newBuilt = if ($postCount -gt $preCount) { "true" } else { "false" }
+            Write-Host "vcpkg binary cache post-configure .zip archives: $postCount (new_archives_built=$newBuilt)"
+            "pre_archives=$preCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "post_archives=$postCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "new_archives_built=$newBuilt" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
           if (-not $configured) { throw "CMake configure failed after 3 attempts" }
 
-      - name: Save vcpkg Binary Archives
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+      - name: Save vcpkg Binary Archives (Complete)
+        if: success() && steps.vcpkg-cache.outputs.cache-hit != 'true' && steps.cmake-configure.outputs.post_archives != '0'
         uses: actions/cache/save@v5
         with:
           path: ${{ runner.temp }}\vcpkg-archives
-          key: ${{ runner.os }}-vcpkg-rel-v1-${{ hashFiles('vcpkg.json') }}
+          key: ${{ runner.os }}-vcpkg-rel-v2-${{ steps.vcpkg-env.outputs.env_hash }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Save Partial vcpkg Binary Archives on Failure
+        if: failure() && steps.vcpkg-cache.outputs.cache-hit != 'true' && steps.cmake-configure.outputs.new_archives_built == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}\vcpkg-archives
+          key: ${{ runner.os }}-vcpkg-rel-v2-${{ steps.vcpkg-env.outputs.env_hash }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Build Core Engine, Tests & Benchmarks
         run: cmake --build build --parallel

@@ -1034,3 +1034,132 @@ class TestHybridBlinkV2AndSafety:
             ts += 33
             st, cl, cr, *_ = d.step(0.21, 0.21, 10.0, 0.02, ts, (0.24, 0.24, 0.65, 0.65, 0.10, 0.10, 0.0, 0.0))
         assert st == 0 and cl < gi.HYBRID_CLOSE_THRESH and cr < gi.HYBRID_CLOSE_THRESH
+
+
+# ===========================================================================
+# Pillar 8: Blink v2 Cued Data Collector Schema, State Machine & Audit Guards
+# ===========================================================================
+class TestWinkDataCollectorV2:
+    def test_cue_event_state_machine_transitions_and_auto_return(self):
+        import wink_data_collector as wdc
+
+        sm = wdc.CueEventStateMachine()
+        assert sm.current(0.0) == (0, "neutral")
+
+        # Trigger left wink at t=10.0s: prepare [0, 0.25) -> active [0.25, 0.90) -> release [0.90, 1.15) -> neutral
+        sm.trigger("left_wink", 10.0)
+        assert sm.current(10.00) == (-1, "prepare")
+        assert sm.current(10.24) == (-1, "prepare")
+        assert sm.current(10.25) == (1, "active_left_wink")
+        assert sm.current(10.89) == (1, "active_left_wink")
+        assert sm.current(10.90) == (-1, "release")
+        assert sm.current(11.14) == (-1, "release")
+        assert sm.current(11.15) == (0, "neutral")
+        assert sm.current(12.00) == (0, "neutral")
+
+        # Downward gaze negative cue emits cue_label=0 during active_downward_gaze
+        sm.trigger("downward_gaze", 20.0)
+        assert sm.current(20.50) == (0, "active_downward_gaze")
+        sm.reset_neutral()
+        assert sm.current(20.60) == (0, "neutral")
+
+        with pytest.raises(ValueError, match="Unknown cue_name"):
+            sm.trigger("invalid_cue", 21.0)
+
+    def test_collector_row_validation_rejects_nan_oob_and_invalid_labels(self):
+        import wink_data_collector as wdc
+
+        valid_kwargs = dict(
+            subject_id="subj_test",
+            session_id="20261127_150000",
+            frame_id=42,
+            ts_ms=1400,
+            capture_s=1.4,
+            detected=1,
+            cue_label=1,
+            cue_phase="active_left_wink",
+            raw_ear_l=0.10,
+            raw_ear_r=0.30,
+            base_ear_l=0.30,
+            base_ear_r=0.30,
+            norm_ear_l=0.333333,
+            norm_ear_r=1.0,
+            blendshapes=(0.75, 0.08, 0.20, 0.15, 0.30, 0.10, 0.0, 0.02),
+            sx=0.50,
+            sy=-0.04,
+            head_pitch_deg=-2.5,
+            head_yaw_deg=1.0,
+            head_roll_deg=0.5,
+            hybrid_state=1,
+        )
+        row = wdc.build_collector_row(**valid_kwargs)
+        assert len(row) == len(wdc.BLINK_COLLECTOR_HEADER) == 29
+        assert row[0] == wdc.BLINK_COLLECTOR_SCHEMA_VERSION
+
+        # Non-finite EAR rejected
+        bad_nan = dict(valid_kwargs, raw_ear_l=float("nan"))
+        with pytest.raises(ValueError, match="finite"):
+            wdc.build_collector_row(**bad_nan)
+
+        # Out-of-bounds blendshape rejected
+        bad_bs = dict(valid_kwargs, blendshapes=(1.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+        with pytest.raises(ValueError, match="Blendshape"):
+            wdc.build_collector_row(**bad_bs)
+
+        # Invalid cue_label rejected
+        bad_lbl = dict(valid_kwargs, cue_label=99)
+        with pytest.raises(ValueError, match="cue_label"):
+            wdc.build_collector_row(**bad_lbl)
+
+    def test_collector_csv_writer_enforces_schema_and_refuses_legacy_drift(self, tmp_path):
+        import wink_data_collector as wdc
+
+        # 1. Fresh file gets exact 29-column v2 header and allows valid append
+        out_csv = tmp_path / "blink_v2_session_test.csv"
+        row = wdc.build_collector_row(
+            subject_id="s1",
+            session_id="sess1",
+            frame_id=1,
+            ts_ms=33,
+            capture_s=0.033,
+            detected=1,
+            cue_label=0,
+            cue_phase="neutral",
+            raw_ear_l=0.30,
+            raw_ear_r=0.30,
+            base_ear_l=0.30,
+            base_ear_r=0.30,
+            norm_ear_l=1.0,
+            norm_ear_r=1.0,
+            blendshapes=(0.05, 0.05, 0.10, 0.10, 0.04, 0.04, 0.02, 0.02),
+            sx=0.50,
+            sy=0.0,
+            head_pitch_deg=0.0,
+            head_yaw_deg=0.0,
+            head_roll_deg=0.0,
+            hybrid_state=0,
+        )
+        with wdc.BlinkCollectorCsvWriter(str(out_csv)) as w:
+            w.write_row(row)
+        # Re-open same valid v2 file succeeds
+        with wdc.BlinkCollectorCsvWriter(str(out_csv)) as w:
+            w.write_row(row)
+
+        with open(out_csv, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f))
+        assert len(rows) == 3
+        assert tuple(rows[0]) == wdc.BLINK_COLLECTOR_HEADER
+        assert len(rows[1]) == 29 and len(rows[2]) == 29
+
+        # 2. Legacy 8-column or 9-column file MUST be refused (prevents silent schema drift!)
+        legacy_csv = tmp_path / "legacy_blink_dataset.csv"
+        legacy_csv.write_text("Timestamp,Left_EAR,Left_Min_10f,Left_Var_10f,Right_EAR,Right_Min_10f,Right_Var_10f,Label\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="Schema mismatch"):
+            with wdc.BlinkCollectorCsvWriter(str(legacy_csv)):
+                pass
+
+        # 3. Default session output path is non-destructive and never targets legacy blink_dataset.csv
+        default_path = wdc.default_session_output_path(str(tmp_path), "20261127_151500")
+        assert default_path.endswith("blink_v2_session_20261127_151500.csv")
+        assert "blink_dataset.csv" not in default_path
+

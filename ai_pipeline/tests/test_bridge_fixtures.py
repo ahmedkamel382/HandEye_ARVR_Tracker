@@ -2,11 +2,14 @@
 MediaPipe is stubbed: only the validation/packing path is exercised."""
 import os, sys, types
 import numpy as np
-sys.modules.setdefault("mediapipe", types.ModuleType("mediapipe"))
-for m in ("mediapipe.tasks", "mediapipe.tasks.python", "mediapipe.tasks.python.vision"):
-    sys.modules.setdefault(m, types.ModuleType(m))
-sys.modules["mediapipe.tasks"].python = sys.modules["mediapipe.tasks.python"]
-sys.modules["mediapipe.tasks.python"].vision = sys.modules["mediapipe.tasks.python.vision"]
+try:
+    import mediapipe  # noqa: F401  (use the real library when installed so the stubs never shadow it)
+except ImportError:
+    sys.modules.setdefault("mediapipe", types.ModuleType("mediapipe"))
+    for m in ("mediapipe.tasks", "mediapipe.tasks.python", "mediapipe.tasks.python.vision"):
+        sys.modules.setdefault(m, types.ModuleType(m))
+    sys.modules["mediapipe.tasks"].python = sys.modules["mediapipe.tasks.python"]
+    sys.modules["mediapipe.tasks.python"].vision = sys.modules["mediapipe.tasks.python.vision"]
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bridge"))
 import landmark_extractors as le
 

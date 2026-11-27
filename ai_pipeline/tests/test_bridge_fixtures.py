@@ -165,3 +165,20 @@ def test_pack_face_rejects_invalid_blendshapes_and_recovers():
     p, d = le.pack_face(lms(478), pose, _make_eye_blendshapes())
     assert p.shape == (487, 3) and d["valid"]
 
+
+def test_pack_face_blendshape_float_tolerance_and_clamping():
+    pose = np.eye(4, dtype=np.float32)
+
+    # Minor TFLite / float32 rounding overshoot within [-1e-4, 1.0 + 1e-4] is accepted and clamped to [0, 1]
+    bs_tol = _make_eye_blendshapes(eyeBlinkRight=-1e-6, eyeBlinkLeft=1.0000001)
+    p, d = le.pack_face(lms(478), pose, bs_tol)
+    assert p.shape == (487, 3) and d["valid"] and d["packed_n"] == 487
+    assert p[484, 0] == 0.0 and p[484, 1] == 1.0
+    assert np.isclose(p[486, 2], 1.0, atol=1e-6)
+
+    # Genuine out-of-range values beyond +-1e-4 still reject the whole face observation
+    for bad_val in (-0.01, -2e-4, 1.0 + 2e-4, 1.01):
+        bs_bad = _make_eye_blendshapes(eyeBlinkRight=bad_val)
+        p_bad, d_bad = le.pack_face(lms(478), pose, bs_bad)
+        assert p_bad.shape == (0, 3) and not d_bad["valid"] and d_bad["reason"] == "blendshapes"
+

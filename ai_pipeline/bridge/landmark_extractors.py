@@ -247,10 +247,18 @@ EYE_BLENDSHAPE_NAMES = (
 )
 
 
+_BLENDSHAPE_EPS = np.float32(1e-4)
+_BLENDSHAPE_LO = np.float32(-_BLENDSHAPE_EPS)
+_BLENDSHAPE_HI = np.float32(1.0) + _BLENDSHAPE_EPS
+_BLENDSHAPE_SENTINEL = np.float32(1.0)
+
+
 def extract_eye_blendshapes(face_blendshapes) -> Optional[np.ndarray]:
     """Extract the 8 canonical eye-aligned blendshapes into a float32 array of shape (8,).
 
-    Returns None if any required channel is missing, non-finite, or outside [0.0, 1.0].
+    Accepts minor float32/TFLite rounding overshoot within [-1e-4, 1.0 + 1e-4] and clamps
+    accepted values into [0.0, 1.0]. Returns None if any required channel is missing,
+    non-finite, or outside [-1e-4, 1.0 + 1e-4] (mirrored 1:1 in gaze_math.hpp).
     """
     if face_blendshapes is None:
         return None
@@ -266,19 +274,26 @@ def extract_eye_blendshapes(face_blendshapes) -> Optional[np.ndarray]:
     arr = np.asarray(vals, dtype=np.float32)
     if not np.isfinite(arr).all():
         return None
-    if bool((arr < 0.0).any() or (arr > 1.0).any()):
+    if bool((arr < _BLENDSHAPE_LO).any() or (arr > _BLENDSHAPE_HI).any()):
         return None
-    return arr
+    return np.clip(arr, np.float32(0.0), np.float32(1.0))
 
 
 def pack_face(face_lms, pose_matrix, face_blendshapes=None):
     """Validate and pack one face + 4x4 pose matrix (+ optional 8 eye blendshapes).
 
-    Backward-compatible contract:
-      - When face_blendshapes is None: returns (484, 3) float32 (legacy contract).
-      - When face_blendshapes is provided: returns (487, 3) float32 with 8 validated [0.0, 1.0]
-        eye-aligned blendshapes + 1.0 sentinel in rows 484..486; rejects (_EMPTY) if any
-        provided blendshape channel is missing, non-finite, or out of [0.0, 1.0].
+    Explicit observation-integrity policies (mirrored in hybrid_blink_spec.json & gaze_math.hpp):
+      1. Missing blendshapes (face_blendshapes is None):
+         Returns legacy (484, 3) float32; downstream HybridBlinkDetector / GazeNative silently
+         falls back to EAR-only hybrid mode (detector_mode='hybrid_ear_only').
+      2. Invalid/corrupted blendshapes (face_blendshapes provided, but missing a required
+         channel, non-finite, or outside [-1e-4, 1.0 + 1e-4]):
+         Rejects the ENTIRE face observation (_EMPTY, valid=False, reason='blendshapes') so
+         pointer is dropped and state=0 (Neutral), matching PR #3's strict all-or-nothing
+         observation integrity policy (no partial-corruption pass-through).
+      3. Valid blendshapes:
+         Clamps values within [-1e-4, 1.0 + 1e-4] into [0.0, 1.0] and returns (487, 3) float32
+         with rows 484..486 holding the 8 eye-aligned blendshapes + 1.0f sentinel at [486, 2].
     """
     n_face = len(face_lms) if face_lms else 0
     pose_arr = np.asarray(pose_matrix, dtype=np.float32) if pose_matrix is not None else np.empty(0, dtype=np.float32)
@@ -306,7 +321,7 @@ def pack_face(face_lms, pose_matrix, face_blendshapes=None):
             return _EMPTY, diag
         bs_rows = np.zeros((_BLENDSHAPE_ROWS, 3), dtype=np.float32)
         bs_rows.reshape(-1)[:8] = bs_vec
-        bs_rows.reshape(-1)[8] = 1.0
+        bs_rows.reshape(-1)[8] = _BLENDSHAPE_SENTINEL
         parts.append(bs_rows)
     packed = np.concatenate(parts)
     if not np.isfinite(packed).all():

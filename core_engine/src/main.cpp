@@ -135,6 +135,7 @@ struct Config {
     std::vector<double> hand_filter, gaze_filter;   // optional "min_cutoff,beta,d_cutoff" overrides (Hz, -, Hz)
     std::string gaze_diag_log;                      // optional per-frame gaze diagnostic CSV (--gaze-diag-log FILE.csv)
     std::string blink_diag_log;                     // optional per-frame blink diagnostic CSV (--blink-diag-log FILE.csv)
+    std::string blink_mode = "hybrid";              // hybrid | legacy (default hybrid; legacy uses gesture_model.dll)
     std::string dsp_record_dir;             // opt-in numerical diagnostics; empty = no recorder
     core::HandParams   hand;
 };
@@ -385,13 +386,16 @@ void aiBody(Pipeline& P) {
         P.ai_failed.store(true);
         return;
     }
+    const core::BlinkMode blink_mode =
+        (cfg.blink_mode == "legacy") ? core::BlinkMode::LegacyForest : core::BlinkMode::Hybrid;
     std::printf("[ai] ready | gaze: %s | hand: %s%s\n",
-                cfg.use_gaze ? (std::string("face landmarks + native math, models = ") + gaze_models.wink->name() + " + pitch/yaw").c_str() : "off",
+                cfg.use_gaze ? (std::string("face landmarks + native math, blink = ") + cfg.blink_mode +
+                                ", models = " + gaze_models.wink->name() + " + pitch/yaw").c_str() : "off",
                 cfg.use_hand ? (std::string("hand landmarks + native features, model = ") + hand_model->name()).c_str() : "off",
                 cfg.hand_roi > 0 ? " | hand ROI crop ON" : "");
     P.ai_ready.store(true);
 
-    core::GazeNative gaze(gaze_models.wink.get(), gaze_models.pitch.get(), gaze_models.yaw.get());
+    core::GazeNative gaze(gaze_models.wink.get(), gaze_models.pitch.get(), gaze_models.yaw.get(), 30, 10, blink_mode);
     core::HandNative handn(hand_model.get(), cfg.hand);
     const cv::Size fs = P.pool.size();
     const int roi = std::min({cfg.hand_roi, fs.width, fs.height});
@@ -458,6 +462,9 @@ void aiBody(Pipeline& P) {
             const auto t_g = Clock::now();
             const int n = face.call(frame, ts, face_pts);
             if (!cfg.dsp_record_dir.empty()) {
+                // dsp_filter/evaluation/import_vs_trace.py:103 and evaluate_holds.py:161 strictly assert
+                // gaze_landmarks in (-1, 0, 484) without modifying dsp_filter/. Normalize 487 -> 484 here;
+                // --blink-diag-log exposes the active payload regime via detector_mode ('hybrid_bs_ear' vs 'hybrid_ear_only').
                 r.gaze_landmarks = (n == core::GazeNative::kPackedWithBlendshapes)
                                        ? core::GazeNative::kPacked
                                        : n;
@@ -467,10 +474,10 @@ void aiBody(Pipeline& P) {
             core::GazeDiagRow* diag_ptr = log_gaze_diag ? &diag_row : nullptr;
             core::BlinkDiagRow* blink_ptr = log_blink_diag ? &blink_row : nullptr;
             if (n >= 0) {
-                r.gaze = gaze.process(face_pts.data(), n, fs.width, fs.height, diag_ptr, ts, blink_ptr);
+                r.gaze = gaze.process(face_pts.data(), n, fs.width, fs.height, diag_ptr, ts, blink_ptr, r.capture_s);
             } else {
                 // P0 fix: n == -1 (Python exception) must also reset GazeNative's temporal blink state, matching n == 0.
-                gaze.process(nullptr, 0, fs.width, fs.height, diag_ptr, ts, blink_ptr);
+                gaze.process(nullptr, 0, fs.width, fs.height, diag_ptr, ts, blink_ptr, r.capture_s);
                 r.gaze = core::ModuleOut{};
             }
             if (log_gaze_diag) {
@@ -571,6 +578,7 @@ void usage() {
 "          --hand-forest auto|treelite|sklearn | --hand-model FILE.pkl (default assets/hand_gesture_rf.pkl)\n"
 "          --gaze-diag-log FILE.csv (optional per-frame gaze diagnostic CSV; disabled by default)\n"
 "          --blink-diag-log FILE.csv (optional per-frame blink v2 diagnostic CSV; disabled by default)\n"
+"          --blink-mode hybrid|legacy (default hybrid; legacy uses gesture_model.dll)\n"
 "hand:     --hand-anchor tip|knuckle|mid   (pointer source, margins and calibration: tray app / os_integration.ini)\n"
 "filter:   --filter auto|dsp|builtin (auto = Eng 4's dsp_filter when compiled in) | --no-filter\n"
 "          --hand-filter MIN,BETA,DCUT | --gaze-filter MIN,BETA,DCUT   (Hz, -, Hz; tune with real recordings)\n"
@@ -663,6 +671,13 @@ Config parseArgs(int argc, char** argv, bool& ok) {
         else if (a == "--gaze-models")    c.gaze_models = next();
         else if (a == "--gaze-diag-log")  { c.gaze_diag_log = next(); if (c.gaze_diag_log.empty()) { std::fprintf(stderr, "--gaze-diag-log needs FILE.csv\n"); ok = false; } }
         else if (a == "--blink-diag-log") { c.blink_diag_log = next(); if (c.blink_diag_log.empty()) { std::fprintf(stderr, "--blink-diag-log needs FILE.csv\n"); ok = false; } }
+        else if (a == "--blink-mode") {
+            c.blink_mode = next();
+            if (c.blink_mode != "hybrid" && c.blink_mode != "legacy") {
+                std::fprintf(stderr, "--blink-mode must be hybrid or legacy\n");
+                ok = false;
+            }
+        }
         else if (a == "--selftest-hand-forest") c.selftest_hand = next();
         else if (a == "--hand-forest")    c.hand_forest = next();
         else if (a == "--hand-model")     c.hand_model = next();

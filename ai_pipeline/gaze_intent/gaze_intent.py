@@ -47,6 +47,7 @@ CALIBRATION_FRAMES = 30
 EAR_DIST_EPS = 1e-12       # horizontal eye distance below this -> NaN (degenerate eye)
 CALIB_EAR_EPS = 1e-6       # legacy EarFeatureState minimum raw EAR guard
 IRIS_BASELINE_EPS = 1e-12  # squared eye-corner baseline below this -> neutral iris ratio
+BLENDSHAPE_RANGE_EPS = 1e-4  # float32 rounding tolerance outside [0, 1] accepted & clamped to [0, 1]
 
 # --- HybridBlinkDetector v2 shared spec constants (mirrored in hybrid_blink_spec.json & gaze_math.hpp) ---
 HYBRID_CALIB_MIN_EAR_BS = 0.12
@@ -231,7 +232,9 @@ def extract_eye_blendshapes(face_blendshapes) -> Optional[Tuple[float, ...]]:
 
     Order: (bs_blink_l, bs_blink_r, bs_lookdown_l, bs_lookdown_r,
             bs_squint_l, bs_squint_r, bs_wide_l, bs_wide_r).
-    Returns None if absent, missing any required channel, non-finite, or out of [0.0, 1.0].
+    Accepts minor float32/TFLite rounding overshoot within [-BLENDSHAPE_RANGE_EPS, 1.0 + BLENDSHAPE_RANGE_EPS]
+    and clamps accepted values into [0.0, 1.0]. Returns None if absent, missing any required channel,
+    non-finite, or outside [-1e-4, 1.0 + 1e-4] (mirrored 1:1 in landmark_extractors.py & gaze_math.hpp).
     """
     if face_blendshapes is None:
         return None
@@ -249,8 +252,12 @@ def extract_eye_blendshapes(face_blendshapes) -> Optional[Tuple[float, ...]]:
     arr = np.asarray(raw, dtype=np.float32)
     if not np.isfinite(arr).all():
         return None
-    if bool((arr < 0.0).any() or (arr > 1.0).any()):
+    eps = np.float32(BLENDSHAPE_RANGE_EPS)
+    lo = np.float32(-eps)
+    hi = np.float32(1.0) + eps
+    if bool((arr < lo).any() or (arr > hi).any()):
         return None
+    arr = np.clip(arr, np.float32(0.0), np.float32(1.0))
     return tuple(float(v) for v in arr.tolist())
 
 
@@ -499,7 +506,7 @@ class HybridBlinkDetector:
 
         # Post-calibration temporal filter + Schmitt-trigger state
         self._has_smooth = False
-        self._last_ts_ms = -1
+        self._last_time_s = -1.0
         self.score_l = 0.0
         self.score_r = 0.0
         self._eye_closed_l = False
@@ -530,7 +537,7 @@ class HybridBlinkDetector:
         self.left_ear_history.clear()
         self.right_ear_history.clear()
         self._has_smooth = False
-        self._last_ts_ms = -1
+        self._last_time_s = -1.0
         self.score_l = 0.0
         self.score_r = 0.0
         self._eye_closed_l = False
@@ -619,12 +626,14 @@ class HybridBlinkDetector:
         raw_r: float,
         head_pitch_deg: float,
         sy: float,
-        ts_ms: int,
+        ts_ms: int = -1,
         blendshapes: Optional[Tuple[float, ...]] = None,
+        capture_s: Optional[float] = None,
     ) -> Tuple[int, float, float, float, float, str]:
         """
         Compute one post-calibration blink state step.
         Returns (state, score_l, score_r, norm_l, norm_r, detector_mode).
+        Timing prefers monotonic capture_s (>= 0, matching DSP/OS), falling back to ts_ms / 1000.0.
         """
         norm_l = raw_l / self.baseline_left_ear if self.baseline_left_ear > 0.0 else 0.0
         norm_r = raw_r / self.baseline_right_ear if self.baseline_right_ear > 0.0 else 0.0
@@ -681,13 +690,20 @@ class HybridBlinkDetector:
             mode = "hybrid_ear_only"
 
         # 3. Asymmetric attack/release wall-clock EMA smoothing (fast 15 ms onset, crisp 30 ms release)
+        if capture_s is not None and math.isfinite(capture_s) and capture_s >= 0.0:
+            now_s = float(capture_s)
+        elif ts_ms is not None and ts_ms >= 0:
+            now_s = float(ts_ms) / 1000.0
+        else:
+            now_s = -1.0
+
         if not self._has_smooth:
             self.score_l = raw_score_l
             self.score_r = raw_score_r
             self._has_smooth = True
         else:
-            if ts_ms >= 0 and self._last_ts_ms >= 0:
-                dt_s = (ts_ms - self._last_ts_ms) / 1000.0
+            if now_s >= 0.0 and self._last_time_s >= 0.0:
+                dt_s = now_s - self._last_time_s
             else:
                 dt_s = HYBRID_DEFAULT_DT_S
             if dt_s <= 0.0 or dt_s > HYBRID_MAX_GAP_S:
@@ -703,7 +719,7 @@ class HybridBlinkDetector:
                 alpha_r = 1.0 - math.exp(-dt_s / tau_r)
                 self.score_l = self.score_l + alpha_l * (raw_score_l - self.score_l)
                 self.score_r = self.score_r + alpha_r * (raw_score_r - self.score_r)
-        self._last_ts_ms = ts_ms
+        self._last_time_s = now_s
 
         # 4. Deterministic Schmitt-trigger hysteresis + contralateral asymmetry arbitration
         c_l = self.score_l
@@ -898,10 +914,15 @@ class GazeIntent:
     def __del__(self):
         self.shutdown()
 
-    def _emit_invalid_diag(self, frame_id: int, timestamp_ms: int) -> None:
+    def _emit_invalid_diag(self, frame_id: int, timestamp_ms: int, capture_s: Optional[float] = None) -> None:
+        cap_s = (
+            float(capture_s)
+            if (capture_s is not None and math.isfinite(capture_s) and capture_s >= 0.0)
+            else (timestamp_ms / 1000.0)
+        )
         if self._diag_writer is not None:
             self._write_diag_row(GazeDiagnosticPayload(
-                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=cap_s,
                 detected=0, state=0,
                 left_iris_x=INVALID_ANGLE, right_iris_x=INVALID_ANGLE, sx=INVALID_ANGLE,
                 left_iris_y=INVALID_ANGLE, right_iris_y=INVALID_ANGLE, sy=INVALID_ANGLE,
@@ -918,7 +939,7 @@ class GazeIntent:
             ))
         if self._blink_diag_writer is not None:
             self._write_blink_diag_row(BlinkDiagnosticPayload(
-                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                frame_id=frame_id, ts_ms=timestamp_ms, capture_s=cap_s,
                 detected=0, state=0, detector_mode="invalid",
                 raw_ear_l=INVALID_ANGLE, raw_ear_r=INVALID_ANGLE,
                 base_ear_l=self.ear_state.baseline_left_ear,
@@ -932,25 +953,34 @@ class GazeIntent:
             ))
 
     def process_frame(
-        self, rgb_frame_array: np.ndarray, timestamp_ms: int
+        self,
+        rgb_frame_array: np.ndarray,
+        timestamp_ms: int,
+        capture_s: Optional[float] = None,
     ) -> Tuple[float, float, float, float, int, Optional[Any]]:
         """
         Returns (abs_yaw, abs_pitch, head_yaw, head_pitch, state, landmarks).
-        When calibrating (state == -1) or when no face / non-finite input is detected
-        (state == 0, landmarks is None), all four angles are NaN (INVALID_ANGLE) so invalid
-        coordinates never enter downstream DSP filters. Use is_valid_output(abs_yaw, abs_pitch)
-        to test validity.
+        When calibrating (state == -1) or when no face / non-finite / corrupted blendshape input
+        is detected (state == 0, landmarks is None), all four angles are NaN (INVALID_ANGLE) so
+        invalid coordinates never enter downstream DSP filters.
+        If optional monotonic capture_s (>= 0) is supplied, it drives HybridBlinkDetector's wall-clock
+        EMA and diagnostic timestamps (matching DSP/OS); otherwise timestamp_ms / 1000.0 is used.
         """
         frame_id = self._frame_id
         self._frame_id += 1
+        cap_s = (
+            float(capture_s)
+            if (capture_s is not None and math.isfinite(capture_s) and capture_s >= 0.0)
+            else (timestamp_ms / 1000.0)
+        )
         if rgb_frame_array is None or getattr(rgb_frame_array, "ndim", 0) < 2:
             self.reset_tracking_state()
-            self._emit_invalid_diag(frame_id, timestamp_ms)
+            self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
             return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
         frame_h, frame_w = int(rgb_frame_array.shape[0]), int(rgb_frame_array.shape[1])
         if frame_w <= 0 or frame_h <= 0:
             self.reset_tracking_state()
-            self._emit_invalid_diag(frame_id, timestamp_ms)
+            self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
             return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame_array)
@@ -961,17 +991,20 @@ class GazeIntent:
             pose_matrix = results.facial_transformation_matrixes[0]
             if not _landmarks_and_pose_finite(landmarks, pose_matrix):
                 self.reset_tracking_state()
-                self._emit_invalid_diag(frame_id, timestamp_ms)
+                self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
                 return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
-            # Optional eye blendshapes (strictly validated [0.0, 1.0] if provided)
+            # Optional eye blendshapes:
+            #   - absent (empty/None) -> silent fallback to EAR-only hybrid (detector_mode='hybrid_ear_only')
+            #   - present but invalid (missing channel, non-finite, or outside [-1e-4, 1+1e-4]) ->
+            #     reject whole face observation (all-or-nothing integrity matching PR #3).
             raw_bs_list = getattr(results, "face_blendshapes", None)
             blendshapes: Optional[Tuple[float, ...]] = None
             if raw_bs_list:
                 blendshapes = extract_eye_blendshapes(raw_bs_list[0])
                 if blendshapes is None:
                     self.reset_tracking_state()
-                    self._emit_invalid_diag(frame_id, timestamp_ms)
+                    self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
                     return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             # 1. 3D EAR (degenerate |p1-p4| <= 1e-12 returns NaN -> rejected cleanly)
@@ -979,7 +1012,7 @@ class GazeIntent:
             raw_right_ear = calculate_ear(landmarks, RIGHT_EYE, frame_w, frame_h)
             if not (math.isfinite(raw_left_ear) and math.isfinite(raw_right_ear)):
                 self.reset_tracking_state()
-                self._emit_invalid_diag(frame_id, timestamp_ms)
+                self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
                 return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             # 2. Extract MPIIGaze features + head pose BEFORE calibration/blink evaluation
@@ -995,14 +1028,14 @@ class GazeIntent:
                 head_pitch, head_yaw, head_roll = get_head_pose_angles(pose_matrix)
             except ValueError:
                 self.reset_tracking_state()
-                self._emit_invalid_diag(frame_id, timestamp_ms)
+                self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
                 return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             if not all(math.isfinite(v) for v in (
                 l_x, r_x, student_x, l_y, r_y, student_y, head_pitch, head_yaw, head_roll
             )):
                 self.reset_tracking_state()
-                self._emit_invalid_diag(frame_id, timestamp_ms)
+                self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
                 return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             # 3. Calibration phase (returns state == -1 and NaN sentinel angles, incl. completing frame)
@@ -1016,7 +1049,7 @@ class GazeIntent:
 
                 if self._diag_writer is not None:
                     self._write_diag_row(GazeDiagnosticPayload(
-                        frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                        frame_id=frame_id, ts_ms=timestamp_ms, capture_s=cap_s,
                         detected=0, state=-1,
                         left_iris_x=l_x, right_iris_x=r_x, sx=student_x,
                         left_iris_y=l_y, right_iris_y=r_y, sy=student_y,
@@ -1033,7 +1066,7 @@ class GazeIntent:
                     ))
                 if self._blink_diag_writer is not None:
                     self._write_blink_diag_row(BlinkDiagnosticPayload(
-                        frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                        frame_id=frame_id, ts_ms=timestamp_ms, capture_s=cap_s,
                         detected=0, state=-1, detector_mode="calibrating",
                         raw_ear_l=raw_left_ear, raw_ear_r=raw_right_ear,
                         base_ear_l=self.ear_state.baseline_left_ear,
@@ -1066,13 +1099,14 @@ class GazeIntent:
 
             if not all(math.isfinite(v) for v in (rel_pitch, rel_yaw, abs_pitch, abs_yaw)):
                 self.reset_tracking_state()
-                self._emit_invalid_diag(frame_id, timestamp_ms)
+                self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
                 return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None
 
             # 5. Blink / Wink / Closure Intent State
             if self.blink_mode == "hybrid":
                 state, score_l, score_r, norm_l, norm_r, det_mode = self.hybrid_blink.step(
-                    raw_left_ear, raw_right_ear, head_pitch, student_y, int(timestamp_ms), blendshapes
+                    raw_left_ear, raw_right_ear, head_pitch, student_y,
+                    int(timestamp_ms), blendshapes, capture_s=capture_s,
                 )
             else:
                 wink_features = self._legacy_ear_state.update(raw_left_ear, raw_right_ear)
@@ -1089,7 +1123,7 @@ class GazeIntent:
 
             if self._diag_writer is not None:
                 self._write_diag_row(GazeDiagnosticPayload(
-                    frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                    frame_id=frame_id, ts_ms=timestamp_ms, capture_s=cap_s,
                     detected=det_flag, state=state,
                     left_iris_x=l_x, right_iris_x=r_x, sx=student_x,
                     left_iris_y=l_y, right_iris_y=r_y, sy=student_y,
@@ -1107,7 +1141,7 @@ class GazeIntent:
 
             if self._blink_diag_writer is not None:
                 self._write_blink_diag_row(BlinkDiagnosticPayload(
-                    frame_id=frame_id, ts_ms=timestamp_ms, capture_s=timestamp_ms / 1000.0,
+                    frame_id=frame_id, ts_ms=timestamp_ms, capture_s=cap_s,
                     detected=det_flag, state=state, detector_mode=det_mode,
                     raw_ear_l=raw_left_ear, raw_ear_r=raw_right_ear,
                     base_ear_l=self.ear_state.baseline_left_ear,
@@ -1127,5 +1161,5 @@ class GazeIntent:
 
         # Issue #4 Fix: Face lost -> clear temporal state & return NaN sentinel angles
         self.reset_tracking_state()
-        self._emit_invalid_diag(frame_id, timestamp_ms)
+        self._emit_invalid_diag(frame_id, timestamp_ms, capture_s=capture_s)
         return INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, INVALID_ANGLE, 0, None

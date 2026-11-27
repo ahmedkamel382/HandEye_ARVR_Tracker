@@ -819,6 +819,12 @@ class TestHybridBlinkV2AndSafety:
         assert math.isclose(spec["hysteresis"]["open_thresh"], gi.HYBRID_OPEN_THRESH, abs_tol=1e-12)
         assert math.isclose(spec["temporal_smoothing"]["ema_tau_attack_seconds"], gi.HYBRID_EMA_TAU_ATTACK_S, abs_tol=1e-12)
         assert math.isclose(spec["temporal_smoothing"]["ema_tau_release_seconds"], gi.HYBRID_EMA_TAU_RELEASE_S, abs_tol=1e-12)
+        assert math.isclose(spec["bridge_packing"]["blendshape_range_eps"], gi.BLENDSHAPE_RANGE_EPS, abs_tol=1e-12)
+        assert spec["bridge_packing"]["sentinel_slot"] == 8
+        assert math.isclose(spec["bridge_packing"]["sentinel_value"], 1.0, abs_tol=1e-12)
+        assert "missing_blendshapes" in spec["bridge_packing"]["policies"]
+        assert "invalid_blendshapes" in spec["bridge_packing"]["policies"]
+        assert "dsp_recorder_landmark_count" in spec["bridge_packing"]["policies"]
 
     def test_degenerate_eye_and_legacy_nan_guard_never_emit_closure(self, mocked_gaze_tracker):
         tracker, stub = mocked_gaze_tracker
@@ -1034,6 +1040,57 @@ class TestHybridBlinkV2AndSafety:
             ts += 33
             st, cl, cr, *_ = d.step(0.21, 0.21, 10.0, 0.02, ts, (0.24, 0.24, 0.65, 0.65, 0.10, 0.10, 0.0, 0.0))
         assert st == 0 and cl < gi.HYBRID_CLOSE_THRESH and cr < gi.HYBRID_CLOSE_THRESH
+
+    def test_blendshape_float_tolerance_and_clamping(self):
+        # Minor float32/TFLite rounding overshoot within [-1e-4, 1+1e-4] accepted & clamped to [0.0, 1.0]
+        bs = make_eye_blendshapes(eyeBlinkRight=-1e-6, eyeBlinkLeft=1.0000001)
+        out = gi.extract_eye_blendshapes(bs)
+        assert out is not None and len(out) == 8
+        assert out[0] == 0.0 and out[1] == 1.0
+
+        # Out-of-tolerance values (> 1e-4 outside [0, 1]) and non-finite still rejected
+        for bad_val in (-0.01, -2e-4, 1.0002, 1.01, float("nan"), float("inf"), float("-inf")):
+            bad_bs = make_eye_blendshapes(eyeBlinkRight=bad_val)
+            assert gi.extract_eye_blendshapes(bad_bs) is None
+
+    def test_capture_s_drives_ema_over_artificial_ts_ms(self, tmp_path):
+        d = HybridBlinkDetector()
+        open_bs = (0.05, 0.05, 0.10, 0.10, 0.04, 0.04, 0.02, 0.02)
+        left_bs = (0.85, 0.05, 0.10, 0.10, 0.25, 0.04, 0.0, 0.02)
+        for _ in range(CALIBRATION_FRAMES):
+            d.update_calibration(0.30, 0.30, 0.0, 0.0, open_bs)
+
+        # Seed smooth state at capture_s=1.000, ts_ms=1000
+        st0, cl0, *_ = d.step(0.30, 0.30, 0.0, 0.0, ts_ms=1000, blendshapes=open_bs, capture_s=1.000)
+        assert st0 == 0 and cl0 < 1e-6
+
+        # Artificial ts_ms only advances +1ms (1001), while real capture_s advances +0.080s (1.080):
+        # EMA MUST follow capture_s (alpha = 1 - exp(-0.080/0.015) = 0.9952 -> state 1, cl > 0.80).
+        st1, cl1, *_ = d.step(0.08, 0.30, 0.0, 0.0, ts_ms=1001, blendshapes=left_bs, capture_s=1.080)
+        assert st1 == 1 and cl1 > 0.80
+
+        # Gap > 0.250s on capture_s (+0.300s) resets EMA immediately even when ts_ms only advances +1ms
+        st2, cl2, *_ = d.step(0.30, 0.30, 0.0, 0.0, ts_ms=1002, blendshapes=open_bs, capture_s=1.380)
+        assert st2 == 0 and cl2 < 0.01
+
+        # GazeIntent.process_frame forwards capture_s into both EMA and 22-col blink diag CSV
+        blink_csv = tmp_path / "blink_cap_s.csv"
+        stub = StubFaceDetector()
+        stub.next_blendshapes = make_eye_blendshapes(eyeBlinkRight=0.05, eyeBlinkLeft=0.05)
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        with patch("gaze_intent.vision.FaceLandmarker.create_from_options", return_value=stub):
+            tracker = GazeIntent(blink_diag_log_path=str(blink_csv))
+            tracker.hybrid_blink = HybridBlinkDetector(calibration_frames=2, window_size=4)
+            tracker.ear_state = tracker.hybrid_blink
+            tracker.process_frame(blank, 1000, capture_s=1.000)
+            tracker.process_frame(blank, 1001, capture_s=1.033)
+            tracker.process_frame(blank, 1002, capture_s=1.250)
+            tracker.shutdown()
+        with open(blink_csv, "r", encoding="utf-8", newline="") as fb:
+            rows = list(csv.reader(fb))
+        last = dict(zip(_BLINK_DIAG_FIELD_NAMES, rows[-1]))
+        assert math.isclose(float(last["capture_s"]), 1.250, abs_tol=1e-6)
+        assert last["ts_ms"] == "1002"
 
 
 # ===========================================================================

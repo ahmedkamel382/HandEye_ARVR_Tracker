@@ -188,6 +188,8 @@ namespace core {
         static constexpr int kPacked = kFacePoints + kPoseRows;        // 484 (legacy landmarks + pose)
         static constexpr int kBlendshapeRows = 3;                      // 8 eye-aligned blendshapes + 1 sentinel -> 3 rows of 3
         static constexpr int kPackedWithBlendshapes = kPacked + kBlendshapeRows;  // 487
+        static constexpr float kBlendshapeEps = 1e-4f;                 // float32 rounding tolerance outside [0, 1], clamped to [0, 1]
+        static constexpr float kBlendshapeMarker = 1.0f;               // row 486 col 2 (slot 8) validity sentinel written by pack_face()
         static constexpr double kSpanDeg = 60.0;                       // x, y = 0.5 + angle / kSpanDeg  (+-30 deg covers the unit square)
 
         GazeNative(IForest* wink, IRegressor* pitch, IRegressor* yaw,
@@ -220,14 +222,21 @@ namespace core {
             resetTrackingState();
         }
 
-        // lm: n x 3 floats:
-        //   - n == kPacked (484): 478 landmarks + 6 pose rows (legacy / EAR-only hybrid path).
-        //   - n == kPackedWithBlendshapes (487): 484 rows + 3 rows carrying 8 validated [0, 1] eye-aligned blendshapes.
-        //   - n == 0 (or malformed count, or any non-finite/out-of-range input/output) -> failInvalid() (x=y=-1, state=0).
+        // lm: n x 3 floats (explicit observation-integrity policies mirrored in hybrid_blink_spec.json):
+        //   - n == kPacked (484): missing/absent blendshapes -> silent fallback to EAR-only hybrid
+        //     (detector_mode = "hybrid_ear_only") or legacy forest.
+        //   - n == kPackedWithBlendshapes (487): 484 rows + 3 rows carrying 8 eye-aligned blendshapes
+        //     in [-kBlendshapeEps, 1.0f + kBlendshapeEps] (clamped to [0, 1]) + sentinel 1.0f +- kBlendshapeEps
+        //     at row 486 col 2 (slot 8). Any corrupted channel or bad sentinel rejects the ENTIRE face
+        //     observation via failInvalid() (x=y=-1, state=0 Neutral) to match PR #3's all-or-nothing policy.
+        //   - n == 0 (or malformed count, or any non-finite/out-of-range input/output) -> failInvalid().
+        // Timing: wall-clock blink EMA prefers exact monotonic capture_s (>= 0, matching DSP/OS),
+        // falling back to ts_ms / 1000.0 when capture_s < 0, and kDefaultDtS when neither is provided.
         ModuleOut process(const float* lm, int n, int W, int H,
                           GazeDiagRow* diag = nullptr,
                           int64_t ts_ms = -1,
-                          BlinkDiagRow* blink_diag = nullptr) {
+                          BlinkDiagRow* blink_diag = nullptr,
+                          double capture_s = -1.0) {
             ModuleOut out;
             out.ok = true;
             auto failInvalid = [&]() -> ModuleOut {
@@ -264,12 +273,17 @@ namespace core {
             double bs[8] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
             if (n == kPackedWithBlendshapes) {
                 const float* bsp = lm + 3 * kPacked;
+                // Enforce row-486 col-2 (slot 8) validity sentinel written by pack_face()
+                const float marker = bsp[8];
+                if (!std::isfinite(marker) || std::fabs(marker - kBlendshapeMarker) > kBlendshapeEps) {
+                    return failInvalid();
+                }
                 for (int i = 0; i < 8; ++i) {
                     const float v = bsp[i];
-                    if (!std::isfinite(v) || v < 0.0f || v > 1.0f) {
+                    if (!std::isfinite(v) || v < -kBlendshapeEps || v > 1.0f + kBlendshapeEps) {
                         return failInvalid();
                     }
-                    bs[i] = double(v);
+                    bs[i] = clampUnit(double(v));
                 }
                 has_bs = true;
             }
@@ -375,7 +389,7 @@ namespace core {
             const char* det_mode = "legacy_rf";
 
             if (blink_mode_ == BlinkMode::Hybrid) {
-                out.state = stepHybridBlink(raw_l, raw_r, head_pitch, sy, ts_ms, has_bs, bs,
+                out.state = stepHybridBlink(raw_l, raw_r, head_pitch, sy, ts_ms, capture_s, has_bs, bs,
                                             norm_l, norm_r, out_score_l, out_score_r, det_mode);
             } else {
                 const double left = base_l_ > 0.0 ? raw_l / base_l_ : 0.0;
@@ -590,7 +604,8 @@ namespace core {
             }
         }
 
-        int stepHybridBlink(double raw_l, double raw_r, double head_pitch_deg, double sy, int64_t ts_ms,
+        int stepHybridBlink(double raw_l, double raw_r, double head_pitch_deg, double sy,
+                            int64_t ts_ms, double capture_s,
                             bool has_bs, const double bs[8],
                             double& out_norm_l, double& out_norm_r,
                             double& out_score_l, double& out_score_r,
@@ -643,13 +658,16 @@ namespace core {
                 out_mode = "hybrid_ear_only";
             }
 
+            const double now_s = (std::isfinite(capture_s) && capture_s >= 0.0)
+                                     ? capture_s
+                                     : ((ts_ms >= 0) ? (double(ts_ms) / 1000.0) : -1.0);
             if (!has_smooth_) {
                 score_l_ = raw_score_l;
                 score_r_ = raw_score_r;
                 has_smooth_ = true;
             } else {
-                const double dt_s = (ts_ms >= 0 && last_ts_ms_ >= 0)
-                                        ? (double(ts_ms - last_ts_ms_) / 1000.0)
+                const double dt_s = (now_s >= 0.0 && last_time_s_ >= 0.0)
+                                        ? (now_s - last_time_s_)
                                         : kDefaultDtS;
                 if (dt_s <= 0.0 || dt_s > kMaxGapS) {
                     score_l_ = raw_score_l;
@@ -666,7 +684,7 @@ namespace core {
                     score_r_ = score_r_ + alpha_r * (raw_score_r - score_r_);
                 }
             }
-            last_ts_ms_ = ts_ms;
+            last_time_s_ = now_s;
 
             const double c_l = score_l_;
             const double c_r = score_r_;
@@ -752,7 +770,7 @@ namespace core {
             hist_l_.clear();
             hist_r_.clear();
             has_smooth_ = false;
-            last_ts_ms_ = -1;
+            last_time_s_ = -1.0;
             score_l_ = 0.0;
             score_r_ = 0.0;
             eye_closed_l_ = false;
@@ -856,7 +874,7 @@ namespace core {
         double base_sy_ = kDefaultBaseSy;
         std::vector<double> cal_ear_l_, cal_ear_r_, cal_bs_l_, cal_bs_r_, cal_sy_;
         bool has_smooth_ = false;
-        int64_t last_ts_ms_ = -1;
+        double last_time_s_ = -1.0;
         double score_l_ = 0.0, score_r_ = 0.0;
         bool eye_closed_l_ = false, eye_closed_r_ = false;
         int prev_state_ = 0;

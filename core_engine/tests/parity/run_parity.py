@@ -125,7 +125,7 @@ def pack_face_with_optional_bs(lm, pose, bs_vals):
     extra = np.zeros((3, 3), dtype=np.float32)
     extra[0, 0], extra[0, 1], extra[0, 2] = bs_vals[0], bs_vals[1], bs_vals[2]
     extra[1, 0], extra[1, 1], extra[1, 2] = bs_vals[3], bs_vals[4], bs_vals[5]
-    extra[2, 0], extra[2, 1], extra[2, 2] = bs_vals[6], bs_vals[7], 0.0
+    extra[2, 0], extra[2, 1], extra[2, 2] = bs_vals[6], bs_vals[7], 1.0
     return np.vstack((base, extra)).astype(np.float32)
 
 

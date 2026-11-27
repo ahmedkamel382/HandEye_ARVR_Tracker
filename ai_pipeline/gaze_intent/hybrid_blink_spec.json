@@ -8,6 +8,14 @@
     "blendshape_rows": 3,
     "packed_with_blendshapes_rows": 487,
     "blendshape_valid_range": [0.0, 1.0],
+    "blendshape_range_eps": 0.0001,
+    "sentinel_slot": 8,
+    "sentinel_value": 1.0,
+    "policies": {
+      "missing_blendshapes": "When MediaPipe face_blendshapes is None/absent, pack_face emits legacy 484-row payload and HybridBlinkDetector/GazeNative silently falls back to EAR-only hybrid mode (detector_mode='hybrid_ear_only').",
+      "invalid_blendshapes": "When blendshapes are present but any required channel is missing, non-finite, outside [-1e-4, 1.0 + 1e-4], or native row-486 col-2 sentinel != 1.0 +- 1e-4, the entire face observation is rejected (valid=False, pointer dropped, state=0 Neutral) to match PR #3 all-or-nothing observation integrity.",
+      "dsp_recorder_landmark_count": "dsp_filter/evaluation/import_vs_trace.py:103 and evaluate_holds.py:161 strictly enforce gaze_landmarks in (-1, 0, 484). main.cpp normalizes 487 -> 484 for DSP trace recording without modifying dsp_filter/; --blink-diag-log exposes the active regime via detector_mode ('hybrid_bs_ear' for 487 vs 'hybrid_ear_only' for 484)."
+    },
     "eye_aligned_blendshape_slots": [
       { "slot": 0, "field": "bs_blink_l",    "mediapipe_name": "eyeBlinkRight",    "eye": "LEFT_EYE(33,160,158,133,153,144) -> state 1 Left Wink" },
       { "slot": 1, "field": "bs_blink_r",    "mediapipe_name": "eyeBlinkLeft",     "eye": "RIGHT_EYE(362,385,387,263,373,380) -> state 2 Right Wink" },
@@ -62,6 +70,7 @@
     "fusion_weight_ear": 0.45
   },
   "temporal_smoothing": {
+    "clock_source": "capture_s (monotonic seconds matching DSP/OS), falling back to ts_ms / 1000.0 when capture_s is omitted/negative, and default_dt_seconds when neither is available.",
     "ema_tau_attack_seconds": 0.015,
     "ema_tau_release_seconds": 0.030,
     "max_gap_seconds": 0.250,

@@ -181,13 +181,13 @@ def worst(*vs):
 def score(trace_path):
     ok, problems, vrows = recorder_integrity(trace_path)
     if not ok:
-        return dict(verdict="FAIL", scorer_version="3.0", recorder_problems=problems[:20])
+        return dict(verdict="FAIL", scorer_version="4.0", recorder_problems=problems[:20])
     try:
         rows = build_rows(vrows)
         zero, seq_problems = prepare(rows)
     except ValueError as exc:
-        return dict(verdict="FAIL", scorer_version="3.0", recorder_problems=["TIMESTAMP: %s" % exc])
-    out = dict(protocol="RESPONSIVENESS_PROTOCOL.md", scorer_version="3.0", zero=zero,
+        return dict(verdict="FAIL", scorer_version="4.0", recorder_problems=["TIMESTAMP: %s" % exc])
+    out = dict(protocol="RESPONSIVENESS_PROTOCOL.md", scorer_version="4.0", zero=zero,
                rows=len(rows), eligible_rows=sum(1 for r in rows if r["eligible"]),
                sequence_problems=seq_problems[:20])
     b_ok, bs = stable(rows, 3.0, 5.0)
@@ -196,10 +196,10 @@ def score(trace_path):
         out.update(verdict=worst("FAIL", "FAIL" if any("NONMONOTONIC" in p for p in seq_problems) else "PASS"))
         return out
     legs = []; ref = bs
-    right_reference_established = False
+    right_reference = None   # actual accepted RIGHT window; assigned ONLY after full outward validation
     for leg, expected in (("LEFT_TO_RIGHT", 1), ("RIGHT_TO_LEFT", -1)):
-        # The return leg cannot be analysed without a qualifying RIGHT arrival.
-        if leg == "RIGHT_TO_LEFT" and not right_reference_established:
+        # The return leg cannot be analysed without a fully accepted RIGHT reference.
+        if leg == "RIGHT_TO_LEFT" and right_reference is None:
             legs.append(dict(leg=leg, verdict="INCONCLUSIVE",
                              reason="return leg not independently established: no qualifying RIGHT reference",
                              reference_established=False))
@@ -220,8 +220,6 @@ def score(trace_path):
             legs.append(dict(leg=leg, verdict="INCONCLUSIVE", reason="no qualifying arrival window",
                              departure_t=dep["tp"], direction=direction_ok,
                              reference_established=False)); continue
-        if leg == "LEFT_TO_RIGHT":
-            right_reference_established = True      # accepts RIGHT arrival for the return leg
         a, b = ref["mean_x"], arr["mean_x"]; amp = abs(b - a)
         ydiff = abs(ref["mean_y"] - arr["mean_y"])
         search_from = 5.0 if leg == "LEFT_TO_RIGHT" else ref["t1"]
@@ -246,13 +244,32 @@ def score(trace_path):
                          crossing_intervals=span, interruptions=probs[:10],
                          departure_t=dep["tp"], direction=("correct" if direction_ok else "wrong"),
                          arrival=arr))
-        ref = arr
+        # Only a direction-correct, fully measured outward leg establishes the
+        # RIGHT reference for the return. Wrong-direction or early-exit paths
+        # above never reach here, so right_reference stays None.
+        if leg == "LEFT_TO_RIGHT" and direction_ok:
+            right_reference = arr
+            ref = arr
     out["legs"] = legs
     out["verdict"] = worst(*[l["verdict"] for l in legs])
     return out
 
 
 # ---------------- end-to-end regression tests ----------------
+def _row(t, x, frame=0, status_code=1):
+    # Initialized-row pattern copied from a genuine E4DSP trace. Adapter input
+    # must equal clamp_input() which casts to binary32, so emit float32-rounded
+    # values for x/ix/dx/px (and y/iy/dy/py).
+    import struct
+    f32 = lambda v: struct.unpack("=f", struct.pack("=f", v))[0]
+    yv = f32(0.4); xv = f32(x)
+    return ("E4REC F frame=%d ms=%d cap=%d t=%.9f n=42 ok=1 x=%.17g y=%.17g "
+            "state=0 trk=0 missed=0 adapter=1 called=1 input_t=%.9f ix=%.17g iy=%.17g "
+            "status=%d has=1 dx=%.17g dy=%.17g outcome=0 resets=0 pub=1 px=%.17g py=%.17g "
+            "out_trk=0 generation=1" % (frame, int(t * 1000), int(t * 1000), t, xv, yv,
+                                        t, xv, yv, status_code, xv, yv, xv, yv))
+
+
 def _fixture_trace():
     """Locate a real recorded trace without machine-specific absolute paths."""
     import glob
@@ -348,12 +365,63 @@ def tests():
         if not root: continue
         p = os.path.join(root, "E2D_UNSCORED_20261125_03", "recording", "trace.txt")
         if os.path.exists(p): r3 = p; break
-    if r3:
-        rr = score(r3)
-        rt = next((l for l in rr.get("legs", []) if l["leg"] == "RIGHT_TO_LEFT"), None)
-        assert rt and rt["verdict"] == "INCONCLUSIVE" and rt.get("reference_established") is False
-        assert "not independently established" in rt.get("reason", "")
-        results.append("B return leg not scored without RIGHT reference (RUN_03_THIRD verified)")
+    if not r3:
+        raise RuntimeError("required regression fixture E2D_UNSCORED_20261125_03 not found "
+                           "(set RUN3_DIR to its parent folder); fixture is not optional")
+    rr = score(r3)
+    rt = next((l for l in rr.get("legs", []) if l["leg"] == "RIGHT_TO_LEFT"), None)
+    assert rt and rt["verdict"] == "INCONCLUSIVE" and rt.get("reference_established") is False
+    assert "not independently established" in rt.get("reason", "")
+    results.append("B return leg not scored without RIGHT reference (RUN_03_THIRD verified)")
+
+    # v5 edge case 1: wrong-direction outward with an otherwise stable arrival must
+    # NOT establish the RIGHT reference; return must be not independently established.
+    def synth_wrong_direction():
+        L = []; t = 0.0
+        def add(x):
+            nonlocal t
+            L.append(_row(t, x, len(L), 0 if not L else 1)); t += 0.05
+        for _ in range(100): add(0.60)            # baseline at 0.60
+        for i in range(10): add(0.60 - 0.25 * (i + 1) / 10)  # WRONG direction (decreasing)
+        for _ in range(60): add(0.35)              # stable arrival at 0.35
+        for i in range(10): add(0.35 + 0.25 * (i + 1) / 10)
+        for _ in range(80): add(0.60)
+        return L
+    p = os.path.join(tempfile.gettempdir(), "v5_wrong_dir.txt")
+    rows_wd = synth_wrong_direction()
+    hdr = "E4REC BEGIN version=2 channel=hand capacity=4096 min_cutoff=1.2 beta=4 derivative_cutoff=1 min_dt=9.9999999999999995e-07 reset_gap=0.25"
+    ftr = "E4REC END submitted=%d attempted=%d stored=%d overflow=0 config_changes=0 complete=1" % (len(rows_wd), len(rows_wd), len(rows_wd))
+    open(p, "w").write("\n".join([hdr] + rows_wd + [ftr]) + "\n")
+    r = score(p)
+    rt = next((x for x in r["legs"] if x["leg"] == "RIGHT_TO_LEFT"), None)
+    assert rt and rt["verdict"] == "INCONCLUSIVE" and "not independently established" in rt.get("reason", "")
+    results.append("v5 edge1 wrong-direction outward does NOT establish RIGHT reference (return skipped)")
+    os.remove(p)
+
+    # v5 edge case 2: outward missing crossings (early continue) must not leave
+    # right_reference set nor reuse the LEFT baseline for a later return.
+    def synth_missing_crossings():
+        L = []; t = 0.0
+        def add(x):
+            nonlocal t
+            L.append(_row(t, x, len(L), 0 if not L else 1)); t += 0.05
+        for _ in range(100): add(0.20)            # baseline 0.20
+        # one isolated spike that departs then returns before any 10/90 crossings
+        add(0.30); add(0.45); add(0.30)
+        for _ in range(100): add(0.20)
+        return L
+    p = os.path.join(tempfile.gettempdir(), "v5_missing_crossings.txt")
+    rows_mc = synth_missing_crossings()
+    open(p, "w").write("\n".join([hdr] + rows_mc + [
+        "E4REC END submitted=%d attempted=%d stored=%d overflow=0 config_changes=0 complete=1" %
+        (len(rows_mc), len(rows_mc), len(rows_mc))]) + "\n")
+    r = score(p)
+    legs = r.get("legs", [])
+    rt = next((x for x in legs if x["leg"] == "RIGHT_TO_LEFT"), None)
+    assert rt and rt["verdict"] == "INCONCLUSIVE" and "not independently established" in rt.get("reason", "")
+    assert not any(x.get("departure_t") in (4.95, 4.950000000000001) for x in legs)
+    results.append("v5 edge2 outward early-exit does NOT enable return or reuse LEFT baseline")
+    os.remove(p)
 
     # C: GENUINE timestamp shift - rewrite t/ms/cap/input_t by a constant in recorder lines
     with tempfile.TemporaryDirectory() as td:
@@ -393,7 +461,7 @@ def tests():
             assert close(ra.get(key), rb.get(key)), \
                 "full outcome must be equivalent under timestamp shift (key=%s)" % key
         results.append("C genuine +1000s timestamp shift: full outcome equivalent (verdict, gates, relative timings; float tol 1e-9; zero shifted %.0fs)" % (rb["zero"] - ra["zero"]))
-    results.append("ALL V4 REGRESSION TESTS PASSED")
+    results.append("ALL V5 REGRESSION TESTS PASSED")
     return results
 
 
